@@ -1,0 +1,19 @@
+“Necesito que construyas o reconstruyas el sistema MoneyMaker con dos prioridades absolutas: que el bot obedezca exactamente los parámetros configurados, y que la estrategia sea estable y no se mueva.
+PROBLEMAS CRÍTICOS QUE DEBEN RESOLVERSE PRIMERO:
+Uno: el bot debe obedecer siempre los parámetros configurados. Si el usuario configura 50% de capital, usa exactamente ese porcentaje. Si configura stop loss en 2%, se ejecuta en 2%. Sin desviación, sin interpretación propia.
+Dos: el botón de detener debe funcionar siempre e inmediatamente. Presionar detener cierra todas las posiciones en ese momento. Es prioridad máxima de seguridad.
+Tres: las sesiones deben ser persistentes en base de datos. El estado del bot, posiciones, configuración y logs sobreviven reinicios del servidor.
+Cuatro: el frontend debe mostrar exactamente lo que el bot ejecuta — qué órdenes abrió, con qué parámetros, por qué razón y el resultado de cada una.
+ESTRATEGIA ESCALERA:
+Opera sobre una sola moneda a la vez. Abre posiciones progresivas en 4 capas de apalancamiento: 10x, 20x, 30x y 50x. La lógica es esta:
+La capa 10x abre cuando el sistema detecta señal válida confirmada por tendencia, momentum y volumen. La capa 20x solo abre si la capa 10x ya está en profit protegido y el mercado sigue confirmando fuerza. La capa 30x solo abre si la 20x está validada. La capa 50x solo abre si toda la estructura anterior está sólida y protegida. Nunca abrir una capa superior si la anterior no está asegurada — esto es obligatorio y no negociable.
+El stop loss de cada capa es dinámico. Al abrir coloca un stop inicial basado en ATR real. Cuando entra en profit mueve el stop a breakeven. Cuando el profit crece asegura ganancia real. El stop siempre protege utilidad neta después de fees, no solo precio bruto.
+Cuando el mercado pierde fuerza el sistema cierra en orden jerárquico: primero 50x, luego 30x, luego 20x, y mantiene 10x si la estructura sigue válida. Si el movimiento vuelve a fortalecerse puede reabrir capas superiores solo con confirmación real, no por una sola vela.
+MÓDULO IC — INTERÉS COMPUESTO:
+El usuario define un porcentaje objetivo de ganancia neta, por ejemplo 1%, 2% o 5%. Cuando el ciclo completo alcanza ese objetivo el sistema cierra todas las posiciones, descuenta fees reales, suma la utilidad al capital base, recalcula el tamaño de la siguiente entrada y reinicia automáticamente. Esto convierte ganancias flotantes en ganancias realizadas y reinvertidas.
+FEES REALES:
+Entrada con orden limit: 0.02% maker. Salida siempre a mercado: 0.055% taker. Cada trade redondo cuesta aproximadamente 0.075% del nocional. El sistema debe calcular esto en cada decisión — el stop nunca puede proteger ganancia falsa ignorando fees.
+FRONTEND:
+Mostrar en tiempo real: activo actual, dirección, capas abiertas con su leverage, precio de entrada por capa, stop actual por capa, ganancia bruta y neta por capa, fees acumulados, capital actual, estado del ciclo IC, alertas de poda y reapertura.
+MODO PAPER Y MODO REAL:
+Ambos deben existir. Paper para validar sin riesgo. Real conectado a Bybit con API keys en variables de entorno, nunca expuestas en el frontend.

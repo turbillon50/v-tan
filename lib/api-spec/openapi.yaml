@@ -1,0 +1,975 @@
+openapi: 3.1.0
+info:
+  title: Api
+  version: 0.1.0
+  description: Crypto Trading Dashboard API
+servers:
+  - url: /api
+    description: Base API path
+tags:
+  - name: health
+  - name: auth
+  - name: market
+  - name: indicators
+  - name: signals
+  - name: portfolio
+  - name: orders
+  - name: bot
+  - name: capital
+
+paths:
+  /healthz:
+    get:
+      operationId: healthCheck
+      tags: [health]
+      summary: Health check
+      responses:
+        "200":
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+
+  /auth/login:
+    post:
+      operationId: login
+      tags: [auth]
+      summary: Login with password
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginBody"
+      responses:
+        "200":
+          description: Login successful
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthStatus"
+        "401":
+          description: Invalid password
+
+  /auth/logout:
+    post:
+      operationId: logout
+      tags: [auth]
+      summary: Logout
+      responses:
+        "200":
+          description: Logged out
+
+  /auth/status:
+    get:
+      operationId: getAuthStatus
+      tags: [auth]
+      summary: Get auth status
+      responses:
+        "200":
+          description: Auth status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthStatus"
+
+  /market/ticker:
+    get:
+      operationId: getTicker
+      tags: [market]
+      summary: Get live ticker for a symbol
+      parameters:
+        - name: symbol
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Ticker data
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ticker"
+
+  /market/candles:
+    get:
+      operationId: getCandles
+      tags: [market]
+      summary: Get candlestick data
+      parameters:
+        - name: symbol
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: interval
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [1, 5, 15, 60, 240]
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Candle data
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Candle"
+
+  /market/funding-rate:
+    get:
+      operationId: getFundingRate
+      tags: [market]
+      summary: Get funding rate for a symbol
+      parameters:
+        - name: symbol
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Funding rate
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FundingRate"
+
+  /market/open-interest:
+    get:
+      operationId: getOpenInterest
+      tags: [market]
+      summary: Get open interest
+      parameters:
+        - name: symbol
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Open interest data
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OpenInterest"
+
+  /market/sentiment:
+    get:
+      operationId: getMarketSentiment
+      tags: [market]
+      summary: Get market sentiment data (fear & greed, dominance, etc)
+      responses:
+        "200":
+          description: Market sentiment
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MarketSentiment"
+
+  /indicators/{symbol}:
+    get:
+      operationId: getIndicators
+      tags: [indicators]
+      summary: Get all technical indicators for a symbol
+      parameters:
+        - name: symbol
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: interval
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [1, 5, 15]
+      responses:
+        "200":
+          description: Technical indicators
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Indicators"
+
+  /signals/{symbol}:
+    get:
+      operationId: getSignal
+      tags: [signals]
+      summary: Get current trading signal with score
+      parameters:
+        - name: symbol
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Signal data
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Signal"
+
+  /signals/{symbol}/ai-analysis:
+    get:
+      operationId: getAiAnalysis
+      tags: [signals]
+      summary: Get Gemini AI analysis narrative
+      parameters:
+        - name: symbol
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: AI analysis
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AiAnalysis"
+
+  /portfolio/balance:
+    get:
+      operationId: getBalance
+      tags: [portfolio]
+      summary: Get account balance
+      responses:
+        "200":
+          description: Account balance
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Balance"
+
+  /portfolio/positions:
+    get:
+      operationId: getPositions
+      tags: [portfolio]
+      summary: Get open positions
+      responses:
+        "200":
+          description: Open positions
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Position"
+
+  /portfolio/trades:
+    get:
+      operationId: getTrades
+      tags: [portfolio]
+      summary: Get trade history
+      responses:
+        "200":
+          description: Trade history
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Trade"
+
+  /portfolio/stats:
+    get:
+      operationId: getPortfolioStats
+      tags: [portfolio]
+      summary: Get portfolio performance stats
+      responses:
+        "200":
+          description: Portfolio stats
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PortfolioStats"
+
+  /orders/open:
+    post:
+      operationId: openOrder
+      tags: [orders]
+      summary: Open a position
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OpenOrderBody"
+      responses:
+        "201":
+          description: Order opened
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OrderResult"
+
+  /orders/close:
+    post:
+      operationId: closeOrder
+      tags: [orders]
+      summary: Close a position
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CloseOrderBody"
+      responses:
+        "200":
+          description: Order closed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OrderResult"
+
+  /bot/status:
+    get:
+      operationId: getBotStatus
+      tags: [bot]
+      summary: Get bot status and settings
+      responses:
+        "200":
+          description: Bot status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BotStatus"
+
+  /bot/toggle:
+    post:
+      operationId: toggleBot
+      tags: [bot]
+      summary: Toggle bot on/off
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ToggleBotBody"
+      responses:
+        "200":
+          description: Bot toggled
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BotStatus"
+
+  /bot/testnet:
+    post:
+      operationId: toggleTestnet
+      tags: [bot]
+      summary: Toggle between testnet and mainnet
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [testnet]
+              properties:
+                testnet:
+                  type: boolean
+      responses:
+        "200":
+          description: Testnet toggled
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [isTestnet]
+                properties:
+                  isTestnet:
+                    type: boolean
+
+  /bot/settings:
+    patch:
+      operationId: updateBotSettings
+      tags: [bot]
+      summary: Update bot settings
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BotSettings"
+      responses:
+        "200":
+          description: Settings updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BotStatus"
+
+  /capital/growth:
+    get:
+      operationId: getCapitalGrowth
+      tags: [capital]
+      summary: Get capital growth history and projections
+      responses:
+        "200":
+          description: Capital growth data
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CapitalGrowth"
+
+  /capital/calculator:
+    post:
+      operationId: calculatePosition
+      tags: [capital]
+      summary: Calculate potential PnL for a position
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CalculatorInput"
+      responses:
+        "200":
+          description: Calculation result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CalculatorResult"
+
+components:
+  schemas:
+    HealthStatus:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+
+    LoginBody:
+      type: object
+      required: [password]
+      properties:
+        password:
+          type: string
+
+    AuthStatus:
+      type: object
+      required: [authenticated, demoMode]
+      properties:
+        authenticated:
+          type: boolean
+        demoMode:
+          type: boolean
+
+    Ticker:
+      type: object
+      required: [symbol, price, change24h, changePercent24h, high24h, low24h, volume24h, markPrice, indexPrice]
+      properties:
+        symbol:
+          type: string
+        price:
+          type: number
+        change24h:
+          type: number
+        changePercent24h:
+          type: number
+        high24h:
+          type: number
+        low24h:
+          type: number
+        volume24h:
+          type: number
+        markPrice:
+          type: number
+        indexPrice:
+          type: number
+
+    Candle:
+      type: object
+      required: [time, open, high, low, close, volume]
+      properties:
+        time:
+          type: number
+        open:
+          type: number
+        high:
+          type: number
+        low:
+          type: number
+        close:
+          type: number
+        volume:
+          type: number
+
+    FundingRate:
+      type: object
+      required: [symbol, rate, nextFundingTime, predictedRate]
+      properties:
+        symbol:
+          type: string
+        rate:
+          type: number
+        nextFundingTime:
+          type: number
+        predictedRate:
+          type: number
+
+    OpenInterest:
+      type: object
+      required: [symbol, openInterest, openInterestValue]
+      properties:
+        symbol:
+          type: string
+        openInterest:
+          type: number
+        openInterestValue:
+          type: number
+
+    MarketSentiment:
+      type: object
+      required: [fearGreedIndex, fearGreedLabel, btcDominance, totalMarketCap, whaleActivity]
+      properties:
+        fearGreedIndex:
+          type: number
+        fearGreedLabel:
+          type: string
+        btcDominance:
+          type: number
+        totalMarketCap:
+          type: number
+        whaleActivity:
+          type: array
+          items:
+            $ref: "#/components/schemas/WhaleMove"
+
+    WhaleMove:
+      type: object
+      required: [symbol, amount, type, time]
+      properties:
+        symbol:
+          type: string
+        amount:
+          type: number
+        type:
+          type: string
+        time:
+          type: number
+
+    Indicators:
+      type: object
+      required: [symbol, interval, rsi, macd, bollingerBands, ema9, ema21, ema50, atr, volume, cvd]
+      properties:
+        symbol:
+          type: string
+        interval:
+          type: string
+        rsi:
+          type: number
+        macd:
+          $ref: "#/components/schemas/MACDData"
+        bollingerBands:
+          $ref: "#/components/schemas/BollingerBands"
+        ema9:
+          type: number
+        ema21:
+          type: number
+        ema50:
+          type: number
+        atr:
+          type: number
+        volume:
+          $ref: "#/components/schemas/VolumeData"
+        cvd:
+          type: number
+
+    MACDData:
+      type: object
+      required: [macd, signal, histogram]
+      properties:
+        macd:
+          type: number
+        signal:
+          type: number
+        histogram:
+          type: number
+
+    BollingerBands:
+      type: object
+      required: [upper, middle, lower]
+      properties:
+        upper:
+          type: number
+        middle:
+          type: number
+        lower:
+          type: number
+
+    VolumeData:
+      type: object
+      required: [current, average, ratio]
+      properties:
+        current:
+          type: number
+        average:
+          type: number
+        ratio:
+          type: number
+
+    Signal:
+      type: object
+      required: [symbol, score, direction, strength, reasons, updatedAt]
+      properties:
+        symbol:
+          type: string
+        score:
+          type: number
+        direction:
+          type: string
+          enum: [LONG, SHORT, NEUTRAL, WAIT]
+        strength:
+          type: string
+          enum: [STRONG, MODERATE, WEAK]
+        reasons:
+          type: array
+          items:
+            type: string
+        updatedAt:
+          type: number
+
+    AiAnalysis:
+      type: object
+      required: [symbol, narrative, sentiment, recommendation, updatedAt]
+      properties:
+        symbol:
+          type: string
+        narrative:
+          type: string
+        sentiment:
+          type: string
+          enum: [BULLISH, BEARISH, NEUTRAL]
+        recommendation:
+          type: string
+        updatedAt:
+          type: number
+
+    Balance:
+      type: object
+      required: [totalEquity, availableBalance, unrealizedPnl, totalWalletBalance, demoMode]
+      properties:
+        totalEquity:
+          type: number
+        availableBalance:
+          type: number
+        unrealizedPnl:
+          type: number
+        totalWalletBalance:
+          type: number
+        demoMode:
+          type: boolean
+
+    Position:
+      type: object
+      required: [symbol, side, size, entryPrice, markPrice, leverage, unrealizedPnl, unrealizedPnlPercent, liquidationPrice, stopLoss, takeProfit1, takeProfit2, takeProfit3, openedAt]
+      properties:
+        symbol:
+          type: string
+        side:
+          type: string
+          enum: [Buy, Sell]
+        size:
+          type: number
+        entryPrice:
+          type: number
+        markPrice:
+          type: number
+        leverage:
+          type: number
+        unrealizedPnl:
+          type: number
+        unrealizedPnlPercent:
+          type: number
+        liquidationPrice:
+          type: number
+        stopLoss:
+          type: number
+        takeProfit1:
+          type: number
+        takeProfit2:
+          type: number
+        takeProfit3:
+          type: number
+        openedAt:
+          type: number
+
+    Trade:
+      type: object
+      required: [id, symbol, side, size, entryPrice, exitPrice, pnl, pnlPercent, leverage, duration, closedAt, riskMode]
+      properties:
+        id:
+          type: string
+        symbol:
+          type: string
+        side:
+          type: string
+          enum: [Buy, Sell]
+        size:
+          type: number
+        entryPrice:
+          type: number
+        exitPrice:
+          type: number
+        pnl:
+          type: number
+        pnlPercent:
+          type: number
+        leverage:
+          type: number
+        duration:
+          type: number
+        closedAt:
+          type: number
+        riskMode:
+          type: string
+          enum: [conservative, risky, ultra]
+
+    PortfolioStats:
+      type: object
+      required: [totalTrades, winRate, avgWin, avgLoss, profitFactor, totalPnl, bestTrade, worstTrade, currentStreak]
+      properties:
+        totalTrades:
+          type: number
+        winRate:
+          type: number
+        avgWin:
+          type: number
+        avgLoss:
+          type: number
+        profitFactor:
+          type: number
+        totalPnl:
+          type: number
+        bestTrade:
+          type: number
+        worstTrade:
+          type: number
+        currentStreak:
+          type: number
+
+    OpenOrderBody:
+      type: object
+      required: [symbol, side, riskMode]
+      properties:
+        symbol:
+          type: string
+        side:
+          type: string
+          enum: [Buy, Sell]
+        riskMode:
+          type: string
+          enum: [conservative, risky, ultra]
+        leverage:
+          type: ["integer", "null"]
+        capitalPercent:
+          type: ["number", "null"]
+
+    CloseOrderBody:
+      type: object
+      required: [symbol]
+      properties:
+        symbol:
+          type: string
+        side:
+          type: ["string", "null"]
+
+    OrderResult:
+      type: object
+      required: [success, message, orderId]
+      properties:
+        success:
+          type: boolean
+        message:
+          type: string
+        orderId:
+          type: string
+
+    BotStatus:
+      type: object
+      required: [active, settings, lastAction, tradesExecuted, isTestnet, openPosition]
+      properties:
+        active:
+          type: boolean
+        settings:
+          $ref: "#/components/schemas/BotSettings"
+        lastAction:
+          type: ["string", "null"]
+        tradesExecuted:
+          type: number
+        isTestnet:
+          type: boolean
+        openPosition:
+          oneOf:
+            - $ref: "#/components/schemas/OpenPosition"
+            - type: "null"
+        tradeLog:
+          type: array
+          items:
+            $ref: "#/components/schemas/TradeLogEntry"
+
+    OpenPosition:
+      type: object
+      required: [symbol, side, qty, entryPrice, leverage, stopLoss, takeProfit, openedAt, unrealizedPnl]
+      properties:
+        symbol:
+          type: string
+        side:
+          type: string
+        qty:
+          type: string
+        entryPrice:
+          type: number
+        leverage:
+          type: number
+        stopLoss:
+          type: number
+        takeProfit:
+          type: number
+        openedAt:
+          type: string
+        unrealizedPnl:
+          type: number
+
+    TradeLogEntry:
+      type: object
+      required: [symbol, side, qty, entryPrice, exitPrice, pnl, closedAt, reason]
+      properties:
+        symbol:
+          type: string
+        side:
+          type: string
+        qty:
+          type: string
+        entryPrice:
+          type: number
+        exitPrice:
+          type: number
+        pnl:
+          type: number
+        closedAt:
+          type: string
+        reason:
+          type: string
+
+    BotSettings:
+      type: object
+      required: [riskMode, capitalPercent, stopLossPercent, tp1Percent, tp2Percent, tp3Percent, moveSlToEntryOnTp1]
+      properties:
+        riskMode:
+          type: string
+          enum: [conservative, moderate, aggressive, killer, megalodon]
+        capitalPercent:
+          type: number
+        stopLossPercent:
+          type: number
+        tp1Percent:
+          type: number
+        tp2Percent:
+          type: number
+        tp3Percent:
+          type: number
+        moveSlToEntryOnTp1:
+          type: boolean
+
+    ToggleBotBody:
+      type: object
+      required: [active]
+      properties:
+        active:
+          type: boolean
+        riskMode:
+          type: string
+        capitalPercent:
+          type: number
+        symbol:
+          type: string
+
+    CapitalGrowth:
+      type: object
+      required: [initialCapital, currentCapital, growthPercent, history, projection30d, projection60d, projection90d, dailyReturn7d]
+      properties:
+        initialCapital:
+          type: number
+        currentCapital:
+          type: number
+        growthPercent:
+          type: number
+        history:
+          type: array
+          items:
+            $ref: "#/components/schemas/CapitalPoint"
+        projection30d:
+          type: number
+        projection60d:
+          type: number
+        projection90d:
+          type: number
+        dailyReturn7d:
+          type: number
+
+    CapitalPoint:
+      type: object
+      required: [date, value]
+      properties:
+        date:
+          type: string
+        value:
+          type: number
+
+    CalculatorInput:
+      type: object
+      required: [symbol, side, leverage, capitalPercent, entryPrice]
+      properties:
+        symbol:
+          type: string
+        side:
+          type: string
+          enum: [Buy, Sell]
+        leverage:
+          type: number
+        capitalPercent:
+          type: number
+        entryPrice:
+          type: number
+
+    CalculatorResult:
+      type: object
+      required: [positionSize, margin, tp1, tp2, tp3, sl, pnlTp1, pnlTp2, pnlTp3, pnlSl, liquidationPrice]
+      properties:
+        positionSize:
+          type: number
+        margin:
+          type: number
+        tp1:
+          type: number
+        tp2:
+          type: number
+        tp3:
+          type: number
+        sl:
+          type: number
+        pnlTp1:
+          type: number
+        pnlTp2:
+          type: number
+        pnlTp3:
+          type: number
+        pnlSl:
+          type: number
+        liquidationPrice:
+          type: number

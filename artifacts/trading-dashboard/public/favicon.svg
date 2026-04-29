@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="64" y2="64" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#050d18"/>
+      <stop offset="100%" stop-color="#020810"/>
+    </linearGradient>
+    <linearGradient id="two" x1="26" y1="8" x2="38" y2="56" gradientUnits="userSpaceOnUse">
+      <stop offset="0%"   stop-color="#00E676"/>
+      <stop offset="50%"  stop-color="#00BCD4"/>
+      <stop offset="100%" stop-color="#7C4DFF"/>
+    </linearGradient>
+    <filter id="g">
+      <feGaussianBlur stdDeviation="2" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <rect width="64" height="64" rx="14" fill="url(#bg)"/>
+  <text x="2"  y="46" fill="white"       fill-opacity="0.9"  font-weight="200" font-size="36" font-family="system-ui,sans-serif" letter-spacing="-1">M</text>
+  <text x="19" y="46" fill="url(#two)"                       font-weight="300" font-size="36" font-family="system-ui,sans-serif" filter="url(#g)">2</text>
+  <text x="35" y="46" fill="white"       fill-opacity="0.9"  font-weight="200" font-size="36" font-family="system-ui,sans-serif" letter-spacing="-1">M</text>
+</svg>

@@ -1,0 +1,31 @@
+import { Router, type IRouter } from "express";
+import healthRouter from "./health";
+import authRouter from "./auth";
+import marketRouter from "./market";
+import indicatorsRouter from "./indicators";
+import signalsRouter from "./signals";
+import portfolioRouter from "./portfolio";
+import ordersRouter from "./orders";
+import botRouter from "./bot";
+import capitalRouter from "./capital";
+import backtestRouter from "./backtest";
+import newsRouter from "./news";
+import alertsRouter from "./alerts";
+import bybitRealRouter from "./bybit-real";
+const router: IRouter = Router();
+
+router.use(healthRouter);
+router.use(authRouter);
+router.use(marketRouter);
+router.use(indicatorsRouter);
+router.use(signalsRouter);
+router.use(portfolioRouter);
+router.use(ordersRouter);
+router.use(botRouter);
+router.use(capitalRouter);
+router.use(backtestRouter);
+router.use(newsRouter);
+router.use(alertsRouter);
+router.use("/bybit", bybitRealRouter);
+
+export default router;

@@ -1,0 +1,21 @@
+Construye una aplicación web completa de trading algorítmico para criptomonedas con las siguientes características:
+STACK TÉCNICO:
+Usa React para el frontend, Node.js con Express para el backend, y conecta todo en Replit. Diseño oscuro estilo terminal hacker con colores verde neón sobre negro.
+EXCHANGE - BYBIT:
+Conecta la API oficial de Bybit para mercados de futuros perpetuos (perps). Usa las variables de entorno BYBIT_API_KEY y BYBIT_API_SECRET. Debe poder ver balance de la cuenta, abrir posiciones long y short, colocar stop loss y take profit automáticos, cerrar posiciones, y consultar historial de trades. Usa el endpoint de Bybit Unified Trading Account.
+ANÁLISIS TÉCNICO EN TIEMPO REAL:
+Obtén velas de 1 minuto, 5 minutos y 15 minutos de Bybit. Calcula en tiempo real: RSI de 14 períodos, MACD con señal y histograma, Bollinger Bands de 20 períodos, EMA de 9, 21 y 50 períodos, volumen promedio y volumen actual comparado, ATR para medir volatilidad, Open Interest en tiempo real, Funding Rate actual y histórico, Liquidation heatmap con zonas de precio donde hay mayor concentración de liquidaciones, CVD delta acumulado para detectar presión compradora o vendedora real.
+INTELIGENCIA ARTIFICIAL CON GEMINI:
+Usa la API de Gemini con la variable GEMINI_API_KEY. Cada 5 minutos Gemini debe analizar: todos los indicadores técnicos calculados, noticias recientes de la crypto seleccionada buscando en fuentes públicas, sentiment general del mercado, dominancia de Bitcoin, índice de miedo y codicia, y actividad de whales (movimientos mayores a 1 millón de dólares). Con todo eso Gemini genera un análisis narrativo completo explicando qué está pasando en el mercado, por qué, y qué probabilidad hay de movimiento alcista o bajista en las próximas 1 a 4 horas. El análisis debe ser detallado, en español, y debe incluir niveles exactos de entrada, stop loss y tres niveles de take profit.
+SISTEMA DE SEÑALES:
+Genera una puntuación de 1 a 100 combinando todos los indicadores técnicos y el análisis de Gemini. Señal LONG FUERTE cuando el score supera 75. Señal SHORT FUERTE cuando cae bajo 25. Señal NEUTRO entre 40 y 60. En zonas intermedias muestra advertencia de esperar. La señal debe actualizarse cada 30 segundos.
+BOT AUTOMÁTICO:
+Incluye un modo bot que cuando detecta señal LONG FUERTE o SHORT FUERTE ejecuta automáticamente la orden en Bybit con estos parámetros configurables: porcentaje del capital a arriesgar por trade, apalancamiento entre 5x y 100x, stop loss automático al 2% contra la posición, take profit 1 al 3%, take profit 2 al 7%, take profit 3 al 15%, al alcanzar TP1 mueve el stop loss automáticamente al precio de entrada para operar sin riesgo. El bot debe tener un switch para activarlo y desactivarlo fácilmente.
+GESTIÓN DE CAPITAL CON INTERÉS COMPUESTO:
+Lleva un registro del capital inicial y el capital actual. Después de cada trade ganador reinvierte automáticamente las ganancias aumentando el tamaño de la siguiente posición. Muestra una proyección gráfica de crecimiento compuesto basada en el rendimiento de los últimos 7 días. Muestra cuánto llevarías en 30, 60 y 90 días si el rendimiento se mantiene.
+DASHBOARD PRINCIPAL:
+Pantalla dividida en secciones: precio en vivo con gráfico de velas interactivo, señal actual con score y análisis de Gemini completo, posición abierta actual si existe con PnL en tiempo real, historial de trades con porcentaje ganado y perdido, balance actual y crecimiento desde el inicio, calculadora de posición que muestra exactamente cuánto ganarías o perderías según el apalancamiento elegido, alertas visuales y sonoras cuando hay señal fuerte.
+MONEDAS DISPONIBLES:
+BTC, ETH, SOL, BNB, XRP, DOGE, AVAX, LINK, ARB, OP. El usuario puede cambiar entre ellas con un click y el sistema recalcula todo instantáneamente.
+SEGURIDAD BÁSICA:
+Protege la app con una contraseña simple al entrar. Las API keys nunca se muestran en pantalla. Toda la comunicación con Bybit va por el backend para no exponer keys en el 

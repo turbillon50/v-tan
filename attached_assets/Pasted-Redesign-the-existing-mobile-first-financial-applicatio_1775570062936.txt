@@ -1,0 +1,314 @@
+Redesign the existing mobile-first financial application and rename it to Money Maker.
+
+IMPORTANT:
+Do NOT rebuild the app logic from scratch.
+Do NOT destroy or replace the current product logic, flows, data structure, or navigation architecture.
+This is a visual and interaction redesign layer over the existing application.
+
+The goal is to preserve the current logic and screens, but transform the entire UI into a premium high-end financial operating system with a strong visual identity.
+
+The result must feel like:
+- a serious financial command center
+- a premium native iPhone app
+- elegant, powerful, minimal
+- custom designed, not template-based
+- visually memorable
+- polished enough to feel like a real premium product
+
+--------------------------------------------------
+GLOBAL VISUAL DIRECTION
+--------------------------------------------------
+
+App Name:
+Money Maker
+
+Style:
+- premium dark mode
+- deep black / graphite base
+- high contrast typography
+- subtle electric teal / neon green accents
+- clean whites
+- elegant red only for stop / danger states
+- soft blue-violet optional secondary glow
+- crystal / glass overlays only where intentional
+- minimal but powerful
+- no clutter
+- no generic crypto app look
+- no childish gradients
+- no default UI kit feeling
+
+FORBIDDEN:
+- Do not use Lucide icons
+- Do not use cheap generic icon packs
+- Do not use generic dashboard templates
+- Do not redesign flows unnecessarily
+- Do not overcrowd cards with text
+- Do not change the core logic of the app
+
+Typography:
+- modern, premium sans-serif
+- strong hierarchy
+- large capital figures
+- subtle supporting labels
+- spacing must feel expensive and intentional
+
+--------------------------------------------------
+MAIN GOAL
+--------------------------------------------------
+
+Keep the current app logic intact, but make it visually stunning.
+
+The app must feel:
+- elite
+- clear
+- confident
+- controlled
+- calm
+- profitable
+- technical but luxurious
+
+--------------------------------------------------
+HOME / PANEL REDESIGN
+--------------------------------------------------
+
+Preserve the current home logic but redesign all visual layers.
+
+1. Top area:
+- Replace the generic header with a clean premium top bar
+- Show MONEY MAKER branding
+- Show status indicator like LIVE / ACTIVE / SANDBOX / IDLE
+- Create a clean custom icon system
+- Use refined spacing, not cheap utility layout
+
+2. Hero capital card:
+- Make the main capital card dominant and elegant
+- Large number as visual hero
+- Subtle crystal-dark finish or luxury matte finish
+- Add subtle edge glow and premium depth
+- Keep supporting metrics secondary and clean
+
+3. Status strips / strategy strips:
+- Preserve information logic
+- Redesign as premium glass-dark strips with subtle lighting
+- Keep text reduced and readable
+- Use micro status dots and refined spacing
+
+4. Market snapshot chips:
+- Preserve the data
+- Redesign each chip as a compact premium tile
+- No generic box appearance
+- Use ultra-clean rounded geometry
+- Maintain hierarchy: symbol first, price second
+
+5. Strategy / bot cards:
+- Preserve current logic
+- Improve visual hierarchy
+- Make each card feel like a modular control block
+- Add subtle glass / matte hybrid treatment
+- Important actions must feel intentional and strong
+
+--------------------------------------------------
+CENTRAL BUTTON SYSTEM (CORE VISUAL FEATURE)
+--------------------------------------------------
+
+Implement a fixed central navigation button in the bottom navigation bar using a premium crystal/glass effect inspired by high-end floating operating systems.
+
+This must become the visual signature of Money Maker.
+
+Use this exact direction:
+
+Create a central fixed button in the bottom navigation with a real crystal / glass effect:
+- backdrop-blur 60px
+- saturate 200%
+- layered translucent whites
+- subtle conic gradient reflections
+- 0.5px border rgba(255,255,255,0.25)
+- animated shine using keyframes
+- soft internal reflections
+- premium tactile look
+- elegant glow, not exaggerated
+
+Interaction:
+- The button lives in the center of the bottom nav
+- When tapped, it opens a full-screen overlay menu
+- The + icon rotates into an × when opened
+- The interaction must feel fluid, premium, and native
+
+Button states:
+- idle = soft crystal glow
+- active = stronger glow and subtle pulse
+- open = icon transforms into × with smooth rotation
+
+Animation:
+- smooth, expensive, controlled
+- no cheap bounce
+- use cubic-bezier(0.22,1,0.36,1)
+
+--------------------------------------------------
+FULLSCREEN OVERLAY MENU
+--------------------------------------------------
+
+When the central button is tapped, open a full-screen overlay.
+
+Overlay style:
+- bg-black/75
+- backdrop-blur-3xl
+- premium dimmed environment
+- feels cinematic and layered
+
+Overlay must include:
+- heading
+- crystal close button
+- 3-column grid or adaptive card grid depending on screen
+- staggered animated entrance
+- each card appears with incremental delay
+- overlay must feel like a premium financial OS launcher
+
+Each overlay card must be crystal / glass premium with:
+- glass background
+- 145deg gradient
+- subtle hue tint variations
+- double luminous border
+- upper lens reflection
+- rounded square icon area
+- icon tile with gradient + glow
+- bold label
+- subtle one-line description
+
+Cards should correspond to the real logic of the app, for example:
+- Panel
+- Posiciones
+- Historial
+- Capital
+- Bot
+- Estrategias
+- Configuración
+- Briefing
+- Alertas
+
+Do not invent nonsense sections if they do not exist.
+Map them to the real current architecture.
+
+--------------------------------------------------
+CRYSTAL / GLASS LANGUAGE
+--------------------------------------------------
+
+Apply crystal effects only where they add value:
+- central button
+- overlay
+- some action cards
+- selected premium controls
+
+Do NOT turn the whole app into glass everywhere.
+The UI must remain elegant and legible.
+
+Mix:
+- matte black structure
+- glass accents
+- refined depth
+- subtle neon highlights
+
+--------------------------------------------------
+BOTTOM NAVIGATION REDESIGN
+--------------------------------------------------
+
+Preserve the current tabs and logic:
+- Panel
+- Posiciones
+- Historial
+- Capital
+- Bot
+
+But redesign the bottom navigation as:
+- elegant native bar
+- soft translucent base
+- premium divider
+- custom icons
+- selected tab with refined accent glow
+- center button integrated as the hero action
+
+Must feel closer to a luxury mobile operating system than to a generic tab bar.
+
+--------------------------------------------------
+ICONS
+--------------------------------------------------
+
+Do NOT use Lucide.
+Do NOT use cheap generic libraries.
+
+Create or simulate a custom icon language:
+- thin geometric icons
+- premium minimal line weight
+- slightly futuristic
+- highly readable
+- consistent stroke system
+
+--------------------------------------------------
+DESKTOP / HOME SCREEN APP ICON
+--------------------------------------------------
+
+Design a premium app icon for Money Maker.
+
+Requirements:
+- icon must look elite on iPhone home screen
+- dark premium base
+- minimal symbol
+- crystal / metallic refinement
+- subtle teal / green electric accent
+- no clutter
+- no text-heavy logo
+- no cheap trading icon
+- no cartoon coin / candlestick cliché
+
+Possible direction:
+- bold abstract “M”
+- monogram MM
+- geometric money / signal / power symbol
+- subtle central glow
+- glass-metal hybrid
+- feels like a premium fintech / trading OS icon
+
+Create icon variants for:
+- app icon light reflection version
+- dark icon version
+- notification / compact icon feel
+
+--------------------------------------------------
+MICROINTERACTIONS
+--------------------------------------------------
+
+Add subtle microinteractions:
+- card hover / press depth
+- animated glow on active states
+- smooth number transitions if possible
+- premium loading states
+- soft pulse in live status indicators
+- refined icon rotation on state changes
+
+--------------------------------------------------
+DO NOT CHANGE THESE THINGS
+--------------------------------------------------
+
+- do not remove existing functionality
+- do not rewrite business logic unnecessarily
+- do not restructure database flows
+- do not destroy current navigation meaning
+- do not clutter the interface with decorative excess
+- do not make it look like a gaming interface
+- do not make it look like a cheap crypto clone
+
+--------------------------------------------------
+DELIVERABLE
+--------------------------------------------------
+
+Return a redesigned premium visual system for Money Maker that:
+- preserves existing app logic
+- upgrades the entire interface quality
+- includes the premium crystal central button
+- includes the full-screen crystal overlay
+- improves cards, typography, spacing, and hierarchy
+- redesigns the bottom nav
+- creates a top-tier iPhone home screen app icon
+- makes the product feel like a serious financial operating system
+
+The final result must feel visually expensive, clean, bold, and memorable.

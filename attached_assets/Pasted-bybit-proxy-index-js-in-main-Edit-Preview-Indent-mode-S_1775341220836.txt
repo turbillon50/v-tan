@@ -1,0 +1,78 @@
+bybit-proxy
+/
+index.js
+in
+main
+
+Edit
+
+Preview
+Indent mode
+
+Spaces
+Indent size
+
+2
+Line wrap mode
+
+No wrap
+Editing index.js file contents
+  1
+  2
+  3
+  4
+  5
+  6
+  7
+  8
+  9
+ 10
+ 11
+ 12
+ 13
+ 14
+ 15
+ 16
+ 17
+ 18
+ 19
+ 20
+ 21
+ 22
+ 23
+ 24
+ 25
+ 26
+ 27
+ 28
+ 29
+const express = require("express");
+const crypto = require("crypto");
+const app = express();
+const PORT = process.env.PORT || 3000;
+const BYBIT_KEY = process.env.BYBIT_API_KEY || "";
+const BYBIT_SECRET = process.env.BYBIT_API_SECRET || "";
+const PROXY_SECRET = process.env.PROXY_SECRET || "";
+app.use(express.json());
+app.use((req, res, next) => {
+  if (req.path === "/health") return next();
+  const secret = req.headers["x-proxy-secret"] || req.body?.proxySecret;
+  if (!PROXY_SECRET || secret !== PROXY_SECRET) return res.status(401).json({ error: "Unauthorized" });
+  next();
+});
+app.get("/health", (_req, res) => res.json({ ok: true }));
+app.post("/proxy", async (req, res) => {
+  const { method = "GET", path, params = {} } = req.body;
+  if (!path || !path.startsWith("/v5/")) return res.status(400).json({ error: "Invalid path" });
+  try {
+    const ts = Date.now().toString();
+    let url = "https://api.bybit.com" + path, body, payload = "";
+    if (method === "GET") { const qs = new URLSearchParams(params).toString(); payload = qs; if (qs) url += "?" + qs; }
+    else { body = JSON.stringify(params); payload = body; }
+    const sig = crypto.createHmac("sha256", BYBIT_SECRET).update(ts + BYBIT_KEY + "5000" + payload).digest("hex");
+    const r = await fetch(url, { method, headers: { "Content-Type":"application/json","X-BAPI-API-KEY":BYBIT_KEY,"X-BAPI-TIMESTAMP":ts,"X-BAPI-SIGN":sig,"X-BAPI-RECV-WINDOW":"5000" }, body, signal: AbortSignal.timeout(10000) });
+    res.json(await r.json());
+  } catch (e) { res.status(502).json({ error: e?.message || "Error conectando a Bybit" }); }
+});
+app.listen(PORT, () => console.log("Proxy Bybit en :" + PORT));
+Use Control + Shift + m to toggle the tab key moving focus. Alternatively, use esc then tab to move to the next interactive element on the page.

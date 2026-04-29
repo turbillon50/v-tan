@@ -1,0 +1,35 @@
+modules = ["nodejs-24", "postgresql-16"]
+
+[[artifacts]]
+id = "artifacts/api-server"
+
+[[artifacts]]
+id = "artifacts/mockup-sandbox"
+
+[deployment]
+router = "application"
+deploymentTarget = "gce"
+
+[deployment.postBuild]
+args = ["pnpm", "store", "prune"]
+env = { "CI" = "true" }
+
+[workflows]
+
+[agent]
+stack = "PNPM_WORKSPACE"
+expertMode = true
+
+[postMerge]
+path = "scripts/post-merge.sh"
+timeoutMs = 20000
+
+[userenv]
+
+[userenv.shared]
+BYBIT_PROXY_URL = "https://motivated-prosperity-production-8a64.up.railway.app"
+PROXY_SECRET = "megalod0n_proxy_2025_ALL"
+VITE_CLERK_PUBLISHABLE_KEY = "pk_test_Y29vbC1lZ3JldC04LmNsZXJrLmFjY291bnRzLmRldiQ"
+
+[nix]
+channel = "stable-25_05"

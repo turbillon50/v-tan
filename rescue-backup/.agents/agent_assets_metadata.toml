@@ -1,0 +1,19 @@
+uploads = []
+
+[[generated]]
+id = "MT4JxngontQM8jyVVfHhQ"
+uri = "file://artifacts/trading-dashboard/public/icon-all.png"
+type = "image"
+title = "ALL Trading divine icon"
+
+[[outputs]]
+id = "4GTrMIuEXm5rK04aRp9C_"
+uri = "file://artifacts/trading-dashboard/public/icon-all.png"
+type = "image"
+title = "ALL — Trading Studio · Ícono Divino"
+
+[[outputs]]
+id = "XzRoK6mZxALlot11r5A2Q"
+uri = "file://tanit-alma-completa.json"
+type = "unspecified"
+title = "Tanit — Alma Completa (Exportación para migración)"

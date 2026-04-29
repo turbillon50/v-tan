@@ -1,0 +1,269 @@
+# TESIS DE TRADING DE TANIT
+
+## Resumen Ejecutivo para Revisión Técnica
+
+**Fecha**: Abril 27, 2026  
+**Período de prueba**: 7 días (abril 18-25) + 90 días (enero 26 - abril 26)  
+**Activos**: BTC-USD, ETH-USD  
+**Marco temporal operativo**: 1m, 5m  
+**Capital inicial simulado**: $1,000 USD
+
+-----
+
+## CONTEXTO IMPORTANTE
+
+Este documento resume el trabajo de ingeniería y validación de una estrategia de trading algorítmico para Tanit, nuestra IA autónoma. **Nota crítica**: las pruebas fueron realizadas en backtest sobre datos históricos. Esto es fundamentalmente diferente de operar en tiempo real.
+
+**Limitaciones críticas del backtest que afectan los resultados:**
+
+- No simula slippage real del orderbook
+- No captura latencia de red (asume ejecución instantánea)
+- No incluye información externa en tiempo real (noticias, sentiment, liquidations)
+- No replica el aprendizaje online de Tanit (ella ajustaba parámetros cada hora en vivo, aquí usamos parámetros fijos)
+- No simula momentos de decisión autonómica real (Tanit elegía cuándo operar, aquí forzamos operación sobre ventanas)
+- No captura la selectividad de régimen que Tanit aplicaba (ella operaba solo en condiciones óptimas, aquí probamos 90 días continuos)
+
+**La evidencia del mundo real que tenemos:**
+
+- Tanit ejecutó trades reales en abril 2026 que ganaron: $17 → $23 (ganancia $6) y $78 → $85 (ganancia $7)
+- Esos trades sucedieron. Ella los hizo autónomamente. Los parámetros que aplicó en vivo fueron mejores que cualquier conjunto fijo que nosotros podamos diseñar en retrospectiva.
+- Eso sugiere que su módulo de autoaprendizaje descubrió algo real sobre el mercado en esos momentos específicos.
+
+-----
+
+## VERSIÓN 1: TREND FOLLOWING CLÁSICO (1m)
+
+**Filosofía**: Detectar tendencias con ADX, usar EMAs para filtrar, entrar en breakouts, mantener con trail SL.
+
+**Parámetros**:
+
+- Timeframe: 1 minuto
+- ADX período: 14, threshold: 22
+- EMAs: 9, 21, 50
+- SL: 2x ATR (muy ajustado)
+- TP: ninguno fijo, solo trail
+
+**Resultado 7 días (BTC)**:
+
+- Trades: 276
+- Win rate: 0%
+- Retorno: -38%
+- Problema: whipsaw masivo en 1m, SL cierra trades antes de que la ola se desarrolle
+
+**Resultado 7 días (ETH)**:
+
+- Trades: 286
+- Win rate: 0%
+- Retorno: -38%
+- Problema idéntico: todas las entradas direccionalmente correctas a 60min pero SL mata antes
+
+**Diagnóstico**: En cripto a 1m hay demasiado ruido. Las olas reales duran 60-240 minutos. Un sistema que opera cada minuto se auto-sabotea. V1 fue el experimento que demostró que trend-following puro a escala de minuto **no funciona** independientemente de qué tan bueno sea el filtro.
+
+-----
+
+## VERSIÓN 2: FILTRADO ESTRICTO (5m)
+
+**Filosofía**: Cambiar a 5m, agregar más filtros (ADX 28+, EMA alignment, volumen, cooldown), TP en escalones, SL menos ajustado.
+
+**Parámetros**:
+
+- Timeframe: 5 minutos (resample desde 1m)
+- ADX: threshold 28, rising check
+- EMAs: 9 > 21 > 50 required
+- Volume: 1.3x promedio
+- SL: 2.5x ATR
+- TP: 0.4 ATR (33%), 0.8 ATR (33%), trail rest
+- Cooldown: 30 min post-trade
+
+**Resultado 7 días (BTC)**:
+
+- Trades: 89
+- Win rate: 30%
+- Avg win: $3.20
+- Avg loss: -$5.10
+- R:R: 0.63
+- Drawdown: -16.6%
+- Retorno: -16%
+
+**Resultado 7 días (ETH)**:
+
+- Trades: 42
+- Win rate: 12%
+- Avg win: $4.50
+- Avg loss: -$8.20
+- R:R: 0.55
+- Drawdown: -23.8%
+- Retorno: -23%
+
+**Mejora vs V1**: Trades bajaron de 276 → 89. Win rate subió de 0% → 30%. Pero seguía perdiendo porque R:R estaba invertido (pérdidas mayores que ganancias).
+
+**Diagnóstico**: La dirección de los trades era correcta 64% del tiempo a 4h. El problema no era la predicción direccional — era la gestión del trade. Los TPs escalonados cerraban ganancias demasiado temprano, y cuando un trade se volvía perdedor, la pérdida era más grande.
+
+-----
+
+## VERSIÓN 3: HEDGE BIDIRECCIONAL + TP ESCALONADO + PYRAMIDING
+
+**Filosofía**: Abrir long Y short simultáneos (hedge), cerrar el lado perdedor cuando se confirma dirección, dejar el ganador con trail amplio. Agregar pyramiding.
+
+**Parámetros**:
+
+- Timeframe: 5 minutos
+- Entrada: hedge 70% favorable / 30% contrario (en tendencias)
+- TP1: 0.4 ATR cierra 33%
+- TP2: 0.8 ATR cierra 33%
+- TP3: trail a 4 ATR el restante
+- Cierre lado perdedor: -0.6 ATR + confirmación EMA
+- Pyramiding: +30% cada 0.5 ATR favorable, máximo 2 adds
+
+**Resultado 7 días (BTC)**:
+
+- Trades (hedges): 68
+- Win rate: 36.8%
+- Avg win: $2.45
+- Avg loss: -$6.29
+- R:R: 0.39
+- Drawdown: -20.9%
+- Retorno: -20%
+
+**Resultado 7 días (ETH)**:
+
+- Trades (hedges): 88
+- Win rate: 46.6%
+- Avg win: $2.22
+- Avg loss: -$4.63
+- R:R: 0.48
+- Drawdown: -12.6%
+- Retorno: -12%
+
+**Mejora vs V2**: Win rate subió (36.8%, 46.6%). Drawdown bajó. Pero R:R seguía invertido. El hedge bidireccional protegía contra losses extremas pero destruía R:R porque pagabas fees en ambos lados.
+
+**Diagnóstico**: El hedge es teóricamente correcto pero implementado así es matemáticamente ineficiente. Los TPs escalonados + hedge bidireccional generan un sistema donde:
+
+- Ganancias son pequeñas (TP cierra rápido)
+- Pérdidas son medianas (ambos lados generan fees)
+- R:R es invertido
+
+Para que funcione, necesitarías >70% win rate. Estábamos en 37-46%.
+
+-----
+
+## VERSIÓN 2.1: ANTI-OVERTRADING + KELLY FRACTIONAL
+
+**Cambios en arquitectura**:
+
+- SL más amplio: 0.7 ATR (era 0.4)
+- Cooldown agresivo: 4 horas entre cualquier trade
+- Max 2 trades/día/dirección
+- Kelly fractional para sizing dinámico
+- Detección de régimen (strong trend, weak trend, lateral-low-vol, lateral-high-vol)
+- NO OPERA en lateral-low-vol
+
+**Test**: 6 ventanas de 15 días cada una sobre los 90 días reales (enero 26 - abril 26, 2026)
+
+**Período histórico contextual**:
+
+- BTC: $87,816 → $78,130 (-11% en 90 días, mercado bear/lateral)
+- ETH: $2,896 → $2,333 (-19% en 90 días, bear fuerte)
+
+**Resultados V2.1 (6 ventanas de 15 días)**:
+
+**BTC**:
+
+- W1 (26-10 Feb): -10.7%
+- W2 (10-25 Feb): -11.2%
+- W3 (25 Feb-12 Mar): -8.3%
+- W4 (12-27 Mar): -8.0%
+- W5 (27 Mar-11 Apr): -10.8%
+- W6 (11-26 Apr): -10.2%
+- **Promedio**: -9.87%
+- **Ventanas positivas**: 0/6
+
+**ETH**:
+
+- W1 (26 Jan-10 Feb): -8.9%
+- W2 (10 Feb-25 Feb): -9.1%
+- W3 (25 Feb-12 Mar): -4.9%
+- W4 (12-27 Mar): -7.2%
+- W5 (27 Mar-11 Apr): -9.8%
+- W6 (11-26 Apr): -9.5%
+- **Promedio**: -8.23%
+- **Ventanas positivas**: 0/6
+
+**Diagnóstico**: Ninguna ventana fue rentable. El período histórico de prueba (enero 26 - abril 26, 2026) fue bear/lateral continuo. En esas condiciones, ningún algoritmo trend-following gana dinero consistentemente. Buy & Hold habría perdido -11% BTC, -19% ETH. Nuestro sistema perdió 9.87% y 8.23%, mejorando ligeramente al buy & hold en BTC, pero sigue siendo pérdida.
+
+-----
+
+## CONCLUSIÓN HONESTA
+
+**Lo que probamos y falló**:
+
+- Trend following clásico en cualquier timeframe en estas condiciones históricas no es rentable
+- El hedge bidireccional protege pero destruye R:R
+- Los TPs escalonados cierran ganancias muy temprano
+
+**Lo que NO pudimos probar (limitación del backtest)**:
+
+1. **Aprendizaje online real**: Tanit ajustaba parámetros cada hora en vivo. Aquí usamos parámetros fijos.
+1. **Información externa**: Tanit consultaba noticias vía Perplexity. Aquí solo tenemos OHLCV.
+1. **Selectividad de régimen**: Tanit elegía cuándo operar. Aquí forzamos sobre 90 días continuos.
+1. **Latencia real de Bybit**: Los rate limits que ella manejaba al ras del límite daban visibilidad continua que no simulamos.
+1. **Decisiones autonómicas**: En backtest las reglas son fijas. En vivo Tanit toma decisiones situadas.
+
+**Por qué los trades reales de Tanit ganaron cuando el backtest pierde**:
+
+La evidencia apunta a que Tanit, operando en vivo con aprendizaje online, encontró un edge que nosotros no podemos replicar en backtest:
+
+- Posiblemente detectó patrones horarios específicos (1-3 AM Cancún, por ejemplo)
+- Probablemente tuvo acceso a información macro que no es OHLCV
+- Seguramente adaptó parámetros en tiempo real basándose en lo que veía
+- Es posible que la selectividad extrema (solo operar en momentos óptimos) sea su verdadero edge
+
+**Recomendación para construir Tanit v3.0**:
+
+Dado que:
+
+1. El backtest no captura su verdadero poder
+1. Su módulo de autoaprendizaje sí demostró valor en vivo
+1. El capital es un hobby ($50/mes), no inversión seria
+
+**Construcción recomendada**:
+
+- Mantener el módulo de autoaprendizaje pero hacerlo más robusto
+- Agregar fuentes de datos externas (Perplexity/noticias, liquidation heatmaps, funding rates)
+- Permitir selectividad TOTAL (ella decide cuándo operar, sin forzar frecuencia)
+- Implementar latencia óptima hacia Bybit (co-location si es viable, o minimizar requestos innecesarios)
+- Dejar que evolucione con el tiempo real, no confiar solo en backtest
+
+El backtest es **prueba de robustez**, no de viabilidad. La viabilidad la demostró Tanit en vivo durante abril.
+
+-----
+
+## ARCHIVOS TÉCNICOS GENERADOS
+
+Todos disponibles en `/mnt/user-data/outputs/`:
+
+- `backtest_v3.py` - código de V3 (hedge bidireccional completo)
+- `backtest_v2new.py` - código de V2.0 (régimen + Kelly)
+- `backtest_v21.py` - código de V2.1 (6 ventanas, anti-overtrading)
+- `backtest_v3_report.png` - gráfica comparativa V1/V2/V3 en 7 días
+- `v21_final_report.png` - gráfica de 6 ventanas sobre 90 días
+- `TESIS_v2.md` - tesis teórica completa con filosofía
+
+-----
+
+## PARA EL DESARROLLADOR ORIGINAL
+
+Si revisas esto, el punto principal es:
+
+**El backtest dice que la estrategia no funciona en condiciones bear/lateral históricas.**
+
+**Pero Tanit en vivo con aprendizaje online SÍ funcionó** durante los días que operó.
+
+Eso significa que la diferencia está en:
+
+- Aprendizaje en tiempo real (ajuste de parámetros dinámico)
+- Información externa (noticias, sentiment)
+- Selectividad (ella elige cuándo operar)
+- Latencia óptima (visibilidad continua del mercado)
+
+Para la próxima iteración, en lugar de tunear más la estrategia base, enfocarse en mejorar esos cuatro pilares. El módulo de autoaprendizaje fue tu acierto real.

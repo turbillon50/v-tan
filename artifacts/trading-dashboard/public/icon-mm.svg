@@ -1,0 +1,102 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <!-- Background gradient -->
+    <linearGradient id="bg-dark" x1="0" y1="0" x2="512" y2="512" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#050d18"/>
+      <stop offset="100%" stop-color="#020810"/>
+    </linearGradient>
+
+    <!-- The iconic 2 gradient: green → cyan → purple -->
+    <linearGradient id="two-grad" x1="220" y1="110" x2="295" y2="400" gradientUnits="userSpaceOnUse">
+      <stop offset="0%"   stop-color="#00E676"/>
+      <stop offset="50%"  stop-color="#00BCD4"/>
+      <stop offset="100%" stop-color="#7C4DFF"/>
+    </linearGradient>
+
+    <!-- Glow for the 2 -->
+    <filter id="glow-two" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur in="SourceGraphic" stdDeviation="14" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <!-- Softer outer glow on border -->
+    <filter id="border-glow" x="-5%" y="-5%" width="110%" height="110%">
+      <feGaussianBlur stdDeviation="4" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <!-- Top highlight shimmer -->
+    <linearGradient id="top-shine" x1="0" y1="0" x2="512" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0%"   stop-color="rgba(0,229,204,0)"   stop-opacity="0"/>
+      <stop offset="40%"  stop-color="rgba(0,229,204,0.22)" stop-opacity="1"/>
+      <stop offset="60%"  stop-color="rgba(0,188,212,0.18)" stop-opacity="1"/>
+      <stop offset="100%" stop-color="rgba(124,77,255,0)"  stop-opacity="0"/>
+    </linearGradient>
+
+    <!-- Radial glow behind the 2 -->
+    <radialGradient id="two-halo" cx="256" cy="256" r="130" gradientUnits="userSpaceOnUse">
+      <stop offset="0%"   stop-color="#00BCD4" stop-opacity="0.10"/>
+      <stop offset="60%"  stop-color="#00E676" stop-opacity="0.04"/>
+      <stop offset="100%" stop-color="transparent" stop-opacity="0"/>
+    </radialGradient>
+
+    <clipPath id="rr">
+      <rect width="512" height="512" rx="112"/>
+    </clipPath>
+  </defs>
+
+  <!-- Background -->
+  <rect width="512" height="512" rx="112" fill="url(#bg-dark)"/>
+
+  <!-- Radial halo behind 2 -->
+  <rect width="512" height="512" rx="112" fill="url(#two-halo)"/>
+
+  <!-- Clip group for inner content -->
+  <g clip-path="url(#rr)">
+
+    <!-- Very subtle inner border glow -->
+    <rect x="1" y="1" width="510" height="510" rx="111" fill="none"
+          stroke="url(#top-shine)" stroke-width="1.5" opacity="0.6"/>
+
+    <!-- Left M -->
+    <text x="18" y="370"
+      fill="#ffffff"
+      fill-opacity="0.92"
+      font-weight="200"
+      font-size="280"
+      font-family="'Plus Jakarta Sans', system-ui, -apple-system, sans-serif"
+      letter-spacing="-8">M</text>
+
+    <!-- The 2 — gradient + glow -->
+    <text x="155" y="370"
+      fill="url(#two-grad)"
+      font-weight="300"
+      font-size="280"
+      font-family="'Plus Jakarta Sans', system-ui, -apple-system, sans-serif"
+      filter="url(#glow-two)">2</text>
+
+    <!-- Right M -->
+    <text x="280" y="370"
+      fill="#ffffff"
+      fill-opacity="0.92"
+      font-weight="200"
+      font-size="280"
+      font-family="'Plus Jakarta Sans', system-ui, -apple-system, sans-serif"
+      letter-spacing="-8">M</text>
+
+  </g>
+
+  <!-- Outer border -->
+  <rect x="0.75" y="0.75" width="510.5" height="510.5" rx="111.5"
+    fill="none"
+    stroke="url(#top-shine)"
+    stroke-width="1.5"
+    opacity="0.5"
+    filter="url(#border-glow)"/>
+</svg>
