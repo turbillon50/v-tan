@@ -47,3 +47,11 @@ Thumbs.db
 # Replit
 .cache/
 .local/
+
+# Environment files and local deploy metadata
+.env
+.env.*
+!.env.example
+!.env.template
+!.env.sample
+.vercel/
