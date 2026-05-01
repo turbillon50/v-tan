@@ -28,7 +28,7 @@ async function getLiveMarketContext(): Promise<string> {
     await Promise.all(symbols.map(async (sym) => {
       try {
         const r = await fetch(`https://api.bybit.com/v5/market/tickers?category=linear&symbol=${sym}`);
-        const j = await r.json();
+        const j = (await r.json()) as { result?: { list?: Array<{ lastPrice?: string }> } };
         const price = parseFloat(j?.result?.list?.[0]?.lastPrice ?? "0");
         if (price > 0) prices[sym.replace("USDT", "")] = price;
       } catch {}

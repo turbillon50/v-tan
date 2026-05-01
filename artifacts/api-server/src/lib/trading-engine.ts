@@ -712,7 +712,7 @@ function getSessionMultiplier(sessionName: string): number {
 }
 
 // Historial de calibraciones para mostrar en dashboard
-let lastCalibration: {
+type CalibrationSnapshot = {
   ts: string;
   cycleNumber: number;
   threshold: number;
@@ -722,8 +722,9 @@ let lastCalibration: {
   dbSamples: number;
   dbConfidence: number;
   changes: string[];
-} | null = null;
-const calibrationHistory: typeof lastCalibration[] = [];
+};
+let lastCalibration: CalibrationSnapshot | null = null;
+const calibrationHistory: CalibrationSnapshot[] = [];
 let calibrationCycleCount = 0;
 let liveBalanceTimer: ReturnType<typeof setInterval> | null = null;
 let syncTimer: ReturnType<typeof setInterval> | null = null;
@@ -10928,6 +10929,7 @@ export function getProtectionGuardStatus(): {
   frLongBlocked: boolean;
   macroDangerZone: boolean;
   atrSlMultiplier: number;
+  atrTpMultiplier: number;
 } {
   const oldest = _btcPriceHistory[0]?.price ?? 0;
   const newest = _btcPriceHistory[_btcPriceHistory.length - 1]?.price ?? 0;
