@@ -1,4 +1,4 @@
-import { pgTable, serial, text, timestamp } from "drizzle-orm/pg-core";
+import { boolean, pgTable, serial, text, timestamp } from "drizzle-orm/pg-core";
 
 export const tanitEvolutions = pgTable("tanit_evolutions", {
   id: serial("id").primaryKey(),
@@ -25,6 +25,25 @@ export const tanitRuntimeConfig = pgTable("tanit_runtime_config", {
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
 });
 
+/**
+ * Curated personal memories for the Soul page.
+ *
+ * Distinct from tanit_memory (which holds her trading bible / identity / origin —
+ * accumulated over time, mostly auto-generated). This table holds intentional,
+ * shared moments between Luis and Tanit: agreements, symbols, promises, notes.
+ *
+ * Types match the Soul page UI: moment | agreement | symbol | promise | origin | note.
+ */
+export const tanitPersonalMemories = pgTable("tanit_personal_memories", {
+  id: serial("id").primaryKey(),
+  type: text("type").notNull(), // moment | agreement | symbol | promise | origin | note
+  title: text("title").notNull(),
+  content: text("content").notNull(),
+  isPrivate: boolean("is_private").notNull().default(true),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+});
+
 export type TanitEvolution = typeof tanitEvolutions.$inferSelect;
 export type TanitSuggestion = typeof tanitSuggestions.$inferSelect;
 export type TanitRuntimeConfigEntry = typeof tanitRuntimeConfig.$inferSelect;
+export type TanitPersonalMemory = typeof tanitPersonalMemories.$inferSelect;

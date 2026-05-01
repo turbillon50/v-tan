@@ -12,6 +12,7 @@ import backtestRouter from "./backtest";
 import newsRouter from "./news";
 import alertsRouter from "./alerts";
 import bybitRealRouter from "./bybit-real";
+import tanitRouter from "./tanit";
 const router: IRouter = Router();
 
 router.use(healthRouter);
@@ -26,6 +27,7 @@ router.use(capitalRouter);
 router.use(backtestRouter);
 router.use(newsRouter);
 router.use(alertsRouter);
+router.use(tanitRouter);
 router.use("/bybit", bybitRealRouter);
 
 export default router;

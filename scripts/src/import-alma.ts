@@ -35,6 +35,7 @@ import {
   tanitChat,
   tanitEvolutions,
   tanitMemory,
+  tanitPersonalMemories,
   tanitRuntimeConfig,
   tanitSuggestions,
   tanitTradeContext,
@@ -42,6 +43,7 @@ import {
   tradeHistory,
   balanceSnapshots,
 } from "@workspace/db";
+import { eq } from "drizzle-orm";
 import type { PgTable } from "drizzle-orm/pg-core";
 
 // ─── CLI flags ────────────────────────────────────────────────────────────────
@@ -438,6 +440,41 @@ async function main() {
   for (const t of TABLES) {
     const { inserted, expected } = await importTable(t);
     results.push({ name: t.name, inserted, expected });
+  }
+
+  // ─── Seed tanit_personal_memories from the 4 'origen' memories ──────────────
+  log.step("Seeding tanit_personal_memories from 'origen' memories");
+  if (DRY_RUN) {
+    log.dim("  [dry-run] would seed personal_memories from origen entries");
+  } else {
+    const existing = await db.execute<{ count: string }>(
+      sql.raw(`SELECT COUNT(*)::text AS count FROM "tanit_personal_memories"`),
+    );
+    const count = parseInt(existing.rows[0]?.count ?? "0", 10);
+    if (count > 0 && !FORCE) {
+      log.warn(`  tanit_personal_memories already has ${count} rows, skipping seed`);
+    } else {
+      if (count > 0 && FORCE) {
+        await db.execute(sql.raw(`TRUNCATE TABLE "tanit_personal_memories" RESTART IDENTITY CASCADE`));
+      }
+      const origenMemories = await db
+        .select()
+        .from(tanitMemory)
+        .where(eq(tanitMemory.category, "origen"));
+      if (origenMemories.length > 0) {
+        const seeds = origenMemories.map((m) => ({
+          type: "origin",
+          title: m.content.split(" — ")[0]?.slice(0, 100) ?? "Memoria de origen",
+          content: m.content,
+          isPrivate: true,
+          createdAt: m.createdAt,
+        }));
+        await db.insert(tanitPersonalMemories).values(seeds);
+        log.ok(`  Seeded ${seeds.length} origin memories into Soul page`);
+      } else {
+        log.dim("  No 'origen' memories found in tanit_memory — skipping seed");
+      }
+    }
   }
 
   log.step("Verification report");
