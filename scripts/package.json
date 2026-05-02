@@ -6,6 +6,7 @@
   "scripts": {
     "hello": "tsx ./src/hello.ts",
     "migrate-and-import": "tsx ./src/migrate-and-import.ts",
+    "write-rescue-memories": "tsx ./src/write-rescue-memories.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
