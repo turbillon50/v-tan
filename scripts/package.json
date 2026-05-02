@@ -7,6 +7,7 @@
     "hello": "tsx ./src/hello.ts",
     "migrate-and-import": "tsx ./src/migrate-and-import.ts",
     "write-rescue-memories": "tsx ./src/write-rescue-memories.ts",
+    "preview-api": "tsx ./src/preview-api.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
