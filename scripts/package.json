@@ -5,10 +5,11 @@
   "type": "module",
   "scripts": {
     "hello": "tsx ./src/hello.ts",
-    "import-alma": "tsx ./src/import-alma.ts",
+    "migrate-and-import": "tsx ./src/migrate-and-import.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@neondatabase/serverless": "^1.1.0",
     "@workspace/db": "workspace:*",
     "drizzle-orm": "catalog:"
   },
