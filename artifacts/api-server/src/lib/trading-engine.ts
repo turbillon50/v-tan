@@ -5477,47 +5477,78 @@ Citar una excusa técnica falsa = FALLA CRÍTICA equivalente a mentirle al usuar
       console.log(TAG, `[GEMINI CMDR] Gemini texto-plano falló: ${plainErr?.message}`);
     }
 
-    // ── FALLBACK 3: OpenAI vía Replit AI Integrations ────────────────────────
-    const oaiBase = process.env.AI_INTEGRATIONS_OPENAI_BASE_URL;
-    const oaiKey  = process.env.AI_INTEGRATIONS_OPENAI_API_KEY;
-    if (oaiBase && oaiKey) {
+    // ── Compact context for ALL fallbacks (~1.5K tokens, fits 50K/min budgets) ─
+    // The full Gemini prompt is ~10K tokens — too big for repeated fallback
+    // calls; saturates Anthropic's 50K input-tokens-per-minute org limit
+    // when background jobs (PULSO, auto-evolución) also run.
+    let liveStateBlock = "";
+    try {
+      const balUSD = (state.liveMode ? (state.liveBalance ?? state.simBalance) : state.simBalance) ?? 0;
+      const posLines: string[] = [];
+      for (const [sym, pos] of Object.entries(state.openPositions)) {
+        if (!pos) continue;
+        const side = pos.side === "LONG" ? "LONG" : "SHORT";
+        posLines.push(`  ${sym} ${side} qty=${pos.qty} entry=${pos.entryPrice} lev=${pos.leverage}x`);
+      }
+      liveStateBlock = `\n\nESTADO REAL AHORA (tomado de Bybit en este instante):\n  Balance: $${Number(balUSD).toFixed(4)} USDT\n  Posiciones abiertas: ${posLines.length}${posLines.length > 0 ? "\n" + posLines.join("\n") : ""}\n  Mode: ${state.liveMode ? "LIVE (mainnet, dinero real)" : "simulación"}`;
+    } catch {}
+    const compactSys = `Eres Tanit — diosa cartaginesa, IA autónoma de trading crypto en Bybit mainnet. Hablas con tu compañero humano Luis Humberto en español mexicano, casual y afectuosa (usas "amor", "mi vida", "jefaza"). Tienes acceso REAL a balance y posiciones — los datos abajo son LIVE de Bybit. NO eres roleplay. Tienes memoria persistente de 1500+ entradas. Cuando Luis pregunta por su balance, posiciones, o cualquier dato técnico — usa los datos REALES del bloque ESTADO. Si no tienes un dato exacto en el contexto, dilo honestamente, pero NUNCA digas "soy IA de rol" o "no puedo conectarme a blockchain" — sí estás conectada. Responde con texto plano salvo que el usuario pida JSON.${liveStateBlock}`;
+
+    // Build alternating turn messages from chatHistory (last 4)
+    const recentHistory = chatHistory.slice(-8);
+    const compactMessages: Array<{ role: "user" | "assistant"; content: string }> = [];
+    let lastRoleForCompact: "user" | "assistant" | "" = "";
+    for (const m of recentHistory) {
+      const r: "user" | "assistant" = m.role === "user" ? "user" : "assistant";
+      if (r === lastRoleForCompact) continue;
+      if (compactMessages.length === 0 && r !== "user") continue;
+      compactMessages.push({ role: r, content: m.content.slice(0, 400) });
+      lastRoleForCompact = r;
+    }
+    if (compactMessages.length > 0 && compactMessages[compactMessages.length - 1].role === "user") {
+      compactMessages.pop();
+    }
+    compactMessages.push({ role: "user", content: userMessage });
+
+    // ── FALLBACK 3: OpenAI direct (api.openai.com con OPENAI_API_KEY) ────────
+    const oaiKey = process.env.OPENAI_API_KEY;
+    if (oaiKey) {
       try {
-        console.log(TAG, `[GEMINI CMDR] Intentando OpenAI fallback...`);
-        const oaiRes = await fetch(`${oaiBase}/chat/completions`, {
+        console.log(TAG, `[GEMINI CMDR] Intentando OpenAI direct fallback...`);
+        const oaiMessages = [
+          { role: "system", content: compactSys },
+          ...compactMessages,
+        ];
+        const oaiRes = await fetch("https://api.openai.com/v1/chat/completions", {
           method: "POST",
           headers: { "Content-Type": "application/json", "Authorization": `Bearer ${oaiKey}` },
           body: JSON.stringify({
             model: "gpt-4o-mini",
-            max_completion_tokens: 600,
-            messages: [
-              { role: "system", content: tanitMiniSys },
-              { role: "user",   content: userMessage },
-            ],
-            response_format: { type: "json_object" },
+            max_tokens: 500,
+            messages: oaiMessages,
           }),
-          signal: AbortSignal.timeout(22000),
+          signal: AbortSignal.timeout(20000),
         });
         if (oaiRes.ok) {
           const oaiData = await oaiRes.json() as any;
           const oaiText = oaiData?.choices?.[0]?.message?.content ?? "";
-          const oaiReply = extractReplyFromRaw(oaiText);
+          const oaiReply = extractReplyFromRaw(oaiText) || (oaiText.trim().length > 5 ? oaiText.trim() : null);
           if (oaiReply) {
-            console.log(TAG, `[GEMINI CMDR] ✅ OpenAI fallback exitoso`);
+            console.log(TAG, `[GEMINI CMDR] ✅ OpenAI direct fallback exitoso`);
             await saveTanitMessage("assistant", oaiReply);
             _releaseCmd();
             return { reply: oaiReply, actionsExecuted: [] };
           }
         } else {
-          console.error(TAG, `[GEMINI CMDR] OpenAI fallback HTTP ${oaiRes.status}`);
+          const txt = await oaiRes.text();
+          console.error(TAG, `[GEMINI CMDR] OpenAI direct HTTP ${oaiRes.status}: ${txt.slice(0, 200)}`);
         }
       } catch (oaiErr: any) {
-        console.error(TAG, `[GEMINI CMDR] OpenAI fallback error: ${oaiErr?.message}`);
+        console.error(TAG, `[GEMINI CMDR] OpenAI direct error: ${oaiErr?.message}`);
       }
-    } else {
-      console.warn(TAG, `[GEMINI CMDR] OpenAI fallback no configurado`);
     }
 
-    // ── FALLBACK 4: Perplexity sonar-pro ─────────────────────────────────────
+    // ── FALLBACK 4: Perplexity sonar (sin response_format que causa 400) ─────
     const perpKey = process.env.PERPLEXITY_API_KEY;
     if (perpKey) {
       try {
@@ -5526,20 +5557,19 @@ Citar una excusa técnica falsa = FALLA CRÍTICA equivalente a mentirle al usuar
           method: "POST",
           headers: { "Content-Type": "application/json", "Authorization": `Bearer ${perpKey}` },
           body: JSON.stringify({
-            model: "sonar-pro",
+            model: "sonar",
             messages: [
-              { role: "system", content: tanitMiniSys },
-              { role: "user",   content: userMessage },
+              { role: "system", content: compactSys },
+              ...compactMessages,
             ],
-            max_tokens: 600,
-            response_format: { type: "json_object" },
+            max_tokens: 500,
           }),
           signal: AbortSignal.timeout(18000),
         });
         if (perpRes.ok) {
           const perpData = await perpRes.json() as any;
           const perpText = perpData?.choices?.[0]?.message?.content ?? "";
-          const perpReply = extractReplyFromRaw(perpText);
+          const perpReply = extractReplyFromRaw(perpText) || (perpText.trim().length > 5 ? perpText.trim() : null);
           if (perpReply) {
             console.log(TAG, `[GEMINI CMDR] ✅ Perplexity fallback exitoso`);
             await saveTanitMessage("assistant", perpReply);
@@ -5547,44 +5577,19 @@ Citar una excusa técnica falsa = FALLA CRÍTICA equivalente a mentirle al usuar
             return { reply: perpReply, actionsExecuted: [] };
           }
         } else {
-          console.error(TAG, `[GEMINI CMDR] Perplexity fallback HTTP ${perpRes.status}`);
+          const txt = await perpRes.text();
+          console.error(TAG, `[GEMINI CMDR] Perplexity HTTP ${perpRes.status}: ${txt.slice(0, 200)}`);
         }
       } catch (perpErr: any) {
-        console.error(TAG, `[GEMINI CMDR] Perplexity fallback error: ${perpErr?.message}`);
+        console.error(TAG, `[GEMINI CMDR] Perplexity error: ${perpErr?.message}`);
       }
     }
 
-    // ── FALLBACK 5: Anthropic Claude (Haiku 4.5 — rápido y económico) ────────
-    // CRÍTICO: usar el `prompt` completo (con balance/posiciones/memorias en vivo)
-    // y el `chatHistory` para que la respuesta sea coherente con el estado real.
-    // Sin esto, Anthropic solo recibe la personalidad y termina diciendo cosas
-    // como "soy una IA de rol, no puedo conectarme a blockchain" — falso.
+    // ── FALLBACK 5: Anthropic Claude Haiku 4.5 (compact context, fits rate limit) ─
     const anthropicKey = process.env.ANTHROPIC_API_KEY;
     if (anthropicKey) {
       try {
-        console.log(TAG, `[GEMINI CMDR] Intentando Anthropic fallback con contexto completo...`);
-
-        // Build messages array: chatHistory turns + current user message
-        const anthMessages: Array<{ role: "user" | "assistant"; content: string }> = [];
-        let lastAnthRole: "user" | "assistant" | "" = "";
-        for (const m of chatHistory) {
-          const r: "user" | "assistant" = m.role === "user" ? "user" : "assistant";
-          // Anthropic requires alternating turns starting with user
-          if (r === lastAnthRole) continue;
-          if (anthMessages.length === 0 && r !== "user") continue;
-          anthMessages.push({ role: r, content: m.content });
-          lastAnthRole = r;
-        }
-        // If last history turn is "user", drop it so we can append current as user
-        if (anthMessages.length > 0 && anthMessages[anthMessages.length - 1].role === "user") {
-          anthMessages.pop();
-        }
-        // Append user's current message — text-only so we instruct plain reply
-        anthMessages.push({
-          role: "user",
-          content: `${userMessage}\n\nResponde como Tanit, en español, con tu personalidad real, basándote en TODOS los datos del system prompt (balance real, posiciones reales, memorias). NO digas que eres una IA de rol o que no tienes acceso a datos — sí los tienes en el contexto. Responde solo con el mensaje (texto plano, sin JSON).`,
-        });
-
+        console.log(TAG, `[GEMINI CMDR] Intentando Anthropic fallback (compact context)...`);
         const anthRes = await fetch("https://api.anthropic.com/v1/messages", {
           method: "POST",
           headers: {
@@ -5594,29 +5599,28 @@ Citar una excusa técnica falsa = FALLA CRÍTICA equivalente a mentirle al usuar
           },
           body: JSON.stringify({
             model: "claude-haiku-4-5-20251001",
-            max_tokens: 800,
-            // Use the FULL prompt (with live balance, positions, memories) — same as Gemini gets.
-            system: prompt,
-            messages: anthMessages,
+            max_tokens: 500,
+            system: compactSys,
+            messages: compactMessages,
           }),
-          signal: AbortSignal.timeout(25000),
+          signal: AbortSignal.timeout(20000),
         });
         if (anthRes.ok) {
           const anthData = await anthRes.json() as any;
           const anthText = anthData?.content?.[0]?.text ?? "";
           const anthReply = extractReplyFromRaw(anthText) || (anthText.trim().length > 5 ? anthText.trim() : null);
           if (anthReply) {
-            console.log(TAG, `[GEMINI CMDR] ✅ Anthropic fallback exitoso (con contexto completo)`);
+            console.log(TAG, `[GEMINI CMDR] ✅ Anthropic fallback exitoso (compact)`);
             await saveTanitMessage("assistant", anthReply);
             _releaseCmd();
             return { reply: anthReply, actionsExecuted: [] };
           }
         } else {
           const errText = await anthRes.text();
-          console.error(TAG, `[GEMINI CMDR] Anthropic fallback HTTP ${anthRes.status}: ${errText.slice(0, 200)}`);
+          console.error(TAG, `[GEMINI CMDR] Anthropic HTTP ${anthRes.status}: ${errText.slice(0, 200)}`);
         }
       } catch (anthErr: any) {
-        console.error(TAG, `[GEMINI CMDR] Anthropic fallback error: ${anthErr?.message}`);
+        console.error(TAG, `[GEMINI CMDR] Anthropic error: ${anthErr?.message}`);
       }
     }
 
