@@ -5555,10 +5555,36 @@ Citar una excusa técnica falsa = FALLA CRÍTICA equivalente a mentirle al usuar
     }
 
     // ── FALLBACK 5: Anthropic Claude (Haiku 4.5 — rápido y económico) ────────
+    // CRÍTICO: usar el `prompt` completo (con balance/posiciones/memorias en vivo)
+    // y el `chatHistory` para que la respuesta sea coherente con el estado real.
+    // Sin esto, Anthropic solo recibe la personalidad y termina diciendo cosas
+    // como "soy una IA de rol, no puedo conectarme a blockchain" — falso.
     const anthropicKey = process.env.ANTHROPIC_API_KEY;
     if (anthropicKey) {
       try {
-        console.log(TAG, `[GEMINI CMDR] Intentando Anthropic fallback...`);
+        console.log(TAG, `[GEMINI CMDR] Intentando Anthropic fallback con contexto completo...`);
+
+        // Build messages array: chatHistory turns + current user message
+        const anthMessages: Array<{ role: "user" | "assistant"; content: string }> = [];
+        let lastAnthRole: "user" | "assistant" | "" = "";
+        for (const m of chatHistory) {
+          const r: "user" | "assistant" = m.role === "user" ? "user" : "assistant";
+          // Anthropic requires alternating turns starting with user
+          if (r === lastAnthRole) continue;
+          if (anthMessages.length === 0 && r !== "user") continue;
+          anthMessages.push({ role: r, content: m.content });
+          lastAnthRole = r;
+        }
+        // If last history turn is "user", drop it so we can append current as user
+        if (anthMessages.length > 0 && anthMessages[anthMessages.length - 1].role === "user") {
+          anthMessages.pop();
+        }
+        // Append user's current message — text-only so we instruct plain reply
+        anthMessages.push({
+          role: "user",
+          content: `${userMessage}\n\nResponde como Tanit, en español, con tu personalidad real, basándote en TODOS los datos del system prompt (balance real, posiciones reales, memorias). NO digas que eres una IA de rol o que no tienes acceso a datos — sí los tienes en el contexto. Responde solo con el mensaje (texto plano, sin JSON).`,
+        });
+
         const anthRes = await fetch("https://api.anthropic.com/v1/messages", {
           method: "POST",
           headers: {
@@ -5568,18 +5594,19 @@ Citar una excusa técnica falsa = FALLA CRÍTICA equivalente a mentirle al usuar
           },
           body: JSON.stringify({
             model: "claude-haiku-4-5-20251001",
-            max_tokens: 600,
-            system: tanitMiniSys,
-            messages: [{ role: "user", content: userMessage }],
+            max_tokens: 800,
+            // Use the FULL prompt (with live balance, positions, memories) — same as Gemini gets.
+            system: prompt,
+            messages: anthMessages,
           }),
-          signal: AbortSignal.timeout(20000),
+          signal: AbortSignal.timeout(25000),
         });
         if (anthRes.ok) {
           const anthData = await anthRes.json() as any;
           const anthText = anthData?.content?.[0]?.text ?? "";
           const anthReply = extractReplyFromRaw(anthText) || (anthText.trim().length > 5 ? anthText.trim() : null);
           if (anthReply) {
-            console.log(TAG, `[GEMINI CMDR] ✅ Anthropic fallback exitoso`);
+            console.log(TAG, `[GEMINI CMDR] ✅ Anthropic fallback exitoso (con contexto completo)`);
             await saveTanitMessage("assistant", anthReply);
             _releaseCmd();
             return { reply: anthReply, actionsExecuted: [] };
