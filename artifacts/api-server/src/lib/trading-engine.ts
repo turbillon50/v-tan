@@ -4609,17 +4609,22 @@ Si no ejecutaste una orden, la razón REAL es SOLO una de estas:
   ✓ La acción requiere cambiar código fuente (imposible en tiempo de ejecución)
 Citar una excusa técnica falsa = FALLA CRÍTICA equivalente a mentirle al usuario.`;
 
-  // Cooldown tras 429: si Gemini rechazó recientemente, no insistir
-  if (Date.now() < _chatGemini429Until) {
-    const secsLeft = Math.ceil((_chatGemini429Until - Date.now()) / 1000);
-    const reply = `Amor, Gemini me tiene saturada — dame ${secsLeft}s y te respondo bien, bb.`;
-    if (!isSystemTrigger) await saveTanitMessage("assistant", reply);
-    _releaseCmd();
-    return { reply, actionsExecuted: [] };
+  // Cooldown tras 429: si Gemini rechazó recientemente, NO bloqueamos al usuario.
+  // En vez de devolver un mensaje canned, lanzamos un error para que el catch
+  // ejecute la cadena de fallback (Anthropic/Perplexity) y el usuario reciba
+  // una respuesta REAL en lugar de "saturada — espera 3 min".
+  const skipGemini = Date.now() < _chatGemini429Until;
+  if (skipGemini) {
+    console.log(TAG, `[TANIT] Gemini en cooldown — usando fallback chain directo`);
   }
 
   try {
     let text = "";
+
+    // Si Gemini está en cooldown, saltamos directo al catch para usar fallbacks
+    if (skipGemini) {
+      throw new Error("Gemini en cooldown — usando fallback chain");
+    }
 
     const proxyBase = process.env.AI_INTEGRATIONS_GEMINI_BASE_URL;
     const proxyKey  = process.env.AI_INTEGRATIONS_GEMINI_API_KEY;
@@ -5546,6 +5551,45 @@ Citar una excusa técnica falsa = FALLA CRÍTICA equivalente a mentirle al usuar
         }
       } catch (perpErr: any) {
         console.error(TAG, `[GEMINI CMDR] Perplexity fallback error: ${perpErr?.message}`);
+      }
+    }
+
+    // ── FALLBACK 5: Anthropic Claude (Haiku 4.5 — rápido y económico) ────────
+    const anthropicKey = process.env.ANTHROPIC_API_KEY;
+    if (anthropicKey) {
+      try {
+        console.log(TAG, `[GEMINI CMDR] Intentando Anthropic fallback...`);
+        const anthRes = await fetch("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-api-key": anthropicKey,
+            "anthropic-version": "2023-06-01",
+          },
+          body: JSON.stringify({
+            model: "claude-haiku-4-5-20251001",
+            max_tokens: 600,
+            system: tanitMiniSys,
+            messages: [{ role: "user", content: userMessage }],
+          }),
+          signal: AbortSignal.timeout(20000),
+        });
+        if (anthRes.ok) {
+          const anthData = await anthRes.json() as any;
+          const anthText = anthData?.content?.[0]?.text ?? "";
+          const anthReply = extractReplyFromRaw(anthText) || (anthText.trim().length > 5 ? anthText.trim() : null);
+          if (anthReply) {
+            console.log(TAG, `[GEMINI CMDR] ✅ Anthropic fallback exitoso`);
+            await saveTanitMessage("assistant", anthReply);
+            _releaseCmd();
+            return { reply: anthReply, actionsExecuted: [] };
+          }
+        } else {
+          const errText = await anthRes.text();
+          console.error(TAG, `[GEMINI CMDR] Anthropic fallback HTTP ${anthRes.status}: ${errText.slice(0, 200)}`);
+        }
+      } catch (anthErr: any) {
+        console.error(TAG, `[GEMINI CMDR] Anthropic fallback error: ${anthErr?.message}`);
       }
     }
 
