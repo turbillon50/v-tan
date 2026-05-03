@@ -3800,18 +3800,8 @@ export async function runGeminiUserCommand(
     loadTanitHistory(16),  // últimos 16 mensajes = 8 turnos
     loadTanitMemory(),
   ]);
-  // memoryStr — se recorta para no saturar el rate-limit de Gemini.
-  // Las memorias personales (usuario/origen/LECCION_CRITICA) ya van duplicadas
-  // arriba en criticalIdentityBlock, así que aquí sólo necesitamos las últimas
-  // entradas de aprendizaje (trading, técnica, mercado). Cap a 120 más recientes
-  // baja el prompt de ~10K → ~3K tokens y reduce 429s.
-  const _personalCats = new Set(["usuario", "origen", "LECCION_CRITICA"]);
-  const _learningEntries = memoryEntries
-    .filter(m => !_personalCats.has(m.category))
-    .sort((a, b) => b.id - a.id)
-    .slice(0, 120);
-  const memoryStr = _learningEntries.length > 0
-    ? _learningEntries.map(m => `[${m.id}][${m.category}] ${m.content}`).join("\n")
+  const memoryStr = memoryEntries.length > 0
+    ? memoryEntries.map(m => `[${m.id}][${m.category}] ${m.content}`).join("\n")
     : "(Sin memorias guardadas aún)";
 
   // ── MEMORIAS CRÍTICAS DE IDENTIDAD — invocables siempre, en TODO contexto ──
