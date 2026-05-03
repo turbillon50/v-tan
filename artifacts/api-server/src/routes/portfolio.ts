@@ -69,20 +69,25 @@ router.get("/portfolio/positions", async (_req, res): Promise<void> => {
       .filter((p: any) => parseFloat(p.size) > 0)
       .map((p: any) => ({
         symbol:               p.symbol,
-        side:                 p.side === "Buy" ? "LONG" : "SHORT",
+        // Bybit returns "Buy"/"Sell" — schema expects same. Don't translate to LONG/SHORT here.
+        side:                 (p.side === "Buy" || p.side === "Sell") ? p.side : "Buy",
         size:                 parseFloat(p.size),
-        entryPrice:           parseFloat(p.avgPrice),
-        markPrice:            parseFloat(p.markPrice),
-        leverage:             parseFloat(p.leverage),
-        unrealizedPnl:        parseFloat(p.unrealisedPnl),
-        unrealizedPnlPercent: parseFloat(p.unrealisedPnl) / (parseFloat(p.positionValue) || 1) * parseFloat(p.leverage) * 100,
+        entryPrice:           parseFloat(p.avgPrice || "0"),
+        markPrice:            parseFloat(p.markPrice || "0"),
+        leverage:             parseFloat(p.leverage || "1"),
+        unrealizedPnl:        parseFloat(p.unrealisedPnl || "0"),
+        unrealizedPnlPercent: parseFloat(p.unrealisedPnl || "0") / (parseFloat(p.positionValue || "0") || 1) * parseFloat(p.leverage || "1") * 100,
         liquidationPrice:     parseFloat(p.liqPrice || "0"),
         stopLoss:             parseFloat(p.stopLoss || "0"),
-        takeProfit:           parseFloat(p.takeProfit || "0"),
+        takeProfit1:          parseFloat(p.takeProfit || "0"),
+        takeProfit2:          0,
+        takeProfit3:          0,
+        openedAt:             parseInt(p.createdTime || p.updatedTime || "0", 10),
       }));
 
     res.json(GetPositionsResponse.parse(positions));
-  } catch {
+  } catch (err) {
+    console.warn("[portfolio/positions] error:", (err as Error).message);
     res.json(GetPositionsResponse.parse([]));
   }
 });
