@@ -5548,42 +5548,12 @@ Citar una excusa técnica falsa = FALLA CRÍTICA equivalente a mentirle al usuar
       }
     }
 
-    // ── FALLBACK 4: Perplexity sonar (sin response_format que causa 400) ─────
-    const perpKey = process.env.PERPLEXITY_API_KEY;
-    if (perpKey) {
-      try {
-        console.log(TAG, `[GEMINI CMDR] Intentando Perplexity fallback...`);
-        const perpRes = await fetch("https://api.perplexity.ai/chat/completions", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "Authorization": `Bearer ${perpKey}` },
-          body: JSON.stringify({
-            model: "sonar",
-            messages: [
-              { role: "system", content: compactSys },
-              ...compactMessages,
-            ],
-            max_tokens: 500,
-          }),
-          signal: AbortSignal.timeout(18000),
-        });
-        if (perpRes.ok) {
-          const perpData = await perpRes.json() as any;
-          const perpText = perpData?.choices?.[0]?.message?.content ?? "";
-          const perpReply = extractReplyFromRaw(perpText) || (perpText.trim().length > 5 ? perpText.trim() : null);
-          if (perpReply) {
-            console.log(TAG, `[GEMINI CMDR] ✅ Perplexity fallback exitoso`);
-            await saveTanitMessage("assistant", perpReply);
-            _releaseCmd();
-            return { reply: perpReply, actionsExecuted: [] };
-          }
-        } else {
-          const txt = await perpRes.text();
-          console.error(TAG, `[GEMINI CMDR] Perplexity HTTP ${perpRes.status}: ${txt.slice(0, 200)}`);
-        }
-      } catch (perpErr: any) {
-        console.error(TAG, `[GEMINI CMDR] Perplexity error: ${perpErr?.message}`);
-      }
-    }
+    // ── FALLBACK 4 REMOVED: Perplexity NO is in personality chat fallback ────
+    // Perplexity sonar is a web-search model — when asked "mi vida cómo estás"
+    // it returned Google results about Spanish songs with [1][3][6] citations
+    // instead of Tanit's personality. Perplexity is reserved for the dedicated
+    // news/web-search context elsewhere (intel block in Gemini prompt). It
+    // does NOT belong in the chat personality fallback chain.
 
     // ── FALLBACK 5: Anthropic Claude Haiku 4.5 (compact context, fits rate limit) ─
     const anthropicKey = process.env.ANTHROPIC_API_KEY;
