@@ -7,6 +7,8 @@ import {
 } from "@workspace/api-zod";
 import { bybitGet, hasCredentials } from "../lib/bybit-client";
 import { getBybitBalance } from "../lib/bybit-auth";
+import { db, tradeHistory } from "@workspace/db";
+import { desc } from "drizzle-orm";
 
 const router = Router();
 
@@ -93,23 +95,112 @@ router.get("/portfolio/positions", async (_req, res): Promise<void> => {
 });
 
 // ─── Trades ───────────────────────────────────────────────────────────────────
-router.get("/portfolio/trades", async (_req, res): Promise<void> => {
-  res.json(GetTradesResponse.parse([]));
+router.get("/portfolio/trades", async (req, res): Promise<void> => {
+  try {
+    const limit = Math.min(parseInt(String(req.query.limit ?? "50"), 10) || 50, 200);
+    const rows = await db
+      .select()
+      .from(tradeHistory)
+      .orderBy(desc(tradeHistory.openedAt))
+      .limit(limit);
+
+    const trades = rows.map((r) => {
+      const entry = parseFloat(r.entryPrice ?? "0");
+      const exit  = parseFloat(r.exitPrice ?? "0");
+      const pnl   = parseFloat(r.netPnl ?? "0");
+      const qty   = parseFloat(r.qty ?? "0");
+      const lev   = r.leverage ?? 1;
+      const notional = entry * qty;
+      const pnlPercent = notional > 0 ? (pnl / notional) * 100 : 0;
+      const opened = r.openedAt ? new Date(r.openedAt).getTime() : 0;
+      const closed = r.closedAt ? new Date(r.closedAt).getTime() : opened;
+      const duration = Math.max(0, Math.round((closed - opened) / 60000)); // minutes
+      const side: "Buy" | "Sell" = (r.side === "LONG" || r.side === "Buy") ? "Buy" : "Sell";
+      const riskMode: "conservative" | "risky" | "ultra" =
+        lev <= 5 ? "conservative" : lev <= 15 ? "risky" : "ultra";
+      return {
+        id: String(r.id),
+        symbol: r.symbol,
+        side,
+        size: qty,
+        entryPrice: entry,
+        exitPrice: exit,
+        pnl,
+        pnlPercent,
+        leverage: lev,
+        duration,
+        closedAt: closed,
+        riskMode,
+      };
+    });
+
+    res.json(GetTradesResponse.parse(trades));
+  } catch (err) {
+    console.warn("[portfolio/trades] error:", (err as Error).message);
+    res.json(GetTradesResponse.parse([]));
+  }
 });
 
 // ─── Stats ────────────────────────────────────────────────────────────────────
 router.get("/portfolio/stats", async (_req, res): Promise<void> => {
-  res.json(GetPortfolioStatsResponse.parse({
-    totalTrades:   0,
-    winRate:       0,
-    avgWin:        0,
-    avgLoss:       0,
-    profitFactor:  0,
-    totalPnl:      0,
-    bestTrade:     0,
-    worstTrade:    0,
-    currentStreak: 0,
-  }));
+  try {
+    const rows = await db
+      .select()
+      .from(tradeHistory)
+      .orderBy(desc(tradeHistory.openedAt))
+      .limit(500);
+
+    if (rows.length === 0) {
+      res.json(GetPortfolioStatsResponse.parse({
+        totalTrades: 0, winRate: 0, avgWin: 0, avgLoss: 0,
+        profitFactor: 0, totalPnl: 0, bestTrade: 0, worstTrade: 0, currentStreak: 0,
+      }));
+      return;
+    }
+
+    const pnls = rows.map((r) => parseFloat(r.netPnl ?? "0"));
+    const totalTrades = pnls.length;
+    const wins = pnls.filter((p) => p > 0);
+    const losses = pnls.filter((p) => p <= 0);
+    const winRate = totalTrades > 0 ? (wins.length / totalTrades) * 100 : 0;
+    const avgWin = wins.length > 0 ? wins.reduce((a, b) => a + b, 0) / wins.length : 0;
+    const avgLoss = losses.length > 0 ? losses.reduce((a, b) => a + b, 0) / losses.length : 0;
+    const totalWins  = wins.reduce((a, b) => a + b, 0);
+    const totalLosses = Math.abs(losses.reduce((a, b) => a + b, 0));
+    const profitFactor = totalLosses > 0 ? totalWins / totalLosses : (totalWins > 0 ? 999 : 0);
+    const totalPnl = pnls.reduce((a, b) => a + b, 0);
+    const bestTrade = pnls.length > 0 ? Math.max(...pnls) : 0;
+    const worstTrade = pnls.length > 0 ? Math.min(...pnls) : 0;
+
+    // Current streak: count consecutive (most recent) trades of same sign
+    let currentStreak = 0;
+    if (pnls.length > 0) {
+      const firstSign = Math.sign(pnls[0]);
+      for (const p of pnls) {
+        if (Math.sign(p) === firstSign) currentStreak++;
+        else break;
+      }
+      if (firstSign < 0) currentStreak = -currentStreak;
+    }
+
+    res.json(GetPortfolioStatsResponse.parse({
+      totalTrades,
+      winRate: parseFloat(winRate.toFixed(2)),
+      avgWin: parseFloat(avgWin.toFixed(4)),
+      avgLoss: parseFloat(avgLoss.toFixed(4)),
+      profitFactor: parseFloat(profitFactor.toFixed(2)),
+      totalPnl: parseFloat(totalPnl.toFixed(4)),
+      bestTrade: parseFloat(bestTrade.toFixed(4)),
+      worstTrade: parseFloat(worstTrade.toFixed(4)),
+      currentStreak,
+    }));
+  } catch (err) {
+    console.warn("[portfolio/stats] error:", (err as Error).message);
+    res.json(GetPortfolioStatsResponse.parse({
+      totalTrades: 0, winRate: 0, avgWin: 0, avgLoss: 0,
+      profitFactor: 0, totalPnl: 0, bestTrade: 0, worstTrade: 0, currentStreak: 0,
+    }));
+  }
 });
 
 export default router;
