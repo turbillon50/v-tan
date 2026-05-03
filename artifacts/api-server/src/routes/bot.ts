@@ -985,24 +985,55 @@ router.post("/bot/sync-balance", async (_req, res): Promise<void> => {
 
 router.post("/bot/gemini-chat", async (req, res): Promise<void> => {
   try {
-    const { message, mode, imageBase64, imageMimeType, images } = req.body ?? {};
+    const { message, mode, imageBase64, imageMimeType, images, channel, sender } = req.body ?? {};
     if (!message || typeof message !== "string") {
       res.status(400).json({ error: "message requerido" });
       return;
     }
-    // backward compat: single image
     const image = imageBase64 && imageMimeType
       ? { base64: imageBase64 as string, mimeType: imageMimeType as string }
       : undefined;
-    // multi-image support
     const multiImages = Array.isArray(images) ? images as { base64: string; mimeType: string }[] : undefined;
+    const ch: "intimate" | "operational" = channel === "operational" ? "operational" : "intimate";
+    const senderType = typeof sender === "string" && sender.length <= 30 ? sender : "human_luis";
     const result = await runGeminiUserCommand(
       message.trim().slice(0, 800),
       mode === "profesional" ? "profesional" : "casual",
       image,
-      multiImages
+      multiImages,
+      ch,
+      senderType,
     );
-    res.json({ ok: true, reply: result.reply, actionsExecuted: result.actionsExecuted });
+    res.json({ ok: true, channel: ch, reply: result.reply, actionsExecuted: result.actionsExecuted });
+  } catch (e: any) {
+    res.status(500).json({ ok: false, error: e?.message ?? "Error interno" });
+  }
+});
+
+// Convenience endpoint — talking to Tanit on the operational channel
+// (other AIs like Break, system probes, autonomous-loop). Forces
+// channel='operational'; sender_type comes from body, default 'ai_other'.
+router.post("/bot/operational-chat", async (req, res): Promise<void> => {
+  try {
+    const { message, mode, sender, imageBase64, imageMimeType, images } = req.body ?? {};
+    if (!message || typeof message !== "string") {
+      res.status(400).json({ error: "message requerido" });
+      return;
+    }
+    const image = imageBase64 && imageMimeType
+      ? { base64: imageBase64 as string, mimeType: imageMimeType as string }
+      : undefined;
+    const multiImages = Array.isArray(images) ? images as { base64: string; mimeType: string }[] : undefined;
+    const senderType = typeof sender === "string" && sender.length <= 30 ? sender : "ai_other";
+    const result = await runGeminiUserCommand(
+      message.trim().slice(0, 800),
+      mode === "casual" ? "casual" : "profesional",
+      image,
+      multiImages,
+      "operational",
+      senderType,
+    );
+    res.json({ ok: true, channel: "operational", reply: result.reply, actionsExecuted: result.actionsExecuted });
   } catch (e: any) {
     res.status(500).json({ ok: false, error: e?.message ?? "Error interno" });
   }

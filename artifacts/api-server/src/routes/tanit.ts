@@ -155,13 +155,19 @@ router.get("/tanit/runtime-config", async (_req, res): Promise<void> => {
 router.get("/tanit/chat", async (req, res): Promise<void> => {
   try {
     const limit = safeLimit(req.query.limit, 50);
-    const list = await db
-      .select()
-      .from(tanitChat)
-      .orderBy(desc(tanitChat.id))
-      .limit(limit);
-    // Reverse so oldest-first when client iterates
-    res.json({ ok: true, count: list.length, messages: list.reverse() });
+    // Default = intimate to protect Luis's personal channel by default.
+    // Pass ?channel=operational for the autonomous/system feed,
+    // or ?channel=all to mix both timelines (auditing).
+    const channelParam = String(req.query.channel ?? "intimate");
+    const allowed = new Set(["intimate", "operational", "all"]);
+    const channel = allowed.has(channelParam) ? channelParam : "intimate";
+
+    const baseQuery = db.select().from(tanitChat).orderBy(desc(tanitChat.id)).limit(limit);
+    const list = channel === "all"
+      ? await baseQuery
+      : await db.select().from(tanitChat).where(eq(tanitChat.channel, channel)).orderBy(desc(tanitChat.id)).limit(limit);
+
+    res.json({ ok: true, channel, count: list.length, messages: list.reverse() });
   } catch (err) {
     res.status(500).json({ ok: false, error: String(err) });
   }
