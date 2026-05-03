@@ -3584,9 +3584,10 @@ let _perplexityCache: { ts: number; result: string } | null = null;
 const PERPLEXITY_CACHE_TTL = 5 * 60 * 1000; // 5 minutos
 
 // ── Balance snapshots persistentes en DB ──────────────────────────────────────
-// Guarda un punto de balance en DB máximo 1 vez por hora para no saturar
+// Guarda un punto de balance en DB máximo 1 vez por minuto — necesario para
+// que el equity curve tenga resolución minuto-a-minuto cuando Luis hace zoom.
 let _lastSnapshotSavedAt = 0;
-const SNAPSHOT_INTERVAL_MS = 60 * 60 * 1000; // 1 hora
+const SNAPSHOT_INTERVAL_MS = 60 * 1000; // 1 minuto
 
 function saveBalanceSnapshotThrottled(balance: number): void {
   const now = Date.now();
