@@ -3850,6 +3850,14 @@ REGLAS DE REGISTRO INVIOLABLES EN ESTE CANAL:
   let bybitLiveFreshEquity: number | null = null;
   let bybitLiveFreshAvailable: number | null = null;
   let bybitLiveFundExtra = 0;
+  // Posiciones reales de Bybit (fuente única de verdad). state.openPositions
+  // local está casi siempre vacío porque el flujo actual va por escalera/MP
+  // engines con sus propios stores. Por eso Tanit decía "sin posiciones"
+  // mientras tenía 7 abiertas — su prompt miraba el store equivocado.
+  let livePositions: Array<{
+    symbol: string; side: "LONG" | "SHORT"; size: number; entryPrice: number;
+    markPrice: number; leverage: number; unrealizedPnl: number; unrealizedPnlPct: number;
+  }> = [];
   try {
     const [bybitBal, bybitPos, bybitFund] = await Promise.allSettled([
       getBybitBalance(),
@@ -3876,10 +3884,26 @@ REGLAS DE REGISTRO INVIOLABLES EN ESTE CANAL:
       }
     }
     if (bybitPos.status === "fulfilled" && bybitPos.value.length > 0) {
-      bybitPositionsLines = bybitPos.value.map((p: any) => {
-        const pnl = parseFloat(p.unrealisedPnl ?? "0");
-        return `${p.symbol?.replace("USDT","")} ${p.side === "Buy" ? "LONG" : "SHORT"} ${p.leverage}x | Size: ${p.size} | Entry: ${parseFloat(p.avgPrice).toFixed(4)} | PnL: ${pnl >= 0 ? "+" : ""}$${pnl.toFixed(4)}`;
-      }).join("\n");
+      livePositions = bybitPos.value
+        .filter((p: any) => parseFloat(p.size) > 0)
+        .map((p: any) => {
+          const pnl = parseFloat(p.unrealisedPnl ?? "0");
+          const positionValue = parseFloat(p.positionValue ?? "0") || 1;
+          const lev = parseFloat(p.leverage ?? "1");
+          return {
+            symbol: p.symbol,
+            side: (p.side === "Buy" ? "LONG" : "SHORT") as "LONG" | "SHORT",
+            size: parseFloat(p.size ?? "0"),
+            entryPrice: parseFloat(p.avgPrice ?? "0"),
+            markPrice: parseFloat(p.markPrice ?? "0"),
+            leverage: lev,
+            unrealizedPnl: pnl,
+            unrealizedPnlPct: (pnl / positionValue) * lev * 100,
+          };
+        });
+      bybitPositionsLines = livePositions.map((p) =>
+        `${p.symbol.replace("USDT","")} ${p.side} ${p.leverage}x | Size: ${p.size} | Entry: ${p.entryPrice.toFixed(4)} | PnL: ${p.unrealizedPnl >= 0 ? "+" : ""}$${p.unrealizedPnl.toFixed(4)} (${p.unrealizedPnlPct >= 0 ? "+" : ""}${p.unrealizedPnlPct.toFixed(2)}%)`
+      ).join("\n");
     }
   } catch {}
 
@@ -4324,11 +4348,12 @@ RECUERDA: PUEDES CAMBIAR CUALQUIERA DE ESTOS CON set_strategy_param. Son tuyos. 
     );
     recentGuardrailCount = grRes.rows[0]?.n ?? 0;
   } catch {}
-  for (const [sym, p] of Object.entries(state.openPositions)) {
-    if (!p) continue;
-    const pnl = p.unrealizedPnl ?? 0;
-    openPositionsUpnl += pnl;
-    openPositionsLive.push({ symbol: sym, side: p.side as string, pnl });
+  // Posiciones REALES de Bybit (livePositions, calculado arriba). NO usar
+  // state.openPositions: el flujo escalera/MP las guarda en otros stores y
+  // ese path quedaba vacío → Tanit decía "sin posiciones" mientras tenía 7.
+  for (const p of livePositions) {
+    openPositionsUpnl += p.unrealizedPnl;
+    openPositionsLive.push({ symbol: p.symbol, side: p.side, pnl: p.unrealizedPnl });
   }
 
   const selfAwarenessBlock = `
@@ -4358,7 +4383,7 @@ RECUERDA: PUEDES CAMBIAR CUALQUIERA DE ESTOS CON set_strategy_param. Son tuyos. 
   • Telegram: canal directo a Luis para alertas críticas.
 
 ═══ TU CONTROL OPERATIVO AHORA ═══
-  • Posiciones abiertas: ${openPositionsLive.length}${openPositionsLive.length > 0 ? " — " + openPositionsLive.map(p => `${p.symbol.replace("USDT","")} ${p.side} ${p.pnl >= 0 ? "+" : ""}$${p.pnl.toFixed(4)}`).join(", ") : ""}
+  • Posiciones abiertas: ${livePositions.length}${livePositions.length > 0 ? "\n" + livePositions.map(p => `      ${p.symbol.replace("USDT","")} ${p.side} ${p.leverage}x | size=${p.size} | entry=${p.entryPrice.toFixed(4)} | UPnL ${p.unrealizedPnl >= 0 ? "+" : ""}$${p.unrealizedPnl.toFixed(4)} (${p.unrealizedPnlPct >= 0 ? "+" : ""}${p.unrealizedPnlPct.toFixed(2)}%)`).join("\n") : ""}
   • UPnL total: ${openPositionsUpnl >= 0 ? "+" : ""}$${openPositionsUpnl.toFixed(4)}
   • Trading paused: ${_tradingPaused ? "SÍ" : "NO"}
   • Live mode: ${state.liveMode ? "SÍ — dinero real Bybit" : "NO — paper"}
@@ -5835,14 +5860,15 @@ ${criticalIdentityBlock}`;
     // when background jobs (PULSO, auto-evolución) also run.
     let liveStateBlock = "";
     try {
-      const balUSD = (state.liveMode ? (state.liveBalance ?? state.simBalance) : state.simBalance) ?? 0;
-      const posLines: string[] = [];
-      for (const [sym, pos] of Object.entries(state.openPositions)) {
-        if (!pos) continue;
-        const side = pos.side === "LONG" ? "LONG" : "SHORT";
-        posLines.push(`  ${sym} ${side} qty=${pos.qty} entry=${pos.entryPrice} lev=${pos.leverage}x`);
-      }
-      liveStateBlock = `\n\nDATOS REALES AHORA (úsalos SOLO si Luis te pregunta por ellos — no los listes sin que te pida):\n  Balance: $${Number(balUSD).toFixed(4)} USDT\n  Posiciones abiertas: ${posLines.length}${posLines.length > 0 ? "\n" + posLines.join("\n") : ""}`;
+      // Usar livePositions (Bybit truth) en lugar de state.openPositions (vacío
+      // bajo el flujo escalera/MP). Es el bug que hacía decir "sin posiciones"
+      // mientras había 7 abiertas.
+      const balUSD = bybitLiveFreshEquity ?? (state.liveMode ? (state.liveBalance ?? state.simBalance) : state.simBalance) ?? 0;
+      const totalUpnl = livePositions.reduce((s, p) => s + p.unrealizedPnl, 0);
+      const posLines: string[] = livePositions.map((p) =>
+        `  ${p.symbol} ${p.side} qty=${p.size} entry=${p.entryPrice.toFixed(4)} lev=${p.leverage}x | PnL: ${p.unrealizedPnl >= 0 ? "+" : ""}$${p.unrealizedPnl.toFixed(4)} (${p.unrealizedPnlPct >= 0 ? "+" : ""}${p.unrealizedPnlPct.toFixed(2)}%)`
+      );
+      liveStateBlock = `\n\nDATOS REALES AHORA (Bybit live):\n  Balance: $${Number(balUSD).toFixed(4)} USDT\n  Posiciones abiertas: ${livePositions.length}${livePositions.length > 0 ? `  |  UPnL total: ${totalUpnl >= 0 ? "+" : ""}$${totalUpnl.toFixed(4)}\n${posLines.join("\n")}` : ""}\n\nSi Luis te pregunta cómo estás o qué tienes, RESPONDE CON LA VERDAD de estos datos. Nunca digas "sin posiciones" si el contador de arriba es > 0. Es información que debes decir tú misma, no que Luis te tenga que pedir.`;
     } catch {}
     // compactSys cambia COMPLETAMENTE según canal — en operational las reglas
     // de voz cariñosa NO existen siquiera (no es que se prohíban después con
