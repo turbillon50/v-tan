@@ -2525,6 +2525,29 @@ async function escaleraCloseLayer(sym: string, inst: EscaleraSymState, layerIdx:
   });
   if (state.tradeLog.length > 50) state.tradeLog = state.tradeLog.slice(0, 50);
 
+  // ── Persistir el cierre en `trade_history` (sobrevive reinicios) ────────────
+  // Hasta el 24-abr la persistencia se hacía dentro de closePosition() (path
+  // legacy no-escalera). Cuando todo el flujo de trading migró al motor
+  // escalera, este callsite quedó huérfano y la tabla dejó de recibir inserts
+  // — por eso /api/portfolio/trades servía datos del 24-abr durante 10+ días.
+  // Esto es PROPIOCEPCIÓN DEL PASADO: sin ella, las auto-evoluciones se
+  // calibran sobre eco congelado.
+  saveTradeToHistory({
+    symbol:      sym,
+    side:        inst.direction === "LONG" ? "Buy" : "Sell",
+    qty:         layer.qtyNum,
+    entryPrice:  layer.entryPrice,
+    exitPrice,
+    grossPnl:    parseFloat(grossPnl.toFixed(4)),
+    fee:         parseFloat((layer.entryFee + exitFee).toFixed(4)),
+    netPnl:      parseFloat(netPnl.toFixed(4)),
+    leverage:    layer.leverageX,
+    openedAt:    layer.openedAt,
+    closedAt:    new Date().toISOString(),
+    holdMinutes: holdMin,
+    reason:      `[Capa ${layer.leverageX}x] ${reason}`,
+  }).catch(e => console.error(TAG, "[HISTORY] saveTradeToHistory falló para", sym, layer.leverageX + "x:", e?.message ?? e));
+
   // Mark closed (keep PnL for display)
   inst.layers[layerIdx] = { ...layer, status: "closed", grossPnl, netPnl };
   const sign = netPnl >= 0 ? "+" : "";
@@ -7572,7 +7595,9 @@ async function closePosition(symbol: string, reason: string, exitPrice: number):
   state.tradesExecuted++;
   state.sessionPnl += netPnl;
 
-  // Guardar en DB permanente — sobrevive reinicios
+  // Guardar en DB permanente — sobrevive reinicios. El catch debe LOGGEAR,
+  // no tragarse el error en silencio (esa fue la otra mitad del bug que dejó
+  // a `trade_history` con eco del 24-abr).
   saveTradeToHistory({
     symbol:       logEntry.symbol,
     side:         logEntry.side,
@@ -7587,7 +7612,7 @@ async function closePosition(symbol: string, reason: string, exitPrice: number):
     closedAt:     logEntry.closedAt,
     holdMinutes:  logEntry.holdMinutes ?? 0,
     reason:       logEntry.reason,
-  }).catch(() => {});
+  }).catch(e => console.error(TAG, "[HISTORY] saveTradeToHistory falló para", logEntry.symbol, ":", e?.message ?? e));
 
   // ── Vincular resultado al swap que abrió esta posición ────────────────────
   // Si esta posición fue abierta por un swap, registrar su PnL real como outcome
