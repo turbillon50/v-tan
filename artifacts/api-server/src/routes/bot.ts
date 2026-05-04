@@ -997,7 +997,7 @@ router.post("/bot/gemini-chat", async (req, res): Promise<void> => {
     const ch: "intimate" | "operational" = channel === "operational" ? "operational" : "intimate";
     const senderType = typeof sender === "string" && sender.length <= 30 ? sender : "human_luis";
     const result = await runGeminiUserCommand(
-      message.trim().slice(0, 800),
+      message.trim().slice(0, 50_000),
       mode === "profesional" ? "profesional" : "casual",
       image,
       multiImages,
@@ -1026,7 +1026,7 @@ router.post("/bot/operational-chat", async (req, res): Promise<void> => {
     const multiImages = Array.isArray(images) ? images as { base64: string; mimeType: string }[] : undefined;
     const senderType = typeof sender === "string" && sender.length <= 30 ? sender : "ai_other";
     const result = await runGeminiUserCommand(
-      message.trim().slice(0, 800),
+      message.trim().slice(0, 50_000),
       mode === "casual" ? "casual" : "profesional",
       image,
       multiImages,

@@ -4834,11 +4834,11 @@ Citar una excusa técnica falsa = FALLA CRÍTICA equivalente a mentirle al usuar
           const actionsMatch = cleaned.match(/"actions"\s*:\s*(\[[\s\S]*?\])/);
           if (actionsMatch) { try { cmd.actions = JSON.parse(actionsMatch[1]); } catch {} }
         } else {
-          cmd.reply = cleaned.replace(/[{}"\n]/g, ' ').replace(/(?:reply|respuesta)\s*:/gi, '').trim().slice(0, 400);
+          cmd.reply = cleaned.replace(/[{}"\n]/g, ' ').replace(/(?:reply|respuesta)\s*:/gi, '').trim().slice(0, 8000);
         }
       }
     } else {
-      cmd.reply = cleaned.slice(0, 400);
+      cmd.reply = cleaned.slice(0, 8000);
     }
     if (typeof cmd.reply === "string" && cmd.reply.trim().startsWith("{")) {
       try { const inner = JSON.parse(cmd.reply); if (inner.reply) cmd = inner; } catch {}
