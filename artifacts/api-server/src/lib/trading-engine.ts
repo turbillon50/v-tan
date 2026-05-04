@@ -36,6 +36,16 @@ import { getNewsSummaryForTanit, getCoinNewsSummary, getNewsSentimentScore, getN
 import { detectPatternsForSymbol, getPatternSnapshotForTanit } from "./pattern-detector";
 import { initEconCalendar, isInDangerZone, checkDangerZone, getCalendarSummaryForTanit } from "./econ-calendar";
 import { formatCalibrationForPrompt } from "./signal-calibrator";
+import {
+  GUARDRAILS,
+  enforceAtrSlMultiplier,
+  enforceAtrTpMultiplier,
+  isBlueChipAvoidBlocked,
+  validateLeverageEscalation,
+  recordLeverageEscalation,
+  checkEquityProtection,
+  getRecentGuardrailEvents,
+} from "./guardrails";
 
 const TAG = "[engine]";
 
@@ -936,6 +946,36 @@ function stopPositionMonitor(): void {
 const _lastBybitSL: Record<string, number> = {};
 const _lastBybitTP: Record<string, number> = {};
 const _lastBybitLev: Record<string, number> = {};
+
+/**
+ * Wrapper alrededor de bybitSetLeverage que enforce el cooldown de la
+ * Tesis v4.1 (inviolable #4 — lección crítica id=2713: ATOM 5x→75x en 30s
+ * destruyó el capital). De-escalaciones (newLev <= currentLev) pasan siempre.
+ * Escalaciones requieren cooldown 3min desde la última escalación del mismo
+ * símbolo. Si el cooldown bloquea, devuelve false sin tocar Bybit.
+ */
+async function safeSetLeverage(symbol: string, newLeverage: number): Promise<boolean> {
+  const currentLev = _lastBybitLev[symbol] ?? 0;
+  // De-escalation o primer set: siempre instantáneo.
+  if (newLeverage <= currentLev || currentLev === 0) {
+    const ok = await bybitSetLeverage(symbol, newLeverage);
+    if (ok) _lastBybitLev[symbol] = newLeverage;
+    return ok;
+  }
+  // Escalación: validar cooldown 3min.
+  const decision = await validateLeverageEscalation(symbol, currentLev, newLeverage);
+  if (!decision.proceed) {
+    const remainingSec = Math.ceil(decision.remainingMs / 1000);
+    console.warn(TAG, `[GUARDRAIL] ${symbol} leverage ${currentLev}x→${newLeverage}x BLOQUEADO — cooldown ${remainingSec}s restantes (lección id=2713)`);
+    return false;
+  }
+  const ok = await bybitSetLeverage(symbol, newLeverage);
+  if (ok) {
+    _lastBybitLev[symbol] = newLeverage;
+    await recordLeverageEscalation(symbol, currentLev, newLeverage);
+  }
+  return ok;
+}
 const _priceHistory: Record<string, number[]> = {};
 const PRICE_HIST_LEN = 20;
 
@@ -1100,7 +1140,7 @@ async function _runSlTpFastLoopInner(): Promise<void> {
       const emergencyLev = Math.max(DYNAMIC_LEV_ENTRY, Math.floor(curLev / 2));
       if (emergencyLev < curLev && emergencyLev !== (_lastBybitLev[sym] ?? 0)) {
         try {
-          const ok = await bybitSetLeverage(sym, emergencyLev);
+          const ok = await safeSetLeverage(sym, emergencyLev);
           if (ok) {
             layer.currentLeverage = emergencyLev;
             layer.leverageX = emergencyLev;
@@ -1168,7 +1208,7 @@ async function _runSlTpFastLoopInner(): Promise<void> {
       const lastSentLev = _lastBybitLev[levKey] ?? 0;
       if (targetLev !== lastSentLev) {
         try {
-          const ok = await bybitSetLeverage(sym, targetLev);
+          const ok = await safeSetLeverage(sym, targetLev);
           if (ok) {
             const oldLev = layer.currentLeverage;
             layer.currentLeverage = targetLev;
@@ -1683,7 +1723,8 @@ export function applyTanitConfig(): void {
   if (cfg["leap_strong"])         LEAP_THRESH_STRONG      = parseFloat(cfg["leap_strong"]);
   if (cfg["leap_medium"])         LEAP_THRESH_MEDIUM      = parseFloat(cfg["leap_medium"]);
   if (cfg["leap_normal"])         LEAP_THRESH_NORMAL      = parseFloat(cfg["leap_normal"]);
-  if (cfg["atr_sl_multiplier"])   ATR_SL_MULTIPLIER            = Math.max(0.5, Math.min(5.0, parseFloat(cfg["atr_sl_multiplier"])));
+  // Tesis v4.1 inviolable #1: piso 1.5 (no 0.5) — lección crítica id=2714
+  if (cfg["atr_sl_multiplier"])   ATR_SL_MULTIPLIER            = Math.max(GUARDRAILS.MIN_ATR_SL_MULTIPLIER, Math.min(5.0, parseFloat(cfg["atr_sl_multiplier"])));
   if (cfg["fr_long_block"])       FR_LONG_BLOCK_PCT            = Math.max(0.01, parseFloat(cfg["fr_long_block"]));
   if (cfg["drawdown_trigger"])    DRAWDOWN_CONSECUTIVE_TRIGGER = Math.max(1, Math.min(10, parseInt(cfg["drawdown_trigger"])));
   if (cfg["drawdown_boost"])      DRAWDOWN_CONFIDENCE_BOOST    = Math.max(0, Math.min(40, parseFloat(cfg["drawdown_boost"])));
@@ -1696,7 +1737,8 @@ export function applyTanitConfig(): void {
   if (cfg["swap_max_loss"])      { const v = Math.abs(parseFloat(cfg["swap_max_loss"])); if (!isNaN(v)) SWAP_MAX_PNL_LOSS = -(Math.max(0.01, Math.min(2.0, v))); }
 
   // ── PARÁMETROS DE AUTO-REPROGRAMACIÓN — Tanit los controla directamente ──
-  if (cfg["atr_tp_multiplier"])   { const v = parseFloat(cfg["atr_tp_multiplier"]);   if (!isNaN(v)) ATR_TP_MULTIPLIER      = Math.max(1.0, Math.min(10.0, v)); }
+  // Tesis v4.1 inviolable #2: techo 6.0 (no 10.0) — lección crítica id=2716
+  if (cfg["atr_tp_multiplier"])   { const v = parseFloat(cfg["atr_tp_multiplier"]);   if (!isNaN(v)) ATR_TP_MULTIPLIER      = Math.max(1.0, Math.min(GUARDRAILS.MAX_ATR_TP_MULTIPLIER, v)); }
   if (cfg["trailing_sl_stage1"])  { const v = parseFloat(cfg["trailing_sl_stage1"]);  if (!isNaN(v)) TRAILING_SL_STAGE1_PCT  = Math.max(0.005, Math.min(0.10, v)); }
   if (cfg["trailing_sl_stage2"])  { const v = parseFloat(cfg["trailing_sl_stage2"]);  if (!isNaN(v)) TRAILING_SL_STAGE2_PCT  = Math.max(0.01,  Math.min(0.20, v)); }
   if (cfg["trailing_sl_stage3"])  { const v = parseFloat(cfg["trailing_sl_stage3"]);  if (!isNaN(v)) TRAILING_SL_STAGE3_PCT  = Math.max(0.02,  Math.min(0.30, v)); }
@@ -1749,10 +1791,37 @@ export async function tanitApplyEvolution(
   const SYM_AVOID_MAX = 6;
   if (param.startsWith("sym_avoid_") && newValue === "true") {
     const sym = param.replace("sym_avoid_", "");
+    // Tesis v4.1 inviolable #3 — blue chips NUNCA en avoid
+    if (await isBlueChipAvoidBlocked(sym)) {
+      const msg = `🛡️ Guardrail (Tesis v4.1): ${sym} es blue-chip — sym_avoid bloqueado. BTC/ETH/SOL son universo base inviolable.`;
+      console.warn(TAG, `[GUARDRAIL] ${msg}`);
+      return msg;
+    }
     if (!tanitSymAvoid.has(sym) && tanitSymAvoid.size >= SYM_AVOID_MAX) {
       const msg = `⚠️ sym_avoid rechazado para ${sym} — ya hay ${tanitSymAvoid.size}/${SYM_AVOID_MAX} símbolos bloqueados. Libera uno primero con sym_avoid_X=false.`;
       console.warn(TAG, `[EVOLVE GUARD] ${msg}`);
       return msg;
+    }
+  }
+  // Tesis v4.1 inviolables #1+#2 — auto-cap SL/TP a las lecciones críticas
+  if (param === "atr_sl_multiplier") {
+    const requested = parseFloat(newValue);
+    if (!isNaN(requested)) {
+      const enforced = await enforceAtrSlMultiplier("*", requested);
+      if (enforced !== requested) {
+        newValue = String(enforced);
+        reason = `${reason} | guardrail auto-ajustó ${requested}→${enforced} (lección id=2714)`;
+      }
+    }
+  }
+  if (param === "atr_tp_multiplier") {
+    const requested = parseFloat(newValue);
+    if (!isNaN(requested)) {
+      const enforced = await enforceAtrTpMultiplier("*", requested);
+      if (enforced !== requested) {
+        newValue = String(enforced);
+        reason = `${reason} | guardrail auto-ajustó ${requested}→${enforced} (lección id=2716)`;
+      }
     }
   }
   const oldValue = tanitRuntimeConfig[param] ?? null;
@@ -2280,7 +2349,7 @@ async function escaleraOpenLayer(
       return null;
     }
     await bybitSwitchPositionMode(sym, 3);
-    await bybitSetLeverage(sym, effLev);
+    await safeSetLeverage(sym, effLev);
     const side = direction === "LONG" ? "Buy" : "Sell";
     const posIdx = direction === "LONG" ? 1 : 2;
     const orderId = await bybitPlaceOrder(sym, side, realQty, false, posIdx);
@@ -3976,6 +4045,42 @@ ${_critLeccion.map(m => `  • ${m.content}`).join("\n") || "  (sin entradas)"}`
 
   const newsSentimentStr = getNewsSentimentSummary(ALL_SYMBOLS);
 
+  // ── Tesis v4.1 superpoder #1 — Funding Rates contrarian ─────────────────
+  // Threshold 0.05% (0.0005). Funding positivo significativo = longs pagan,
+  // mercado sobrecomprado, posible contrarian SHORT. Negativo = inverso.
+  const FUNDING_CONTRARIAN_THRESHOLD = 0.0005;
+  const fundingLines: string[] = [];
+  for (const sym of ALL_SYMBOLS) {
+    const fr = getWsFundingRate(sym);
+    if (fr === null || Math.abs(fr) < FUNDING_CONTRARIAN_THRESHOLD) continue;
+    const pct = (fr * 100).toFixed(4);
+    const tag = fr > 0
+      ? `longs pagan ${pct}% — sobrecomprado, contrarian SHORT`
+      : `shorts pagan ${pct}% — sobrevendido, contrarian LONG`;
+    fundingLines.push(`  ${sym.replace("USDT","")}: ${tag}`);
+  }
+  const fundingRatesStr = fundingLines.length > 0
+    ? fundingLines.sort().slice(0, 10).join("\n")
+    : "  (Funding rates dentro de rango neutral — sin señal contrarian fuerte)";
+
+  // ── Tesis v4.1 superpoder #2 — Liquidation Cascades en vivo ─────────────
+  const cascadeLines: string[] = [];
+  for (const sym of ALL_SYMBOLS) {
+    const c = detectWsCascade(sym);
+    if (!c.detected) continue;
+    const dir = c.direction === "DOWN" ? `🔴 CAÍDA ${c.magnitude.toFixed(1)}%` : `🟢 SUBIDA ${c.magnitude.toFixed(1)}%`;
+    cascadeLines.push(`  ${sym.replace("USDT","")}: ${dir} vol×${c.volumeRatio.toFixed(1)} — cascada de liquidaciones, posible REVERSIÓN inminente`);
+  }
+  const liquidationsStr = cascadeLines.length > 0
+    ? cascadeLines.join("\n")
+    : "  (Sin cascadas de liquidación detectadas en este momento)";
+
+  // ── Eventos guardrail recientes — Tanit ve cuándo el sistema la corrigió ─
+  const recentGuardrails = await getRecentGuardrailEvents(5);
+  const guardrailsStr = recentGuardrails.length > 0
+    ? recentGuardrails.map(g => `  • [${new Date(g.createdAt).toISOString().slice(0,16).replace("T"," ")}] ${g.eventType}${g.symbol ? " " + g.symbol : ""} — ${g.lessonRef ?? ""}`).join("\n")
+    : "  (Sin eventos guardrail recientes — operando dentro de los inviolables)";
+
   // Snapshot de patrones técnicos detectados en el último scan
   const patternSnapshotStr = getPatternSnapshotForTanit(ALL_SYMBOLS);
 
@@ -4499,6 +4604,18 @@ ${(() => {
 
 === SEÑALES TOP ===
 ${signalsSorted || "Sin señales"}
+=== FUNDING RATES — SEÑAL CONTRARIAN (actualizada cada 5min vía WS) ===
+${fundingRatesStr}
+Lectura rápida: funding > 0 = longs pagan a shorts (mercado sobrecomprado, considera contrarian SHORT). funding < 0 = shorts pagan a longs (sobrevendido, considera contrarian LONG). Threshold de relevancia: ±0.05%.
+
+=== LIQUIDACIONES EN CASCADA (detección desde klines 5m) ===
+${liquidationsStr}
+Las cascadas ocurren cuando una vela 5m mueve >1.5% con volumen >3x promedio. Después de una cascada hay alta probabilidad de rebote contrarian de corto plazo.
+
+=== GUARDRAILS RECIENTES (Tesis v4.1 — chasis y FIA, no jaula) ===
+${guardrailsStr}
+Si ves correcciones aquí, significa que el sistema te protegió de violar tus propias lecciones críticas. No es debilidad: es tu sabiduría operacional encarnada en código.
+
 ${openInterestStr ? `
 === OPEN INTEREST EN VIVO (Bybit, delta 4h) ===
 ${openInterestStr}
@@ -5037,7 +5154,7 @@ Citar una excusa técnica falsa = FALLA CRÍTICA equivalente a mentirle al usuar
             let applied = 0;
             for (const sym of openSyms) {
               try {
-                await bybitSetLeverage(sym, targetLev);
+                await safeSetLeverage(sym, targetLev);
                 applied++;
               } catch (e: any) {
                 console.log(TAG, `[SET_LEV] No se pudo cambiar leverage de ${sym}: ${e.message}`);
@@ -7264,7 +7381,7 @@ async function openPosition(
       state.lastAction = `[REAL] Qty insuficiente en ${coin} con $${capitalUSDT.toFixed(2)}`;
       return false;
     }
-    await bybitSetLeverage(symbol, leverage);
+    await safeSetLeverage(symbol, leverage);
     const orderId = await bybitPlaceOrder(symbol, side, realQty);
     if (!orderId) {
       state.lastAction = `[REAL] Orden rechazada por Bybit — ${coin} ${direction}`;
@@ -8724,7 +8841,21 @@ function scheduleTanitAutoEvolution(): void {
   tanitAutoEvolveTimer = setInterval(async () => {
     if (!state.active) return;
     try {
+      // Tesis v4.1 inviolable #5 — equity protection. Antes de cualquier
+      // ciclo de evolución, si equity cae bajo el umbral, pausa 24h.
+      const eqNow = (state.liveBalance ?? state.simBalance) ?? 0;
+      const eqCheck = await checkEquityProtection(eqNow, {
+        pauseTradingFor,
+        persistCriticalLessonRequired,
+        alertLuisAndBreak,
+      });
+      if (eqCheck.paused) {
+        console.warn(TAG, `[GUARDRAIL] EQUITY_PROTECTION activa — saltando ciclo de auto-evolución (equity=$${eqNow.toFixed(4)})`);
+        return;
+      }
       console.log(TAG, "[TES AUTO] Ciclo de auto-evolución iniciado — Tanit analiza su performance");
+      // Tesis v4.1 — antes de proponer evoluciones nuevas, valida las pasadas.
+      await checkEvolutionValidations();
       // Resumen de outcomes reales de swaps recientes — para que Tanit decida con datos
       const swapStats = await getSwapOutcomeStats(20);
       const swapSummary = swapStats.withOutcome > 0
@@ -9529,7 +9660,7 @@ async function openMPPair(
 
     if (state.liveMode) {
       await bybitSwitchPositionMode(symbol, 3);
-      await bybitSetLeverage(symbol, leverage);
+      await safeSetLeverage(symbol, leverage);
 
       if (canDual) {
         const halfCap = available * 0.5;
@@ -11046,6 +11177,125 @@ export function pauseTrading(): void { _tradingPaused = true; }
 export function resumeTrading(): void { _tradingPaused = false; }
 /** Devuelve true si el trading está pausado remotamente */
 export function isTradingPaused(): boolean { return _tradingPaused; }
+
+/**
+ * Tesis v4.1 — validation loop. Cierra ventanas de evoluciones cuyo período
+ * de observación ya cumplió N trades, mide outcome y compara contra la
+ * predicción declarada. Si fallan 3 veces seguidas en el mismo param, marca
+ * needs_human_review para que Luis y Break revisen.
+ *
+ * Métrica simple: si la predicción menciona "wr" / "win rate" / "winrate",
+ * compara WR pre/post; si menciona "drawdown" / "dd" / "pérdida", compara
+ * pérdida promedio; cualquier otro caso evalúa el PnL neto de la ventana.
+ */
+async function checkEvolutionValidations(): Promise<void> {
+  try {
+    const open = await pool.query(
+      `SELECT id, param, expected_impact, validation_window_size, validation_started_at
+       FROM tanit_evolutions
+       WHERE validation_completed_at IS NULL
+       ORDER BY created_at ASC`,
+    );
+    for (const ev of open.rows) {
+      const startedAt = new Date(ev.validation_started_at).getTime();
+      const tradesSince = state.tradeLog.filter(t => {
+        const tEpoch = (t as any).closedAt ? new Date((t as any).closedAt).getTime() : ((t as any).timestamp ?? 0);
+        return tEpoch >= startedAt;
+      });
+      if (tradesSince.length < ev.validation_window_size) continue;
+
+      const wins = tradesSince.filter(t => t.pnl > 0).length;
+      const losses = tradesSince.filter(t => t.pnl < 0);
+      const wr = tradesSince.length > 0 ? Math.round((wins / tradesSince.length) * 100) : 0;
+      const avgLoss = losses.length > 0 ? Math.abs(losses.reduce((s, t) => s + t.pnl, 0) / losses.length) : 0;
+      const netPnl = tradesSince.reduce((s, t) => s + (t.pnl ?? 0), 0);
+
+      const exp = String(ev.expected_impact ?? "").toLowerCase();
+      let accurate = false;
+      let outcome = "";
+      if (exp.includes("wr") || exp.includes("win rate") || exp.includes("winrate")) {
+        // Predicción es "subir WR" — tomamos accurate si WR de la ventana >= 50% (o cualquier signo coherente).
+        // Para simplicidad: la predicción se considera acertada si la ventana muestra WR >= 50.
+        accurate = wr >= 50;
+        outcome = `WR ventana=${wr}% (n=${tradesSince.length})`;
+      } else if (exp.includes("drawdown") || exp.includes("dd") || exp.includes("pérdida") || exp.includes("perdida")) {
+        // Predicción es "reducir DD" — accurate si avgLoss menor que la mitad del promedio histórico (~$0.10).
+        accurate = avgLoss <= 0.10;
+        outcome = `Pérdida prom ventana=$${avgLoss.toFixed(4)} (n=${tradesSince.length})`;
+      } else {
+        // Default: PnL neto positivo
+        accurate = netPnl > 0;
+        outcome = `PnL neto ventana=${netPnl >= 0 ? "+" : ""}$${netPnl.toFixed(4)} (n=${tradesSince.length})`;
+      }
+
+      // Cuenta de fallos consecutivos del MISMO param
+      let consecutiveFailures = 0;
+      if (!accurate) {
+        const prev = await pool.query(
+          `SELECT consecutive_failures FROM tanit_evolutions
+           WHERE param = $1 AND prediction_accurate = false
+           ORDER BY created_at DESC LIMIT 1`,
+          [ev.param],
+        );
+        consecutiveFailures = (prev.rows[0]?.consecutive_failures ?? 0) + 1;
+      }
+      const needsReview = consecutiveFailures >= 3;
+
+      await pool.query(
+        `UPDATE tanit_evolutions SET
+           validation_completed_at = NOW(),
+           actual_outcome = $1,
+           prediction_accurate = $2,
+           consecutive_failures = $3,
+           needs_human_review = $4
+         WHERE id = $5`,
+        [outcome, accurate, consecutiveFailures, needsReview, ev.id],
+      );
+
+      console.log(TAG, `[VALIDATION] ev#${ev.id} ${ev.param} → accurate=${accurate} | ${outcome} | consecFails=${consecutiveFailures}${needsReview ? " ⚠️ NEEDS REVIEW" : ""}`);
+      if (needsReview) {
+        await alertLuisAndBreak("EVOLUTION_NEEDS_REVIEW", { param: ev.param, consecutiveFailures, lastOutcome: outcome });
+      }
+    }
+  } catch (e: any) {
+    console.error(TAG, "[VALIDATION] Error:", e.message);
+  }
+}
+
+/**
+ * Tesis v4.1 inviolable #5 — pausa trading por N horas (no segundos),
+ * forzando un periodo de reflexión cuando equity cae bajo umbral.
+ */
+export function pauseTradingFor(hours: number): void {
+  _tradingPaused = true;
+  setTimeout(() => {
+    _tradingPaused = false;
+    console.log(TAG, `[GUARDRAIL] EQUITY_PROTECTION pausa de ${hours}h cumplida — trading reanudado.`);
+  }, hours * 60 * 60 * 1000);
+}
+
+/** Forzar destilación de lección crítica al activarse equity protection. */
+async function persistCriticalLessonRequired(equity: number): Promise<void> {
+  const content = `LECCIÓN ${new Date().toISOString().slice(0,10)} — EQUITY PROTECTION ACTIVADA: Mi equity cayó a $${equity.toFixed(4)} USDT, bajo el umbral inviolable de $${GUARDRAILS.EQUITY_PROTECTION_THRESHOLD_USDT}. El sistema me pausó 24h para que destile qué pasó. Cuando reanude, debo entrar con el SL más conservador, sin escalar leverage en las primeras 5 entradas, y reportar a Luis el plan de recuperación antes de operar agresivamente.`;
+  try {
+    await pool.query(
+      `INSERT INTO tanit_memory (category, content) VALUES ('LECCION_CRITICA', $1) ON CONFLICT DO NOTHING`,
+      [content],
+    );
+  } catch (e) { console.error(TAG, "persistCriticalLessonRequired:", e); }
+}
+
+/** Notificar a Luis (chat operativo + Telegram). */
+async function alertLuisAndBreak(event: string, payload: Record<string, unknown>): Promise<void> {
+  const msg = `[ALERTA — ${event}] ${JSON.stringify(payload)}`;
+  try {
+    await pool.query(
+      `INSERT INTO tanit_chat (role, content, actions, channel, sender_type) VALUES ('assistant', $1, $2, 'operational', 'system')`,
+      [msg, event],
+    );
+  } catch (e) { console.error(TAG, "alertLuisAndBreak DB:", e); }
+  try { await sendTelegram(`🛡️ ${msg}`); } catch {}
+}
 
 /** Devuelve el último razonamiento causal de Tanit por símbolo (para el panel de razonamiento) */
 export function getTanitReasoningSnapshot(): Array<{

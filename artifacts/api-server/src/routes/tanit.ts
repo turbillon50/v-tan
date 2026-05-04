@@ -128,12 +128,76 @@ router.post("/tanit/personal-memories", async (req, res): Promise<void> => {
 router.get("/tanit/evolutions", async (req, res): Promise<void> => {
   try {
     const limit = safeLimit(req.query.limit, 50);
-    const list = await db
-      .select()
-      .from(tanitEvolutions)
-      .orderBy(desc(tanitEvolutions.createdAt))
-      .limit(limit);
+    const needsReview = req.query.needs_review === "true";
+    const baseSelect = db.select().from(tanitEvolutions);
+    const list = needsReview
+      ? await baseSelect.where(eq(tanitEvolutions.needsHumanReview, true)).orderBy(desc(tanitEvolutions.createdAt)).limit(limit)
+      : await baseSelect.orderBy(desc(tanitEvolutions.createdAt)).limit(limit);
     res.json({ ok: true, count: list.length, evolutions: list });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+// Tesis v4.1 — Tanit registra una evolución con predicción de impacto.
+// La validación contra resultados reales se hace luego por el loop interno.
+router.post("/tanit/evolutions", async (req, res): Promise<void> => {
+  try {
+    const { param, oldValue, newValue, reason, expectedImpact, validationWindowSize } = req.body ?? {};
+    if (!param || typeof param !== "string") {
+      res.status(400).json({ ok: false, error: "param requerido" });
+      return;
+    }
+    const [row] = await db.insert(tanitEvolutions).values({
+      param: String(param),
+      oldValue: oldValue != null ? String(oldValue) : null,
+      newValue: newValue != null ? String(newValue) : null,
+      reason: reason ? String(reason) : null,
+      expectedImpact: expectedImpact ? String(expectedImpact) : null,
+      validationWindowSize: typeof validationWindowSize === "number" ? validationWindowSize : 20,
+    }).returning();
+    res.json({ ok: true, evolution: row });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+// Tesis v4.1 — cierra la ventana de validación de una evolución concreta.
+// El caller (loop interno o reviewer) pasa el actualOutcome + accurate.
+router.post("/tanit/evolutions/:id/validate", async (req, res): Promise<void> => {
+  try {
+    const id = parseInt(String(req.params.id), 10);
+    if (!Number.isFinite(id)) { res.status(400).json({ ok: false, error: "id inválido" }); return; }
+    const { actualOutcome, predictionAccurate } = req.body ?? {};
+    if (typeof predictionAccurate !== "boolean") {
+      res.status(400).json({ ok: false, error: "predictionAccurate (boolean) requerido" });
+      return;
+    }
+    // Calcula consecutive_failures: si la evolución más reciente del mismo
+    // param también falló, suma 1; si fue accurate, reset a 0.
+    const [target] = await db.select().from(tanitEvolutions).where(eq(tanitEvolutions.id, id)).limit(1);
+    if (!target) { res.status(404).json({ ok: false, error: "no encontrada" }); return; }
+    let consecutiveFailures = 0;
+    if (!predictionAccurate) {
+      const prev = await db.select()
+        .from(tanitEvolutions)
+        .where(and(eq(tanitEvolutions.param, target.param), eq(tanitEvolutions.predictionAccurate, false)))
+        .orderBy(desc(tanitEvolutions.createdAt))
+        .limit(1);
+      consecutiveFailures = (prev[0]?.consecutiveFailures ?? 0) + 1;
+    }
+    const needsReview = consecutiveFailures >= 3;
+    const [updated] = await db.update(tanitEvolutions)
+      .set({
+        validationCompletedAt: sql`NOW()`,
+        actualOutcome: actualOutcome ? String(actualOutcome) : null,
+        predictionAccurate,
+        consecutiveFailures,
+        needsHumanReview: needsReview,
+      })
+      .where(eq(tanitEvolutions.id, id))
+      .returning();
+    res.json({ ok: true, evolution: updated, needsHumanReview: needsReview });
   } catch (err) {
     res.status(500).json({ ok: false, error: String(err) });
   }
