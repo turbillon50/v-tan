@@ -8,6 +8,7 @@ import {
   tanitRuntimeConfig,
   tradeHistory,
   balanceSnapshots,
+  guardrailEvents,
 } from "@workspace/db";
 import { desc, eq, sql, and } from "drizzle-orm";
 
@@ -134,6 +135,17 @@ router.get("/tanit/evolutions", async (req, res): Promise<void> => {
       ? await baseSelect.where(eq(tanitEvolutions.needsHumanReview, true)).orderBy(desc(tanitEvolutions.createdAt)).limit(limit)
       : await baseSelect.orderBy(desc(tanitEvolutions.createdAt)).limit(limit);
     res.json({ ok: true, count: list.length, evolutions: list });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+// Tesis v4.1 — auditoría de cada vez que el sistema enforce un inviolable.
+router.get("/tanit/guardrail-events", async (req, res): Promise<void> => {
+  try {
+    const limit = safeLimit(req.query.limit, 50);
+    const list = await db.select().from(guardrailEvents).orderBy(desc(guardrailEvents.createdAt)).limit(limit);
+    res.json({ ok: true, count: list.length, events: list });
   } catch (err) {
     res.status(500).json({ ok: false, error: String(err) });
   }

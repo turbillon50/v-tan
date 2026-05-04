@@ -1047,6 +1047,63 @@ router.get("/bot/live-params", (_req, res): void => {
   }
 });
 
+// ─── Whisper transcription — audio messages from frontend ───────────────────
+// Accepts base64 audio (typically webm/opus from MediaRecorder) and returns the
+// transcript. Uses OpenAI whisper-1 since the OPENAI_API_KEY is already set on
+// Railway. The frontend then re-sends the text to /bot/gemini-chat as if Luis
+// had typed it — keeping the chat path unchanged.
+router.post("/bot/transcribe", async (req, res): Promise<void> => {
+  try {
+    const { audioBase64, mimeType } = req.body ?? {};
+    if (!audioBase64 || typeof audioBase64 !== "string") {
+      res.status(400).json({ ok: false, error: "audioBase64 requerido" });
+      return;
+    }
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) {
+      res.status(503).json({ ok: false, error: "OPENAI_API_KEY no configurada" });
+      return;
+    }
+    const buf = Buffer.from(audioBase64, "base64");
+    if (buf.length < 200) {
+      res.status(400).json({ ok: false, error: "audio demasiado corto" });
+      return;
+    }
+    if (buf.length > 20 * 1024 * 1024) {
+      res.status(413).json({ ok: false, error: "audio supera 20MB" });
+      return;
+    }
+    const mt = typeof mimeType === "string" && mimeType ? mimeType : "audio/webm";
+    const ext = mt.includes("mp4") ? "mp4"
+      : mt.includes("ogg") ? "ogg"
+      : mt.includes("wav") ? "wav"
+      : mt.includes("mpeg") || mt.includes("mp3") ? "mp3"
+      : "webm";
+
+    const form = new FormData();
+    form.append("file", new Blob([buf], { type: mt }), `voice.${ext}`);
+    form.append("model", "whisper-1");
+    form.append("language", "es");
+    form.append("response_format", "json");
+
+    const r = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${apiKey}` },
+      body: form,
+      signal: AbortSignal.timeout(45_000),
+    });
+    if (!r.ok) {
+      const errText = await r.text().catch(() => "");
+      res.status(502).json({ ok: false, error: `whisper HTTP ${r.status}`, detail: errText.slice(0, 200) });
+      return;
+    }
+    const data = await r.json() as { text?: string };
+    res.json({ ok: true, text: (data.text ?? "").trim() });
+  } catch (e: any) {
+    res.status(500).json({ ok: false, error: e?.message ?? "Error interno" });
+  }
+});
+
 router.get("/bot/balance-debug", async (_req, res): Promise<void> => {
   try {
     const results: any = {};
