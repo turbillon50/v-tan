@@ -98,10 +98,13 @@ router.get("/portfolio/positions", async (_req, res): Promise<void> => {
 router.get("/portfolio/trades", async (req, res): Promise<void> => {
   try {
     const limit = Math.min(parseInt(String(req.query.limit ?? "50"), 10) || 50, 200);
+    // Trades cerrados ordenados por closed_at DESC — el más reciente primero.
+    // (Antes ordenaba por opened_at, que para una orden con vela larga ponía
+    // primero el opened pero el cierre podía ser anterior al de otra orden.)
     const rows = await db
       .select()
       .from(tradeHistory)
-      .orderBy(desc(tradeHistory.openedAt))
+      .orderBy(desc(tradeHistory.closedAt))
       .limit(limit);
 
     const trades = rows.map((r) => {

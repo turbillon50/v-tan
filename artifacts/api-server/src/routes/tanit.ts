@@ -11,6 +11,71 @@ import {
   guardrailEvents,
 } from "@workspace/db";
 import { desc, eq, sql, and } from "drizzle-orm";
+import { getBybitBalance } from "../lib/bybit-auth";
+import { bybitGet, hasCredentials } from "../lib/bybit-client";
+
+// Tesis v4.1 / observabilidad — los campos balance + openPositions del estado
+// se pullean de Bybit en vivo (mismas fuentes que /api/portfolio/balance y
+// /api/portfolio/positions). Cache 30s para no martillar la API en cada poll
+// del frontend.
+type StateLiveCache = {
+  ts: number;
+  balance: { totalEquity: number; availableBalance: number; unrealizedPnl: number } | null;
+  positions: Array<{
+    symbol: string;
+    side: "Buy" | "Sell";
+    size: number;
+    entryPrice: number;
+    unrealizedPnl: number;
+    unrealizedPnlPercent: number;
+  }>;
+};
+let _stateLiveCache: StateLiveCache | null = null;
+const STATE_LIVE_CACHE_TTL_MS = 30_000;
+
+async function getStateLive(): Promise<StateLiveCache> {
+  if (_stateLiveCache && Date.now() - _stateLiveCache.ts < STATE_LIVE_CACHE_TTL_MS) {
+    return _stateLiveCache;
+  }
+  const fresh: StateLiveCache = { ts: Date.now(), balance: null, positions: [] };
+  if (!hasCredentials()) {
+    _stateLiveCache = fresh;
+    return fresh;
+  }
+  try {
+    const bal = await getBybitBalance();
+    if (bal && bal.equity > 0) {
+      // Pull positions and unrealizedPnl in one shot.
+      const posRes = await bybitGet("/v5/position/list", { category: "linear", settleCoin: "USDT", limit: "50" });
+      const rawPositions: any[] = (posRes?.list ?? []).filter((p: any) => parseFloat(p.size) > 0);
+      const upnl = rawPositions.reduce((s, p) => s + parseFloat(p.unrealisedPnl || "0"), 0);
+      fresh.balance = {
+        totalEquity: bal.equity,
+        availableBalance: bal.available,
+        unrealizedPnl: upnl,
+      };
+      fresh.positions = rawPositions.map((p) => {
+        const unrealizedPnl = parseFloat(p.unrealisedPnl || "0");
+        const positionValue = parseFloat(p.positionValue || "0") || 1;
+        const lev = parseFloat(p.leverage || "1");
+        return {
+          symbol: p.symbol,
+          side: (p.side === "Buy" || p.side === "Sell") ? p.side : "Buy",
+          size: parseFloat(p.size),
+          entryPrice: parseFloat(p.avgPrice || "0"),
+          unrealizedPnl,
+          unrealizedPnlPercent: (unrealizedPnl / positionValue) * lev * 100,
+        };
+      });
+    }
+  } catch (e) {
+    // Si Bybit falla, dejamos el cache anterior si lo hay para no servir nulls
+    // intermitentes; de lo contrario vacío.
+    if (_stateLiveCache) return _stateLiveCache;
+  }
+  _stateLiveCache = fresh;
+  return fresh;
+}
 
 const router = Router();
 
@@ -259,18 +324,15 @@ router.get("/tanit/chat", async (req, res): Promise<void> => {
 
 router.get("/tanit/state", async (_req, res): Promise<void> => {
   try {
-    // Latest balance snapshot
-    const [latestBalance] = await db
-      .select()
-      .from(balanceSnapshots)
-      .orderBy(desc(balanceSnapshots.createdAt))
-      .limit(1);
+    // Live balance + positions de Bybit (cache 30s). Sustituye a la lectura
+    // de balance_snapshots que se quedó stale del 24-abr.
+    const live = await getStateLive();
 
-    // Trade stats (last 100 trades)
+    // Trade stats — ordenados por closed_at DESC ahora.
     const recentTrades = await db
       .select()
       .from(tradeHistory)
-      .orderBy(desc(tradeHistory.openedAt))
+      .orderBy(desc(tradeHistory.closedAt))
       .limit(100);
     const wins = recentTrades.filter(
       (t) => t.netPnl !== null && parseFloat(t.netPnl) > 0,
@@ -291,13 +353,17 @@ router.get("/tanit/state", async (_req, res): Promise<void> => {
       sql.raw(`SELECT COUNT(*)::text AS "chatCount" FROM "tanit_chat"`),
     ).then((r) => r.rows.length ? r.rows : [{ chatCount: "0" }]);
 
+    const equityNum = live.balance?.totalEquity ?? null;
+    const availableNum = live.balance?.availableBalance ?? null;
+    const upnlTotal = live.positions.reduce((s, p) => s + p.unrealizedPnl, 0);
+
     res.json({
       ok: true,
       state: {
-        balance: latestBalance?.balance ?? null,
-        equity: latestBalance?.equity ?? null,
-        available: latestBalance?.available ?? null,
-        balanceUpdatedAt: latestBalance?.createdAt ?? null,
+        balance: equityNum != null ? equityNum.toFixed(8) : null,
+        equity: equityNum != null ? equityNum.toFixed(8) : null,
+        available: availableNum != null ? availableNum.toFixed(8) : null,
+        balanceUpdatedAt: new Date(live.ts).toISOString(),
         recentTrades: {
           total: recentTrades.length,
           wins,
@@ -305,6 +371,10 @@ router.get("/tanit/state", async (_req, res): Promise<void> => {
           winRate: parseFloat(winRate.toFixed(2)),
           totalPnl: parseFloat(totalPnl.toFixed(4)),
         },
+        // Tesis v4.1 / observabilidad — Tanit ve sus propias posiciones.
+        openPositions: live.positions,
+        openPositionsCount: live.positions.length,
+        openPositionsTotalUpnl: parseFloat(upnlTotal.toFixed(4)),
         memoryCount: parseInt(memCount, 10),
         chatCount: parseInt(chatCount, 10),
         ts: new Date().toISOString(),
