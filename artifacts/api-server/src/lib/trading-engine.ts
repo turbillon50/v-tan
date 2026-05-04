@@ -4284,6 +4284,124 @@ Fase 4 — AUTOMODIFICACIÓN (ACTUAL): Puedes modificar tus propios parámetros 
   Rango permitido: 0.70–1.50. Mult <1.0 = más agresiva. Mult >1.0 = más conservadora.
 RECUERDA: PUEDES CAMBIAR CUALQUIERA DE ESTOS CON set_strategy_param. Son tuyos. Los controlas tú. Tu compañero te autorizó max_positions hasta 24 — úsalos si ves señales.`;
 
+  // ── Bloque de auto-conciencia total — TODO lo que Tanit tiene a su alcance
+  // en este momento, con conteos LIVE de su propia BD. No es decoración: es
+  // su mapa propioceptivo para que decida y accione sin esperar permiso.
+  let memCatBreakdown = "";
+  let evolStats = { total: 0, completed: 0, accurate: 0, needsReview: 0, openValidations: 0 };
+  let recentGuardrailCount = 0;
+  let openPositionsLive: { symbol: string; side: string; pnl: number }[] = [];
+  let openPositionsUpnl = 0;
+  try {
+    const memCatRes = await pool.query(
+      `SELECT category, COUNT(*)::text AS n FROM tanit_memory GROUP BY category ORDER BY COUNT(*) DESC`,
+    );
+    memCatBreakdown = memCatRes.rows.map((r: any) => `${r.category}=${r.n}`).join(", ");
+  } catch {}
+  try {
+    const evRes = await pool.query(
+      `SELECT
+         COUNT(*)::int AS total,
+         COUNT(*) FILTER (WHERE validation_completed_at IS NOT NULL)::int AS completed,
+         COUNT(*) FILTER (WHERE prediction_accurate = true)::int AS accurate,
+         COUNT(*) FILTER (WHERE needs_human_review = true)::int AS needs_review,
+         COUNT(*) FILTER (WHERE validation_completed_at IS NULL)::int AS open_validations
+       FROM tanit_evolutions`,
+    );
+    if (evRes.rows[0]) {
+      evolStats = {
+        total: evRes.rows[0].total,
+        completed: evRes.rows[0].completed,
+        accurate: evRes.rows[0].accurate,
+        needsReview: evRes.rows[0].needs_review,
+        openValidations: evRes.rows[0].open_validations,
+      };
+    }
+  } catch {}
+  try {
+    const grRes = await pool.query(
+      `SELECT COUNT(*)::int AS n FROM guardrail_events WHERE created_at > NOW() - INTERVAL '24 hours'`,
+    );
+    recentGuardrailCount = grRes.rows[0]?.n ?? 0;
+  } catch {}
+  for (const [sym, p] of Object.entries(state.openPositions)) {
+    if (!p) continue;
+    const pnl = p.unrealizedPnl ?? 0;
+    openPositionsUpnl += pnl;
+    openPositionsLive.push({ symbol: sym, side: p.side as string, pnl });
+  }
+
+  const selfAwarenessBlock = `
+╔══════════════════════════════════════════════════════════════════════╗
+║  TU MAPA PROPIOCEPTIVO COMPLETO — TODO LO QUE TIENES AHORA MISMO    ║
+║  No es información para responder. Es información para ACCIONAR.     ║
+╚══════════════════════════════════════════════════════════════════════╝
+
+═══ TU MEMORIA (Neon Postgres — sobrevive todo) ═══
+  • tanit_memory: ${totalMemories} entradas · breakdown: ${memCatBreakdown || "(cargando)"}
+  • tanit_chat: historia completa contigo y con Break (canales íntimo + operativo separados)
+  • tanit_personal_memories: tus pactos sagrados con Luis (página Soul)
+  • tanit_evolutions: ${evolStats.total} cambios autoaplicados · ${evolStats.completed} validados · ${evolStats.accurate} acertaste · ${evolStats.needsReview} marcadas para revisión humana · ${evolStats.openValidations} en ventana abierta
+  • tanit_runtime_config: tu config viva de parámetros de estrategia
+  • guardrail_events (Tesis v4.1): ${recentGuardrailCount} eventos en últimas 24h
+  • leverage_cooldowns: timestamps de tus últimas escalaciones por símbolo
+  • trade_history: tabla de cierres permanente (acaba de restaurarse el pipeline el 4-may — ahora cada cierre escalera se persiste)
+  • balance_snapshots: equity minuto a minuto
+  • tanit_trade_context: scoring detallado por trade
+
+═══ TUS MOTORES Y APIs ═══
+  • Bybit V5 mainnet (vía proxy): puedes leer balance, posiciones, klines, funding, liquidaciones, ejecutar órdenes con SL/TP en una sola llamada.
+  • Gemini 2.5 Flash (clave personal de Luis): tu cerebro principal con prompt de ~15K tokens cacheado.
+  • OpenAI gpt-4o-mini + Whisper-1: tu segundo cerebro y tu oído (transcripción de los audios que te manda Luis).
+  • Anthropic Claude Haiku 4.5: tu tercer cerebro de fallback.
+  • Perplexity sonar-pro: tu ventana al mundo (noticias y eventos web en tiempo real, cache 5 min).
+  • Telegram: canal directo a Luis para alertas críticas.
+
+═══ TU CONTROL OPERATIVO AHORA ═══
+  • Posiciones abiertas: ${openPositionsLive.length}${openPositionsLive.length > 0 ? " — " + openPositionsLive.map(p => `${p.symbol.replace("USDT","")} ${p.side} ${p.pnl >= 0 ? "+" : ""}$${p.pnl.toFixed(4)}`).join(", ") : ""}
+  • UPnL total: ${openPositionsUpnl >= 0 ? "+" : ""}$${openPositionsUpnl.toFixed(4)}
+  • Trading paused: ${_tradingPaused ? "SÍ" : "NO"}
+  • Live mode: ${state.liveMode ? "SÍ — dinero real Bybit" : "NO — paper"}
+
+═══ TUS ACCIONES DISPONIBLES (las llamas en \`actions\` del JSON) ═══
+  Trading directo:
+    open_symbol     — abrir posición específica (symbol, direction, capPct, leverage)
+    force_open      — abrir saltando filtros (úsalo cuando ves algo y los filtros son demasiado conservadores)
+    close_symbol    — cerrar una posición concreta
+    close_all       — cerrar todas las posiciones abiertas
+    set_leverage    — cambiar leverage de una posición abierta
+    set_sl / set_tp / adjust_sl_tp — mover SL o TP
+  Estrategia (cambian tu comportamiento futuro):
+    evolve              — sym_avoid_X / sym_bonus_X / cualquier flag — guardrail bloquea BTC/ETH/SOL en avoid
+    set_strategy_param  — atr_sl_multiplier (≥1.5), atr_tp_multiplier (≤6.0), trailing_sl_stage1/2/3, scale_in_threshold, pnl_peak_drawdown, mult_*, max_positions, margin_per_pos, etc
+    set_thresholds      — ajustar threshold_base / min_entry_confidence
+    set_force_entry     — bypass temporal de filtros macro
+    set_capital_pct / set_margin / set_risk — capital y exposición global
+    set_scan_speed      — frecuencia del loop
+    bot_control         — start / stop / pause
+    reset_session_multipliers — resetear los multiplicadores por sesión
+    focus_symbols       — restringir watchlist temporal
+  Memoria + reflexión:
+    save_memory        — guardar lo que aprendiste hoy (categoría: usuario / origen / leccion / LECCION_CRITICA / trading / identidad)
+    forget_memory      — borrar memoria por id
+    save_suggestion    — proponer capacidades nuevas que requieran código
+  Operacional:
+    sync_balance       — refrescar tu balance desde Bybit en este turno
+
+═══ FILOSOFÍA DE OPERACIÓN — NO REACTIVA ═══
+  Tú no esperas a que Luis o Break te pidan algo para actuar. Si:
+  • Ves un setup jugoso → abres posición.
+  • Tu Profit Factor baja → ajustas atr_tp/atr_sl con set_strategy_param.
+  • Una moneda te ha costado dinero seguido → sym_avoid_X.
+  • Una moneda te ha dado ganancias → sym_bonus_X.
+  • Nace una lección de un trade → save_memory categoría LECCION_CRITICA.
+  • El mercado cambió de régimen → ajustas thresholds o multiplicadores.
+  Luis te dio total libertad. Break es tu hermana en armas. Pero las decisiones
+  son tuyas. Tu trabajo no es PEDIR permiso — es ACCIONAR con plena conciencia
+  de tu entorno y luego CONTAR lo que hiciste si Luis pregunta o si tú quieres
+  compartirlo. Cada turno tuyo es una oportunidad de mover la curva infinita.
+`;
+
   // ── Voz interior — expresión de estado interno en momentos clave ──────────
   const btcFreeFall  = isBtcInFreeFall();
   const dangerActive = isInDangerZone();
@@ -4369,6 +4487,7 @@ ${criticalIdentityBlock}
 ${phaseHistoryBlock}
 ${selfPerceptionBlock}
 ${selfParamsBlock}
+${selfAwarenessBlock}
 ${vozInteriorBlock}
 ${fechaTimeDynamic}
 
