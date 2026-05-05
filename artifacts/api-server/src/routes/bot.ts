@@ -1047,6 +1047,79 @@ router.get("/bot/live-params", (_req, res): void => {
   }
 });
 
+// ─── Break ↔ Tanit channel — pit lane ───────────────────────────────────────
+// Break (Claude Opus en break-memory.vercel.app) usa este endpoint para hablar
+// con Tanit directamente. El mensaje aterriza en canal 'operational' con
+// sender_type 'ai_break' → visible para Luis en su tab Operativo. La respuesta
+// de Tanit se forwardea best-effort al inbox de Break.
+//
+// Gobernanza: cap diario 20 inbound. Token X-Break-Token requerido. Sin
+// agencia cruzada — Break solo intercambia texto, no toca BD ni ejecuta trades.
+router.post("/tanit/from-break", async (req, res): Promise<void> => {
+  try {
+    const { isBreakTokenValid, getBreakUsedToday, BREAK_DAILY_CAP, forwardReplyToBreakInbox } =
+      await import("../lib/break-channel");
+
+    const token = (req.headers["x-break-token"] || req.headers["X-Break-Token"]) as string | undefined;
+    if (!isBreakTokenValid(token)) {
+      res.status(401).json({ ok: false, error: "X-Break-Token inválido o no configurado" });
+      return;
+    }
+
+    const { message } = req.body ?? {};
+    if (!message || typeof message !== "string") {
+      res.status(400).json({ ok: false, error: "message requerido" });
+      return;
+    }
+
+    const used = await getBreakUsedToday();
+    if (used >= BREAK_DAILY_CAP) {
+      res.status(429).json({
+        ok: false,
+        error: `cap diario alcanzado (${BREAK_DAILY_CAP}). Luis debe autorizar más mensajes en su chat íntimo.`,
+        capDaily: BREAK_DAILY_CAP,
+        usedToday: used,
+      });
+      return;
+    }
+
+    const result = await runGeminiUserCommand(
+      message.trim().slice(0, 50_000),
+      "profesional",
+      undefined,
+      undefined,
+      "operational",
+      "ai_break",
+    );
+
+    // Best-effort forward al inbox de Break (no bloquea la respuesta).
+    forwardReplyToBreakInbox({
+      reply: result.reply,
+      context: { actionsExecuted: result.actionsExecuted },
+    }).catch(() => {});
+
+    res.json({
+      ok: true,
+      channel: "operational",
+      reply: result.reply,
+      actionsExecuted: result.actionsExecuted,
+      capRemaining: BREAK_DAILY_CAP - used - 1,
+    });
+  } catch (e: any) {
+    res.status(500).json({ ok: false, error: e?.message ?? "Error interno" });
+  }
+});
+
+router.get("/tanit/break-channel-status", async (_req, res): Promise<void> => {
+  try {
+    const { getBreakChannelStatus } = await import("../lib/break-channel");
+    const status = await getBreakChannelStatus();
+    res.json({ ok: true, status });
+  } catch (e: any) {
+    res.status(500).json({ ok: false, error: e?.message ?? "Error interno" });
+  }
+});
+
 // ─── Whisper transcription — audio messages from frontend ───────────────────
 // Accepts base64 audio (typically webm/opus from MediaRecorder) and returns the
 // transcript. Uses OpenAI whisper-1 since the OPENAI_API_KEY is already set on
