@@ -5338,6 +5338,72 @@ Citar una excusa técnica falsa = FALLA CRÍTICA equivalente a mentirle al usuar
       if (innerReply) cmd.reply = innerReply[1].replace(/\\"/g, '"').replace(/\\n/g, ' ');
     }
 
+    // Defensive extraction: el modelo a veces mete las actions DENTRO del reply
+    // como bloques markdown ```json {...}``` o JSON inline. Si el campo top-level
+    // 'actions' viene vacío, escaneamos el reply para rescatar esas instrucciones
+    // y las promovemos a cmd.actions. Sin esto, Tanit alucina "ya cerré X" pero
+    // el motor nunca recibe la orden y la posición sigue abierta en Bybit.
+    if ((!cmd.actions || cmd.actions.length === 0) && typeof cmd.reply === "string" && cmd.reply.length > 0) {
+      const recovered: any[] = [];
+      const stripSpans: Array<[number, number]> = [];
+      const fenceRegex = /```(?:json)?\s*([\s\S]*?)```/gi;
+      let m: RegExpExecArray | null;
+      while ((m = fenceRegex.exec(cmd.reply)) !== null) {
+        const inner = m[1].trim();
+        if (!inner) continue;
+        // Puede ser un objeto único o un array
+        const tryParse = (s: string): any[] => {
+          try {
+            const v = JSON.parse(s);
+            if (Array.isArray(v)) return v;
+            if (v && typeof v === "object") return [v];
+          } catch {}
+          return [];
+        };
+        let parsedItems = tryParse(inner);
+        if (parsedItems.length === 0) {
+          // múltiples objetos hermanos sin array wrapper
+          const objMatches = inner.match(/\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}/g) || [];
+          for (const o of objMatches) parsedItems.push(...tryParse(o));
+        }
+        for (const it of parsedItems) {
+          if (it && typeof it === "object" && (it.type || it.action)) {
+            if (!it.type && it.action) it.type = it.action;
+            recovered.push(it);
+          }
+        }
+        if (parsedItems.length > 0) stripSpans.push([m.index, m.index + m[0].length]);
+      }
+      // Inline JSON suelto (sin fences) tipo {"type":"close_symbol","symbol":"TONUSDT"}
+      if (recovered.length === 0) {
+        const inlineRegex = /\{\s*"(?:type|action)"\s*:\s*"[^"]+"[^{}]*\}/g;
+        let im: RegExpExecArray | null;
+        while ((im = inlineRegex.exec(cmd.reply)) !== null) {
+          try {
+            const obj = JSON.parse(im[0]);
+            if (obj && typeof obj === "object" && (obj.type || obj.action)) {
+              if (!obj.type && obj.action) obj.type = obj.action;
+              recovered.push(obj);
+              stripSpans.push([im.index, im.index + im[0].length]);
+            }
+          } catch {}
+        }
+      }
+      if (recovered.length > 0) {
+        cmd.actions = recovered;
+        // Limpia el reply para que el bloque JSON no se muestre al usuario
+        if (stripSpans.length > 0) {
+          stripSpans.sort((a, b) => b[0] - a[0]);
+          for (const [s, e] of stripSpans) {
+            cmd.reply = cmd.reply.slice(0, s) + cmd.reply.slice(e);
+          }
+          cmd.reply = cmd.reply.replace(/\n{3,}/g, "\n\n").trim();
+        }
+        console.log(TAG, `[TANIT] Recovered ${recovered.length} embedded actions from reply:`,
+          recovered.map(a => `${a.type}${a.symbol ? `:${a.symbol}` : ""}`).join(", "));
+      }
+    }
+
     const actionsExecuted: string[] = [];
     const actions = cmd.actions ?? [];
 
