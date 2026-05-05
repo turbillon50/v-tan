@@ -173,21 +173,9 @@ function connect(): void {
         }
       }
 
-      // ── Liquidaciones en tiempo real — cascades detector ─────────────────
-      if (msg.topic.startsWith("liquidation.")) {
-        const data = msg.data;
-        if (data?.symbol && data?.side && data?.size && data?.price) {
-          const sym = data.symbol as string;
-          const usdtValue = parseFloat(data.size) * parseFloat(data.price);
-          if (!isNaN(usdtValue) && usdtValue > 0) {
-            if (!liquidationBuffer[sym]) liquidationBuffer[sym] = [];
-            liquidationBuffer[sym].push({ ts: Date.now(), side: data.side as "Buy" | "Sell", usdtValue });
-            // limpiar eventos viejos (> 10 min) para no acumular indefinidamente
-            const cutoff = Date.now() - 10 * 60 * 1000;
-            liquidationBuffer[sym] = liquidationBuffer[sym].filter(e => e.ts > cutoff);
-          }
-        }
-      }
+      // ── Liquidaciones en tiempo real — DEPRECATED ────────────────────────
+      // Se reemplazó por detectWsCascade() que analiza klineBuffer (5m candles).
+      // El topic "liquidation." sigue suscrito en el server pero ya no se procesa.
 
       // ── Kline 5m — buffer de velas para pattern-detector ─────────────────
       if (msg.topic.startsWith("kline.5.")) {

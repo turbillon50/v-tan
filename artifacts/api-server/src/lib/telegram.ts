@@ -14,15 +14,19 @@ let _paramFlushTimer: ReturnType<typeof setTimeout> | null = null;
 const PARAM_DEBOUNCE_MS = 2000;
 
 export function queueParamChange(
-  type:   "evolución" | "estrategia",
+  type:   "evolución" | "estrategia" | "reset",
   param:  string,
   value:  string,
   reason: string,
 ): void {
-  const entry: ParamChangeEntry =
-    type === "evolución"
-      ? { emoji: "✨", label: "EVOLUCIÓN",  param, value, reason }
-      : { emoji: "⚙️", label: "ESTRATEGIA", param, value, reason };
+  let entry: ParamChangeEntry;
+  if (type === "evolución") {
+    entry = { emoji: "✨", label: "EVOLUCIÓN", param, value, reason };
+  } else if (type === "reset") {
+    entry = { emoji: "🔄", label: "RESET", param, value, reason };
+  } else {
+    entry = { emoji: "⚙️", label: "ESTRATEGIA", param, value, reason };
+  }
 
   _paramBatch.push(entry);
 

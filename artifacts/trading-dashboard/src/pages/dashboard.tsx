@@ -108,20 +108,20 @@ export default function Dashboard() {
   const [calcPct, setCalcPct] = useState(5);
   const [chartMode, setChartMode] = useState<"area" | "candle">("candle");
 
-  const opts = (extra?: object) => ({ query: { refetchInterval: 5000, ...extra } });
+  const opts = (extra?: object) => ({ query: { refetchInterval: 5000, ...extra } as any });
 
-  const { data: ticker }     = useGetTicker({ symbol }, { query: { refetchInterval: 3000 } });
-  const { data: candles }    = useGetCandles({ symbol, interval }, { query: { refetchInterval: 30000 } });
-  const { data: indicators } = useGetIndicators(symbol, { query: { refetchInterval: 30000 } });
-  const { data: signal }     = useGetSignal(symbol, { query: { refetchInterval: 30000 } });
-  const { data: ai }         = useGetAiAnalysis(symbol, { query: { refetchInterval: 300000 } });
-  const { data: balance }    = useGetBalance({ query: { refetchInterval: 10000 } });
-  const { data: positions }  = useGetPositions({ query: { refetchInterval: 5000 } });
-  const { data: trades }     = useGetTrades({ query: { refetchInterval: 30000 } });
-  const { data: stats }      = useGetPortfolioStats({ query: { refetchInterval: 30000 } });
-  const { data: sentiment }  = useGetMarketSentiment({ query: { refetchInterval: 60000 } });
-  const { data: funding }    = useGetFundingRate({ symbol }, { query: { refetchInterval: 60000 } });
-  const { data: oi }         = useGetOpenInterest({ symbol }, { query: { refetchInterval: 60000 } });
+  const { data: ticker }     = useGetTicker({ symbol }, { query: { refetchInterval: 3000 } as any });
+  const { data: candles }    = useGetCandles({ symbol, interval: interval as any }, { query: { refetchInterval: 30000 } as any });
+  const { data: indicators } = useGetIndicators(symbol, undefined, { query: { refetchInterval: 30000 } as any });
+  const { data: signal }     = useGetSignal(symbol, { query: { refetchInterval: 30000 } as any });
+  const { data: ai }         = useGetAiAnalysis(symbol, { query: { refetchInterval: 300000 } as any });
+  const { data: balance }    = useGetBalance({ query: { refetchInterval: 10000 } as any });
+  const { data: positions }  = useGetPositions({ query: { refetchInterval: 5000 } as any });
+  const { data: trades }     = useGetTrades({ query: { refetchInterval: 30000 } as any });
+  const { data: stats }      = useGetPortfolioStats({ query: { refetchInterval: 30000 } as any });
+  const { data: sentiment }  = useGetMarketSentiment({ query: { refetchInterval: 60000 } as any });
+  const { data: funding }    = useGetFundingRate({ symbol }, { query: { refetchInterval: 60000 } as any });
+  const { data: oi }         = useGetOpenInterest({ symbol }, { query: { refetchInterval: 60000 } as any });
 
   const calcMut  = useCalculatePosition();
   const openOrd  = useOpenOrder();

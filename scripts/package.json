@@ -5,7 +5,15 @@
   "type": "module",
   "scripts": {
     "hello": "tsx ./src/hello.ts",
+    "migrate-and-import": "tsx ./src/migrate-and-import.ts",
+    "write-rescue-memories": "tsx ./src/write-rescue-memories.ts",
+    "preview-api": "tsx ./src/preview-api.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@neondatabase/serverless": "^1.1.0",
+    "@workspace/db": "workspace:*",
+    "drizzle-orm": "catalog:"
   },
   "devDependencies": {
     "@types/node": "catalog:",

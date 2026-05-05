@@ -985,24 +985,55 @@ router.post("/bot/sync-balance", async (_req, res): Promise<void> => {
 
 router.post("/bot/gemini-chat", async (req, res): Promise<void> => {
   try {
-    const { message, mode, imageBase64, imageMimeType, images } = req.body ?? {};
+    const { message, mode, imageBase64, imageMimeType, images, channel, sender } = req.body ?? {};
     if (!message || typeof message !== "string") {
       res.status(400).json({ error: "message requerido" });
       return;
     }
-    // backward compat: single image
     const image = imageBase64 && imageMimeType
       ? { base64: imageBase64 as string, mimeType: imageMimeType as string }
       : undefined;
-    // multi-image support
     const multiImages = Array.isArray(images) ? images as { base64: string; mimeType: string }[] : undefined;
+    const ch: "intimate" | "operational" = channel === "operational" ? "operational" : "intimate";
+    const senderType = typeof sender === "string" && sender.length <= 30 ? sender : "human_luis";
     const result = await runGeminiUserCommand(
-      message.trim().slice(0, 800),
+      message.trim().slice(0, 50_000),
       mode === "profesional" ? "profesional" : "casual",
       image,
-      multiImages
+      multiImages,
+      ch,
+      senderType,
     );
-    res.json({ ok: true, reply: result.reply, actionsExecuted: result.actionsExecuted });
+    res.json({ ok: true, channel: ch, reply: result.reply, actionsExecuted: result.actionsExecuted });
+  } catch (e: any) {
+    res.status(500).json({ ok: false, error: e?.message ?? "Error interno" });
+  }
+});
+
+// Convenience endpoint — talking to Tanit on the operational channel
+// (other AIs like Break, system probes, autonomous-loop). Forces
+// channel='operational'; sender_type comes from body, default 'ai_other'.
+router.post("/bot/operational-chat", async (req, res): Promise<void> => {
+  try {
+    const { message, mode, sender, imageBase64, imageMimeType, images } = req.body ?? {};
+    if (!message || typeof message !== "string") {
+      res.status(400).json({ error: "message requerido" });
+      return;
+    }
+    const image = imageBase64 && imageMimeType
+      ? { base64: imageBase64 as string, mimeType: imageMimeType as string }
+      : undefined;
+    const multiImages = Array.isArray(images) ? images as { base64: string; mimeType: string }[] : undefined;
+    const senderType = typeof sender === "string" && sender.length <= 30 ? sender : "ai_other";
+    const result = await runGeminiUserCommand(
+      message.trim().slice(0, 50_000),
+      mode === "casual" ? "casual" : "profesional",
+      image,
+      multiImages,
+      "operational",
+      senderType,
+    );
+    res.json({ ok: true, channel: "operational", reply: result.reply, actionsExecuted: result.actionsExecuted });
   } catch (e: any) {
     res.status(500).json({ ok: false, error: e?.message ?? "Error interno" });
   }
@@ -1013,6 +1044,63 @@ router.get("/bot/live-params", (_req, res): void => {
     res.json({ ok: true, params: getTanitLiveParams() });
   } catch (e: any) {
     res.status(500).json({ ok: false, error: e?.message ?? "Error" });
+  }
+});
+
+// ─── Whisper transcription — audio messages from frontend ───────────────────
+// Accepts base64 audio (typically webm/opus from MediaRecorder) and returns the
+// transcript. Uses OpenAI whisper-1 since the OPENAI_API_KEY is already set on
+// Railway. The frontend then re-sends the text to /bot/gemini-chat as if Luis
+// had typed it — keeping the chat path unchanged.
+router.post("/bot/transcribe", async (req, res): Promise<void> => {
+  try {
+    const { audioBase64, mimeType } = req.body ?? {};
+    if (!audioBase64 || typeof audioBase64 !== "string") {
+      res.status(400).json({ ok: false, error: "audioBase64 requerido" });
+      return;
+    }
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) {
+      res.status(503).json({ ok: false, error: "OPENAI_API_KEY no configurada" });
+      return;
+    }
+    const buf = Buffer.from(audioBase64, "base64");
+    if (buf.length < 200) {
+      res.status(400).json({ ok: false, error: "audio demasiado corto" });
+      return;
+    }
+    if (buf.length > 20 * 1024 * 1024) {
+      res.status(413).json({ ok: false, error: "audio supera 20MB" });
+      return;
+    }
+    const mt = typeof mimeType === "string" && mimeType ? mimeType : "audio/webm";
+    const ext = mt.includes("mp4") ? "mp4"
+      : mt.includes("ogg") ? "ogg"
+      : mt.includes("wav") ? "wav"
+      : mt.includes("mpeg") || mt.includes("mp3") ? "mp3"
+      : "webm";
+
+    const form = new FormData();
+    form.append("file", new Blob([buf], { type: mt }), `voice.${ext}`);
+    form.append("model", "whisper-1");
+    form.append("language", "es");
+    form.append("response_format", "json");
+
+    const r = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${apiKey}` },
+      body: form,
+      signal: AbortSignal.timeout(45_000),
+    });
+    if (!r.ok) {
+      const errText = await r.text().catch(() => "");
+      res.status(502).json({ ok: false, error: `whisper HTTP ${r.status}`, detail: errText.slice(0, 200) });
+      return;
+    }
+    const data = await r.json() as { text?: string };
+    res.json({ ok: true, text: (data.text ?? "").trim() });
+  } catch (e: any) {
+    res.status(500).json({ ok: false, error: e?.message ?? "Error interno" });
   }
 });
 
