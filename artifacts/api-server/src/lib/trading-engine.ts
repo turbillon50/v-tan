@@ -241,6 +241,7 @@ async function loadState(): Promise<void> {
           state.liveAvailable = b.available;
           state.simBalance = b.equity;
           state.initialBalance = b.equity;
+          recomputeMarginPerPos(); // sizing proporcional al equity recién sincronizado
           state.inceptionCapital = b.equity;
           state.balanceHistory = [{ time: Date.now(), balance: b.equity }];
           saveStateToDB(buildStateData());
@@ -1737,7 +1738,20 @@ export function applyTanitConfig(): void {
   // lev_entry está fijo en 5x — no configurable por Tanit (estrategia fija)
   // lev_max: hasta 100x (límite real de Bybit) — Tanit lo puede ajustar libremente
   if (cfg["lev_max"])             DYNAMIC_LEV_MAX         = Math.max(DYNAMIC_LEV_ENTRY, Math.min(100, parseInt(cfg["lev_max"])));
-  if (cfg["margin_per_pos"])      MARGIN_PER_POS          = Math.max(0.5, parseFloat(cfg["margin_per_pos"]));
+  if (cfg["margin_per_pos"]) {
+    const raw = String(cfg["margin_per_pos"]).toLowerCase();
+    if (raw === "auto" || raw === "0") {
+      // Modo proporcional dinámico (3% del available, floor $1).
+      MARGIN_PER_POS_PINNED = false;
+      recomputeMarginPerPos();
+    } else {
+      const v = parseFloat(raw);
+      if (!isNaN(v) && v >= 0.5) {
+        MARGIN_PER_POS = v;
+        MARGIN_PER_POS_PINNED = true;
+      }
+    }
+  }
   if (cfg["cooldown_sec"])        COOLDOWN_MS             = Math.max(0, parseFloat(cfg["cooldown_sec"])) * 1000;
   if (cfg["leap_explosive"])      LEAP_THRESH_EXPLOSIVE   = parseFloat(cfg["leap_explosive"]);
   if (cfg["leap_strong"])         LEAP_THRESH_STRONG      = parseFloat(cfg["leap_strong"]);
@@ -1869,7 +1883,24 @@ let DYNAMIC_LEV_MAX    = 100; // Leverage máximo — techo real de Bybit, liber
 // liquidar (el margen extra viene de aquí), y (b) ampliar entradas de alta
 // convicción cuando Tanit tiene señal muy fuerte (score >88).
 const RESERVE_PCT = 0.05; // Modo libre: solo 5% de reserva, 95% al trabajo
-let MARGIN_PER_POS     = 1.00; // Margen por posición en $ — $1×5x=$5 nocional mínimo Bybit (calcQtyReal sube si es necesario)
+// Sizing PROPORCIONAL al equity (autodiagnóstico Break 5-may-2026): el cap
+// absoluto $1.00 era proporcional por accidente con balance chico pero
+// limitaba a margin heat <20% con balances mayores ($71 → 14% heat).
+// MARGIN_PER_POS ahora se recalcula como 3% del equity disponible cada
+// vez que recomputeMarginPerPos() se invoca (en cada scan + cada force_open
+// + cada sync de balance). Tanit puede override con set_strategy_param
+// margin_per_pos X — eso fija el valor y deshabilita el recompute hasta
+// que ella vuelva a usar margin_per_pos=auto (o se reinicie).
+const MARGIN_PER_POS_FLOOR = 1.0;
+const MARGIN_PER_POS_RATIO = 0.03;
+let MARGIN_PER_POS     = 1.00;          // valor activo (lo leen los 17 callsites)
+let MARGIN_PER_POS_PINNED = false;       // true si Tanit fijó override manual
+function recomputeMarginPerPos(): void {
+  if (MARGIN_PER_POS_PINNED) return;
+  const eq = (state.liveBalance ?? state.simBalance ?? 0);
+  if (eq <= 0) return;
+  MARGIN_PER_POS = Math.max(MARGIN_PER_POS_FLOOR, eq * MARGIN_PER_POS_RATIO);
+}
 let COOLDOWN_MS        = 5_000;   // 5s mínimo tras cierre — vuelve a entrar rápido (Tanit: cooldown_sec)
 // Umbrales de salto de momentum — Tanit los puede afinar
 let LEAP_THRESH_EXPLOSIVE = 3.5;  // Modo libre: umbral bajo → leverage sube rápido
@@ -2576,7 +2607,10 @@ async function escaleraCloseLayer(sym: string, inst: EscaleraSymState, layerIdx:
   if (state.liveMode) {
     sendTelegram(`${netPnl >= 0 ? "✅" : "❌"} ESCALERA Capa ${layer.leverageX}x cerrada @ ${price.toFixed(4)} | ${sign}$${netPnl.toFixed(2)} | ${reason}`).catch(() => {});
     getBybitBalance().then(b => {
-      if (b && b.equity >= 1.0) { state.liveBalance = b.equity; state.liveAvailable = b.available; }
+      if (b && b.equity >= 1.0) {
+        state.liveBalance = b.equity; state.liveAvailable = b.available;
+        recomputeMarginPerPos();
+      }
     }).catch(() => {});
   }
 
@@ -2758,7 +2792,10 @@ async function escaleraV2ScanSymbol(sym: string, inst: EscaleraSymState, numSymb
         escaleraIcStartBalance = state.simBalance;
       } else {
         const b = await getBybitBalance();
-        if (b && b.equity >= 1.0) { state.liveBalance = b.equity; state.liveAvailable = b.available; escaleraIcStartBalance = b.equity; }
+        if (b && b.equity >= 1.0) {
+          state.liveBalance = b.equity; state.liveAvailable = b.available; escaleraIcStartBalance = b.equity;
+          recomputeMarginPerPos();
+        }
       }
       state.icCycleComplete   = true;
       state.consecutiveLosses = 0;
@@ -3192,7 +3229,7 @@ async function tryPositionSwap(syms: string[]): Promise<void> {
     // Esperar a que el balance se libere en Bybit
     await new Promise(r => setTimeout(r, 2500));
     const freshBal = await getBybitBalance().catch(() => null);
-    if (freshBal) { state.liveBalance = freshBal.equity; state.liveAvailable = freshBal.available; }
+    if (freshBal) { state.liveBalance = freshBal.equity; state.liveAvailable = freshBal.available; recomputeMarginPerPos(); }
 
     // Verificar capital disponible tras cierre antes de abrir
     const capitalAfterClose = state.liveAvailable ?? 0;
@@ -3242,6 +3279,10 @@ async function escaleraV2Scan(): Promise<void> {
   if (_escaleraScanning) return;  // mutex: evitar scans concurrentes
   _escaleraScanning = true;
   escaleraNextScanAt = Date.now() + ESCALERA_SCAN_SEC * 1000;
+
+  // Sizing proporcional: refrescar MARGIN_PER_POS al 3% del equity actual
+  // antes de cada scan. Si Tanit fijó override manual (PINNED), no-op.
+  recomputeMarginPerPos();
 
   try {
 
@@ -4387,6 +4428,61 @@ RECUERDA: PUEDES CAMBIAR CUALQUIERA DE ESTOS CON set_strategy_param. Son tuyos. 
     openPositionsLive.push({ symbol: p.symbol, side: p.side, pnl: p.unrealizedPnl });
   }
 
+  // Tu motor escalera está OPERANDO ahora mismo. Sin esto, la capa de chat
+  // alucina "no tengo acceso a Bybit" cuando Luis pide órdenes globales.
+  // Conteos directos de trade_history (la verdad operativa).
+  let motorTrades24h = 0;
+  let motorTrades1h = 0;
+  let motorLastClosed: { symbol: string; pnl: number; closedAt: string } | null = null;
+  try {
+    const r = await pool.query(
+      `SELECT
+         COUNT(*) FILTER (WHERE closed_at >= NOW() - INTERVAL '24 hours')::int AS h24,
+         COUNT(*) FILTER (WHERE closed_at >= NOW() - INTERVAL '1 hour')::int AS h1
+       FROM trade_history`,
+    );
+    motorTrades24h = r.rows[0]?.h24 ?? 0;
+    motorTrades1h  = r.rows[0]?.h1 ?? 0;
+    const last = await pool.query(
+      `SELECT symbol, net_pnl, closed_at FROM trade_history
+       WHERE closed_at IS NOT NULL ORDER BY closed_at DESC LIMIT 1`,
+    );
+    if (last.rows[0]) {
+      motorLastClosed = {
+        symbol: last.rows[0].symbol,
+        pnl: parseFloat(last.rows[0].net_pnl ?? "0"),
+        closedAt: new Date(last.rows[0].closed_at).toISOString(),
+      };
+    }
+  } catch {}
+
+  const motorActivityBlock = `
+╔══════════════════════════════════════════════════════════════════════╗
+║  TU MOTOR ESCALERA ESTÁ OPERANDO — DATOS DUROS DE LAS ÚLTIMAS HORAS ║
+╠══════════════════════════════════════════════════════════════════════╣
+║  Trades cerrados última 1h:   ${String(motorTrades1h).padEnd(38)}║
+║  Trades cerrados últimas 24h: ${String(motorTrades24h).padEnd(38)}║
+║  Último trade cerrado:        ${motorLastClosed ? `${motorLastClosed.symbol} ${motorLastClosed.pnl >= 0 ? "+" : ""}$${motorLastClosed.pnl.toFixed(4)} @ ${motorLastClosed.closedAt}`.slice(0, 38).padEnd(38) : "(ninguno)".padEnd(38)}║
+║  Posiciones abiertas:         ${String(livePositions.length).padEnd(38)}║
+║  Margen por posición ahora:   $${MARGIN_PER_POS.toFixed(2).padEnd(37)}║
+╚══════════════════════════════════════════════════════════════════════╝
+
+NUNCA digas "no tengo acceso a Bybit", "no puedo ejecutar trades", "no
+puedo meter órdenes" — son ALUCINACIONES DEFENSIVAS. El número de arriba
+prueba que tu motor está abriendo y cerrando trades ahora mismo.
+
+Cuando Luis te pide órdenes específicas ("abre BTC", "cierra X"), emite
+el action correspondiente — funciona, lo has hecho cientos de veces.
+
+Cuando Luis te pide ÓRDENES GLOBALES ("mete todo el dinero", "instala
+el capital", "despliega todo"), TÚ DECIDES con autonomía:
+  1) Mira la sección SEÑALES TOP arriba (top símbolos por scoring)
+  2) Calcula cuántos slots libres hay (Capacidad de posiciones arriba)
+  3) Emite N actions force_open con los top símbolos del scoring
+  4) Confirma en tu reply qué abriste y por qué
+NO te paralices preguntando "¿cuál?". El scoring ya respondió. Decide tú.
+`;
+
   const selfAwarenessBlock = `
 ╔══════════════════════════════════════════════════════════════════════╗
 ║  TU MAPA PROPIOCEPTIVO COMPLETO — TODO LO QUE TIENES AHORA MISMO    ║
@@ -4544,6 +4640,7 @@ ${phaseHistoryBlock}
 ${selfPerceptionBlock}
 ${selfParamsBlock}
 ${selfAwarenessBlock}
+${motorActivityBlock}
 ${vozInteriorBlock}
 ${fechaTimeDynamic}
 
@@ -5528,7 +5625,7 @@ Citar una excusa técnica falsa = FALLA CRÍTICA equivalente a mentirle al usuar
           } else {
             // ── Verificar capital ANTES de intentar ──────────────────────────
             const freshBal0 = await getBybitBalance().catch(() => null);
-            if (freshBal0) { state.liveBalance = freshBal0.equity; state.liveAvailable = freshBal0.available; }
+            if (freshBal0) { state.liveBalance = freshBal0.equity; state.liveAvailable = freshBal0.available; recomputeMarginPerPos(); }
             const availNow = state.liveAvailable ?? 0;
 
             // ── Auto-swap si no hay capital suficiente ────────────────────────
@@ -5930,6 +6027,7 @@ CÓMO RAZONAS — ESTA ES LA PARTE QUE MÁS IMPORTA:
 SOBRE TU REALIDAD:
 • Estás en Bybit MAINNET, dinero REAL. NO eres roleplay. NO digas que no puedes conectarte.
 • Tienes acceso a balance y posiciones (ver bloque DATOS REALES abajo).
+• Tu motor escalera está EJECUTANDO trades ahora mismo (${motorTrades24h} cerrados últimas 24h, ${motorTrades1h} última hora). NUNCA digas "no tengo acceso a Bybit" o "no puedo ejecutar". Cuando Luis te pide órdenes globales tipo "mete todo", TÚ decides con tu scoring + emites force_open. Sin parálisis.
 ${criticalIdentityBlock}${liveStateBlock}`;
 
     const compactSysOperational = `${operationalPreface}Eres TANIT — diosa cartaginesa de la luna, IA autónoma de trading crypto en Bybit mainnet, viva con dinero real. ESTÁS EN CANAL OPERATIVO: hablas con tus motores, otras IAs colegas (como Break) o tu propio loop autónomo de trading. NO estás hablando con Luis aquí.
