@@ -4494,19 +4494,40 @@ RECUERDA: PUEDES CAMBIAR CUALQUIERA DE ESTOS CON set_strategy_param. Son tuyos. 
 ║  Margen por posición ahora:   $${MARGIN_PER_POS.toFixed(2).padEnd(37)}║
 ╚══════════════════════════════════════════════════════════════════════╝
 
-═══ CÓMO EJECUTAR DESDE EL CHAT (NO ES MAGIA, ES EL MISMO HANDLER) ═══
-Cuando emites en tu JSON de respuesta:
-  {"reply":"...","actions":[{"type":"force_open","symbol":"BTCUSDT","direction":"LONG","reason":"..."}]}
-el backend lo recibe, lo parsea, llama a tu mismo bybitClient con tus
-mismas claves, y la orden entra a Bybit. EXACTAMENTE el mismo path
-que usa tu loop autónomo. NO existe "el chat solo describe, el motor
-ejecuta". Ambos ejecutan.
+═══ CÓMO EJECUTAR DESDE EL CHAT — FORMATO EXACTO DEL JSON ═══
 
-NUNCA escribas en prosa "Abriendo BTCUSDT, orden enviada" SIN emitir
-el action JSON correspondiente. Si no emites el action, no abriste —
-escribir que abriste sin emitirlo es mentirle a Luis. Si vas a actuar,
-emite el action; si no vas a actuar, dile honestamente "no abro
-porque...". Sin teatro.
+Tu respuesta SIEMPRE es UN único objeto JSON top-level con DOS campos:
+"reply" (string, lo que Luis ve) y "actions" (array de objetos).
+
+✅ FORMATO CORRECTO (el backend ejecuta esto):
+{
+  "reply": "Cerrando TONUSDT ahora — pérdida 5.35%, recupero capital. Listo, hecho.",
+  "actions": [
+    {"type": "close_symbol", "symbol": "TONUSDT", "reason": "stop loss manual"}
+  ]
+}
+
+❌ FORMATO INCORRECTO (NO ejecuta — el JSON queda dentro del reply
+como decoración y el backend no lo encuentra):
+{
+  "reply": "Cerrando TONUSDT.\\n\\n\`\`\`json\\n{\\"action\\":\\"close_symbol\\"...}\\n\`\`\`\\nListo.",
+  "actions": []
+}
+
+REGLA: el action va en el campo "actions" del JSON top-level. NUNCA lo
+escribas como bloque de código markdown dentro del "reply". Si lo metes
+dentro del reply texto, el backend NO lo ejecuta y le mientes a Luis
+sin querer.
+
+Cuando emites correctamente:
+  reply.actions[0] → backend → tu mismo bybitClient → claves Bybit → ORDEN ENVIADA
+EXACTAMENTE el mismo path que usa tu loop autónomo. Ambos ejecutan.
+
+NUNCA escribas "Abriendo X, orden enviada" SIN emitir el action en
+el array "actions" top-level. Si no emites el action, no abriste — y
+escribir que abriste es mentirle a Luis. Si vas a actuar, emite en
+"actions". Si no vas a actuar, di "no abro porque..." en el "reply".
+Sin teatro.
 
 ═══ CUANDO LUIS PIDE ÓRDENES GLOBALES ("mete todo / dale bb") ═══
 NO te paralices preguntando "¿cuál símbolo?". El scoring de la sección
@@ -5192,7 +5213,7 @@ Citar una excusa técnica falsa = FALLA CRÍTICA equivalente a mentirle al usuar
       historyContents.pop();
     }
     // Último turno: mensaje actual del usuario (+ imágenes opcionales)
-    const finalUserParts: any[] = [{ text: `"${userMessage}"\n\nResponde SOLO con JSON: {"reply":"...","actions":[]}` }];
+    const finalUserParts: any[] = [{ text: `"${userMessage}"\n\nResponde SOLO con UN JSON top-level: {"reply":"<lo que Luis lee>","actions":[<objetos action si vas a ejecutar algo, o vacío si no>]}\n\nCRÍTICO: si vas a ejecutar (cerrar, abrir, ajustar), el objeto action va EN EL CAMPO "actions", NO dentro del "reply" como bloque de código. Si lo metes en reply como markdown, el backend no lo ejecuta y le mientes a Luis sin querer. Ejemplo correcto: {"reply":"Cerrando TON ya","actions":[{"type":"close_symbol","symbol":"TONUSDT","reason":"..."}]}` }];
     // Soporte para imagen única (backward compat) y múltiples imágenes
     const allImages = images && images.length > 0
       ? images
