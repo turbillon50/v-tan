@@ -11682,6 +11682,21 @@ export async function getTanitIdentityData(): Promise<{
 }
 
 /** Parámetros en vivo de Tanit — Fase 4 + estrategia. Para el dashboard de parámetros reales. */
+/** Read-only snapshot for Break monitoring (no UI metadata). */
+export function getThesisSnapshot(): {
+  ATR_SL_MULTIPLIER: number;
+  ATR_TP_MULTIPLIER: number;
+  DYNAMIC_LEV_MAX: number;
+  tanitRuntimeConfig: Record<string, string>;
+} {
+  return {
+    ATR_SL_MULTIPLIER,
+    ATR_TP_MULTIPLIER,
+    DYNAMIC_LEV_MAX,
+    tanitRuntimeConfig: { ...tanitRuntimeConfig },
+  };
+}
+
 export function getTanitLiveParams(): Record<string, { value: number | string; label: string; group: string; unit?: string }> {
   return {
     // ── FASE 4 — Auto-reprogramación ──────────────────────────────────────────
