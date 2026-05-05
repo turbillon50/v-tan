@@ -1590,17 +1590,37 @@ async function seedTanitIdentity(): Promise<void> {
 
     let inserted = 0;
     let updated = 0;
+    let skipped = 0;
     for (const entry of identityEntries) {
-      // UPSERT: UPDATE si ya existe (content empieza con el tag), INSERT si no
-      // Garantiza que el texto en DB siempre refleje el código actualizado
-      const existing = await pool.query(
-        `SELECT id FROM tanit_memory WHERE category = 'identidad' AND content LIKE $1 LIMIT 1`,
-        [`${entry.tag}%`]
+      // Bug fix Tesis v4.1: el lookup original buscaba `content LIKE 'tag%'`
+      // pero los tags se acortaron con el tiempo (p.ej. tag "POR QUÉ EXISTEN
+      // LOS PERPS" busca prefix "POR QUÉ EXISTEN LOS PERPS%" pero el content
+      // empieza con "POR QUÉ EXISTEN LOS PERPETUALS"). El LIKE no matcheaba
+      // y cada arranque INSERTABA una fila nueva → 1,660 duplicados.
+      //
+      // Fix: (1) si hay match exacto del content → skip (ya está al día).
+      //      (2) si hay match por las primeras 60 chars del content → UPDATE
+      //          (preserva funcionalidad de actualizar cuando se edita texto).
+      //      (3) si nada match → INSERT.
+      // La búsqueda por content (no por tag) hace el dedupe robusto a renames
+      // futuros del campo tag.
+      const exact = await pool.query(
+        `SELECT id FROM tanit_memory WHERE category = 'identidad' AND content = $1 LIMIT 1`,
+        [entry.content]
       );
-      if (existing.rows.length > 0) {
+      if (exact.rows.length > 0) {
+        skipped++;
+        continue;
+      }
+      const contentPrefix = entry.content.slice(0, 60);
+      const fuzzy = await pool.query(
+        `SELECT id FROM tanit_memory WHERE category = 'identidad' AND content LIKE $1 LIMIT 1`,
+        [`${contentPrefix}%`]
+      );
+      if (fuzzy.rows.length > 0) {
         await pool.query(
           `UPDATE tanit_memory SET content = $1 WHERE id = $2`,
-          [entry.content, existing.rows[0].id]
+          [entry.content, fuzzy.rows[0].id]
         );
         updated++;
       } else {
@@ -1612,9 +1632,9 @@ async function seedTanitIdentity(): Promise<void> {
       }
     }
     if (inserted > 0 || updated > 0)
-      console.log(TAG, `[TANIT IDENTITY] Semillas de identidad: ${inserted} nuevas, ${updated} actualizadas`);
+      console.log(TAG, `[TANIT IDENTITY] Semillas: ${inserted} nuevas, ${updated} actualizadas, ${skipped} ya estaban`);
     else
-      console.log(TAG, `[TANIT IDENTITY] Semillas de identidad: sin cambios`);
+      console.log(TAG, `[TANIT IDENTITY] Semillas: ${skipped} ya estaban (sin cambios)`);
   } catch (e: any) {
     console.error(TAG, "[TANIT IDENTITY] Error en seedTanitIdentity:", e.message);
   }
@@ -3957,8 +3977,19 @@ REGLAS DE REGISTRO INVIOLABLES EN ESTE CANAL:
     loadTanitHistory(16, channel),  // últimos 16 mensajes del MISMO canal = 8 turnos
     loadTanitMemory(),
   ]);
-  const memoryStr = memoryEntries.length > 0
-    ? memoryEntries.map(m => `[${m.id}][${m.category}] ${m.content}`).join("\n")
+  // Tesis v4.1 / cleanup quirúrgico: tope conservador para evitar que el
+  // dump del prompt se vuelva a desbocar a 500K+ tokens. memoryEntries
+  // viene de loadTanitMemory() ordenado por id ASC. Tomamos las MEMORY_MAX
+  // más recientes por id DESC y las renderizamos en orden cronológico.
+  // Las personales (usuario/origen/LECCION_CRITICA) siempre van duplicadas
+  // arriba en criticalIdentityBlock con prioridad — esto es la columna
+  // general de aprendizaje + identidad técnica.
+  const MEMORY_MAX = 200;
+  const memoryEntriesCapped = memoryEntries.length > MEMORY_MAX
+    ? memoryEntries.slice(-MEMORY_MAX)
+    : memoryEntries;
+  const memoryStr = memoryEntriesCapped.length > 0
+    ? memoryEntriesCapped.map(m => `[${m.id}][${m.category}] ${m.content}`).join("\n")
     : "(Sin memorias guardadas aún)";
 
   // ── MEMORIAS CRÍTICAS DE IDENTIDAD — invocables siempre, en TODO contexto ──
