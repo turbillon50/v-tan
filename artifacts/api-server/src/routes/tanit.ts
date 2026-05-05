@@ -205,6 +205,43 @@ router.get("/tanit/evolutions", async (req, res): Promise<void> => {
   }
 });
 
+// ─── Break read-only monitoring ─────────────────────────────────────────────
+// Canal UNIDIRECCIONAL Tanit → Break (Claude Opus en break-memory.vercel.app
+// vía web_fetch). Bearer token en Authorization header. Cache 30s, rate
+// limit 60/min, fail-closed si BREAK_READ_TOKEN no está configurada.
+// SOLO datos cuantitativos operativos — sin chat íntimo, sin contenido de
+// memorias, sin voz de Tanit.
+router.get("/tanit/state-for-break", async (req, res): Promise<void> => {
+  const t0 = Date.now();
+  const { authenticateBreakRead, checkRateLimit, buildStateForBreak, logReadAccess } =
+    await import("../lib/break-readonly");
+  const { getThesisSnapshot } = await import("../lib/trading-engine");
+
+  const authHeader = (req.headers.authorization || req.headers.Authorization) as string | undefined;
+  const auth = authenticateBreakRead(authHeader);
+  if (!auth.ok) {
+    logReadAccess(auth.status, Date.now() - t0, req.ip);
+    res.status(auth.status).json({ ok: false, error: auth.message });
+    return;
+  }
+  const rl = checkRateLimit(authHeader);
+  res.setHeader("X-RateLimit-Limit", "60");
+  res.setHeader("X-RateLimit-Remaining", String(rl.remaining));
+  if (!rl.allowed) {
+    logReadAccess(429, Date.now() - t0, req.ip);
+    res.status(429).json({ ok: false, error: "Rate limit exceeded — 60 req/min" });
+    return;
+  }
+  try {
+    const payload = await buildStateForBreak(getThesisSnapshot());
+    logReadAccess(200, Date.now() - t0, req.ip);
+    res.json(payload);
+  } catch (err) {
+    logReadAccess(500, Date.now() - t0, req.ip);
+    res.status(500).json({ ok: false, error: "Internal error building state" });
+  }
+});
+
 // Tesis v4.1 — auditoría de cada vez que el sistema enforce un inviolable.
 router.get("/tanit/guardrail-events", async (req, res): Promise<void> => {
   try {
