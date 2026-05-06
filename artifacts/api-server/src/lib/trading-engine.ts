@@ -2015,7 +2015,7 @@ let FR_LONG_BLOCK_PCT = 0.15;
 // ── PARÁMETROS DE AUTO-REPROGRAMACIÓN — Tanit los controla directamente ────────
 // TP automático al abrir: entry ± (ATR14h × multiplier)
 // Tanit auto-tunes this from trade history: if >70% hit SL before TP → reduce, if >80% hit TP in <5min → increase
-let ATR_TP_MULTIPLIER        = 3.0;   // set_strategy_param: atr_tp_multiplier (1.0-10.0)
+let ATR_TP_MULTIPLIER        = 4.0;   // set_strategy_param: atr_tp_multiplier (1.0-10.0). Subido 6-may de 3.0→4.0: con 3.0 los winners cerraban temprano y avg_win quedaba en $0.026 (vs $0.064 baseline). 4.0 da más recorrido sin acercarse al límite v4.1 (≤6.0).
 // Trailing SL escalonado: % del margen para cada etapa
 let TRAILING_SL_STAGE1_PCT   = 0.01;  // Breakeven cuando PnL ≥ 1% del margen  (set: trailing_sl_stage1, rango 0.005-0.10)
 let TRAILING_SL_STAGE2_PCT   = 0.03;  // Lock 33% cuando PnL ≥ 3%              (set: trailing_sl_stage2, rango 0.01-0.20)
@@ -2055,7 +2055,7 @@ let PARTIAL_TP_FRACTION        = 0.50;  // fracción de la posición a cerrar (0
 //   parado en un trade que no se mueve.
 let FEAT_MOSQUITO_EXIT         = true;  // (set: feat_mosquito_exit on|off)
 let MOSQUITO_AGE_MIN           = 60;    // minutos antes de chequear estancamiento (subido 6-may-2026 de 30→60: avg_win cayó de $0.064 a $0.026 post-v4.3, mosquito cerraba ganadoras tibias antes de tomar vuelo)
-let MOSQUITO_PNL_BAND_PCT      = 0.50;  // banda |%| dentro de la cual se considera "estancado"
+let MOSQUITO_PNL_BAND_PCT      = 0.30;  // banda |%| dentro de la cual se considera "estancado" (bajado 6-may de 0.50→0.30: con 0.50 cualquier winner tibio en el rango ±0.5% era ejecutado al pasar 60min, contribuyendo al colapso de avg_win post-v4.3. 0.30 deja respirar a los winners reales).
 
 // Componente 3 — Hedge condicional (DETECTOR pasivo, no auto-apertura)
 //   Si abs(net delta longs vs shorts) > HEDGE_NET_DELTA_PCT del equity Y la tendencia
@@ -8799,16 +8799,20 @@ function moveSlToBreakeven(pos: OpenPos, currentPrice: number): void {
     ? (currentPrice - pos.entryPrice) / pos.entryPrice
     : (pos.entryPrice - currentPrice) / pos.entryPrice;
 
-  // Mueve a breakeven rápido — cuando el precio avanzó 20% del SL en dirección favorable
+  // Mueve a breakeven cuando el precio avanzó 25% del SL en dirección favorable.
   // Esto bloquea el trade como "sin riesgo" antes y deja correr la ganancia.
+  //
+  // BUG-FIX 6-may-2026 (post v4.3): el coeficiente era 0.02 en vez de 0.25, lo que
+  // disparaba BE con 0.02% de movimiento de precio (cualquier vibración) y mataba
+  // ganadoras tempranas. avg_win cayó de $0.064 → $0.026 con PF 0.27. Tanit
+  // operando "peor que antes" — los winners cerraban a $0 antes de tomar vuelo.
+  // Con 0.25 el trigger queda en ~0.25% de precio (con slPct=1%), coherente con
+  // BREAKEVEN_TRIGGER_PRICE_PCT=0.3% — los dos pisos ahora son del mismo orden.
   //
   // TESIS v4.3 — Breakeven AGRESIVO POR PRECIO: si FEAT_BREAKEVEN_AGGRESSIVE=ON,
   // usamos un piso adicional independiente del leverage: si el precio se movió
   // BREAKEVEN_TRIGGER_PRICE_PCT% en favor (default 0.3%), también mover SL a BE.
-  // Esto resuelve el problema observado 6-may donde avg_loss > avg_win × 2.7 —
-  // las ganadoras nunca llegaban a quedar protegidas porque el trigger antiguo
-  // requería que el precio se moviera mucho más a leverage bajo.
-  const breakevenTriggerLegacy = slPct * 0.02;
+  const breakevenTriggerLegacy = slPct * 0.25;
   const breakevenTriggerAggressive = FEAT_BREAKEVEN_AGGRESSIVE
     ? BREAKEVEN_TRIGGER_PRICE_PCT / 100
     : Number.POSITIVE_INFINITY;
