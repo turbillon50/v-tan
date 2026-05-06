@@ -3756,19 +3756,52 @@ let _perplexityCache: { ts: number; result: string } | null = null;
 const PERPLEXITY_CACHE_TTL = 5 * 60 * 1000; // 5 minutos
 
 // ── Balance snapshots persistentes en DB ──────────────────────────────────────
-// Guarda un punto de balance en DB máximo 1 vez por minuto — necesario para
-// que el equity curve tenga resolución minuto-a-minuto cuando Luis hace zoom.
+// Guarda un punto de balance en DB cada 5 minutos con todos los campos necesarios
+// para el dashboard /monitor. Los campos adicionales (num_positions, margin_heat_pct,
+// daily_pnl_usdt) se añadieron en la migración migrate-dashboard.mjs (5-may-2026).
 let _lastSnapshotSavedAt = 0;
-const SNAPSHOT_INTERVAL_MS = 60 * 1000; // 1 minuto
+const SNAPSHOT_INTERVAL_MS = 5 * 60 * 1000; // 5 minutos
 
 function saveBalanceSnapshotThrottled(balance: number): void {
   const now = Date.now();
   if (now - _lastSnapshotSavedAt < SNAPSHOT_INTERVAL_MS) return;
   _lastSnapshotSavedAt = now;
+
+  // Datos adicionales del state global para el dashboard
+  const equity    = balance;
+  const available = state.liveAvailable ?? balance;
+  const numPos    = state.openPositions ? Object.keys(state.openPositions).length : 0;
+  const marginHeat = equity > 0 ? parseFloat((((equity - available) / equity) * 100).toFixed(4)) : 0;
+
+  // daily_pnl: sum de netPnl de trade_history de hoy
   pool.query(
-    `INSERT INTO balance_snapshots (balance, created_at) VALUES ($1, NOW())`,
-    [parseFloat(balance.toFixed(6))]
-  ).catch(e => console.error(TAG, "balance_snapshot error:", e));
+    `SELECT COALESCE(SUM(net_pnl), 0)::float AS daily_pnl
+     FROM trade_history
+     WHERE closed_at >= NOW()::date`
+  ).then(r => {
+    const dailyPnl = Number(r.rows[0]?.daily_pnl ?? 0);
+    pool.query(
+      `INSERT INTO balance_snapshots
+         (balance, equity, available, num_positions, margin_heat_pct, daily_pnl_usdt, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, NOW())`,
+      [
+        parseFloat(balance.toFixed(6)),
+        parseFloat(equity.toFixed(6)),
+        parseFloat(available.toFixed(6)),
+        numPos,
+        marginHeat,
+        parseFloat(dailyPnl.toFixed(6)),
+      ]
+    ).catch(e => console.error(TAG, "balance_snapshot insert error:", e));
+  }).catch(e => {
+    // Si falla la query de daily_pnl, igual guardamos el snapshot básico
+    pool.query(
+      `INSERT INTO balance_snapshots (balance, equity, available, num_positions, margin_heat_pct, created_at)
+       VALUES ($1, $2, $3, $4, $5, NOW())`,
+      [parseFloat(balance.toFixed(6)), parseFloat(equity.toFixed(6)),
+       parseFloat(available.toFixed(6)), numPos, marginHeat]
+    ).catch(e2 => console.error(TAG, "balance_snapshot fallback error:", e2));
+  });
 }
 
 export async function getBalanceHistory(days = 30): Promise<{ time: number; balance: number }[]> {

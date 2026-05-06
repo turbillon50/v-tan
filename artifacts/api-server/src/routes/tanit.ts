@@ -3,6 +3,7 @@ import {
   db,
   tanitChat,
   tanitMemory,
+  capitalContributions,
   tanitPersonalMemories,
   tanitEvolutions,
   tanitRuntimeConfig,
@@ -441,7 +442,7 @@ router.get("/tanit/trades", async (req, res): Promise<void> => {
   }
 });
 
-// ─── Balance snapshots (equity curve in Analytics page) ───────────────────────
+// ─── Balance snapshots (equity curve) ─────────────────────────────────────────
 
 router.get("/tanit/balance-snapshots", async (req, res): Promise<void> => {
   try {
@@ -452,6 +453,94 @@ router.get("/tanit/balance-snapshots", async (req, res): Promise<void> => {
       .orderBy(balanceSnapshots.createdAt)
       .limit(limit);
     res.json({ ok: true, count: list.length, snapshots: list });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+// ─── Balance history with range filter (for /monitor dashboard) ──────────────
+
+router.get("/tanit/balance-history", async (req, res): Promise<void> => {
+  try {
+    const rangeMap: Record<string, string> = {
+      "1h": "1 hours", "6h": "6 hours", "24h": "24 hours",
+      "7d": "7 days", "30d": "30 days",
+    };
+    const rangeParam = String(req.query.range ?? "24h");
+    const interval = rangeMap[rangeParam] ?? "24 hours";
+    const { pool: pg } = await import("@workspace/db");
+    const r = await pg.query(
+      `SELECT EXTRACT(EPOCH FROM created_at)::bigint * 1000 AS time,
+              COALESCE(equity, balance)::float AS equity,
+              COALESCE(available, balance)::float AS available,
+              balance::float AS balance,
+              COALESCE(num_positions, 0)::int AS num_positions,
+              COALESCE(margin_heat_pct, 0)::float AS margin_heat_pct,
+              COALESCE(daily_pnl_usdt, 0)::float AS daily_pnl_usdt
+       FROM balance_snapshots
+       WHERE created_at >= NOW() - ($1)::interval
+       ORDER BY created_at ASC`,
+      [interval]
+    );
+    res.json({ ok: true, range: rangeParam, count: r.rows.length, history: r.rows });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+// ─── Capital contributions (Luis deposits) ────────────────────────────────────
+
+router.get("/tanit/capital-contributions", async (req, res): Promise<void> => {
+  try {
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS capital_contributions (
+        id SERIAL PRIMARY KEY,
+        amount_usdt NUMERIC(20,8) NOT NULL,
+        amount_mxn NUMERIC(20,4),
+        exchange_rate NUMERIC(10,4),
+        notes TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW() NOT NULL
+      )
+    `);
+    const list = await db
+      .select()
+      .from(capitalContributions)
+      .orderBy(capitalContributions.createdAt);
+    const totalUsdt = list.reduce((s, r) => s + Number(r.amountUsdt ?? 0), 0);
+    res.json({ ok: true, contributions: list, total_usdt: parseFloat(totalUsdt.toFixed(4)) });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+router.post("/tanit/capital-contributions", async (req, res): Promise<void> => {
+  try {
+    const { amount_usdt, amount_mxn, exchange_rate, notes } = req.body ?? {};
+    const usdt = parseFloat(amount_usdt);
+    if (!Number.isFinite(usdt) || usdt <= 0) {
+      res.status(400).json({ ok: false, error: "amount_usdt must be a positive number" });
+      return;
+    }
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS capital_contributions (
+        id SERIAL PRIMARY KEY,
+        amount_usdt NUMERIC(20,8) NOT NULL,
+        amount_mxn NUMERIC(20,4),
+        exchange_rate NUMERIC(10,4),
+        notes TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW() NOT NULL
+      )
+    `);
+    const [inserted] = await db
+      .insert(capitalContributions)
+      .values({
+        amountUsdt: String(usdt),
+        amountMxn: amount_mxn != null ? String(parseFloat(amount_mxn)) : null,
+        exchangeRate: exchange_rate != null ? String(parseFloat(exchange_rate)) : null,
+        notes: notes ? String(notes).slice(0, 500) : null,
+      })
+      .returning();
+    res.json({ ok: true, contribution: inserted });
   } catch (err) {
     res.status(500).json({ ok: false, error: String(err) });
   }
