@@ -1861,6 +1861,23 @@ export function applyTanitConfig(): void {
   if (cfg["mosquito_pnl_band_pct"])   { const v = parseFloat(cfg["mosquito_pnl_band_pct"]);   if (!isNaN(v)) MOSQUITO_PNL_BAND_PCT   = Math.max(0.10, Math.min(2.0,  v)); }
   if (cfg["hedge_net_delta_pct"])     { const v = parseFloat(cfg["hedge_net_delta_pct"]);     if (!isNaN(v)) HEDGE_NET_DELTA_PCT     = Math.max(10,   Math.min(80,   v)); }
 
+  // ── TESIS v4.3 — Día 2 ─────────────────────────────────────────────────
+  if (cfg["margin_heat_block_pct"])           { const v = parseFloat(cfg["margin_heat_block_pct"]);           if (!isNaN(v)) MARGIN_HEAT_BLOCK_PCT           = Math.max(50, Math.min(95, v)); }
+  if (cfg["margin_heat_defensive_close_pct"]) { const v = parseFloat(cfg["margin_heat_defensive_close_pct"]); if (!isNaN(v)) MARGIN_HEAT_DEFENSIVE_CLOSE_PCT = Math.max(80, Math.min(99, v)); }
+  if (cfg["feat_progressive_lev"]      != null) FEAT_PROGRESSIVE_LEV  = parseBool(cfg["feat_progressive_lev"]);
+  if (cfg["feat_breakeven_aggressive"] != null) FEAT_BREAKEVEN_AGGRESSIVE = parseBool(cfg["feat_breakeven_aggressive"]);
+  if (cfg["feat_loss_time_exit"]       != null) FEAT_LOSS_TIME_EXIT   = parseBool(cfg["feat_loss_time_exit"]);
+  if (cfg["lev_prog_hard_cap"])  { const v = parseFloat(cfg["lev_prog_hard_cap"]);  if (!isNaN(v)) LEV_PROG_HARD_CAP  = Math.max(LEV_PROG_MIN, Math.min(50, v)); }
+  if (cfg["lev_prog_min"])       { const v = parseFloat(cfg["lev_prog_min"]);       if (!isNaN(v)) LEV_PROG_MIN       = Math.max(1, Math.min(LEV_PROG_HARD_CAP, v)); }
+  if (cfg["lev_prog_wr_up"])     { const v = parseFloat(cfg["lev_prog_wr_up"]);     if (!isNaN(v)) LEV_PROG_WR_UP     = Math.max(50, Math.min(95, v)); }
+  if (cfg["lev_prog_wr_down"])   { const v = parseFloat(cfg["lev_prog_wr_down"]);   if (!isNaN(v)) LEV_PROG_WR_DOWN   = Math.max(40, Math.min(LEV_PROG_WR_UP, v)); }
+  if (cfg["lev_prog_heat_ok"])   { const v = parseFloat(cfg["lev_prog_heat_ok"]);   if (!isNaN(v)) LEV_PROG_HEAT_OK   = Math.max(50, Math.min(LEV_PROG_HEAT_BAIL, v)); }
+  if (cfg["lev_prog_heat_bail"]) { const v = parseFloat(cfg["lev_prog_heat_bail"]); if (!isNaN(v)) LEV_PROG_HEAT_BAIL = Math.max(LEV_PROG_HEAT_OK, Math.min(95, v)); }
+  if (cfg["lev_prog_cooldown_min"]) { const v = parseFloat(cfg["lev_prog_cooldown_min"]); if (!isNaN(v)) LEV_PROG_COOLDOWN_MS = Math.max(1, Math.min(30, v)) * 60 * 1000; }
+  if (cfg["lev_prog_window"])    { const v = parseFloat(cfg["lev_prog_window"]);    if (!isNaN(v)) LEV_PROG_WINDOW    = Math.max(5, Math.min(100, v)); }
+  if (cfg["breakeven_trigger_price_pct"]) { const v = parseFloat(cfg["breakeven_trigger_price_pct"]); if (!isNaN(v)) BREAKEVEN_TRIGGER_PRICE_PCT = Math.max(0.05, Math.min(2.0, v)); }
+  if (cfg["loss_time_exit_min"]) { const v = parseFloat(cfg["loss_time_exit_min"]); if (!isNaN(v)) LOSS_TIME_EXIT_MIN = Math.max(2, Math.min(60, v)); }
+
   // ── Multiplicadores de agresividad por sesión ──────────────────────────────
   const clampMult = (v: number) => Math.max(0.70, Math.min(1.50, v));
   if (cfg["mult_late_night"]) { const v = parseFloat(cfg["mult_late_night"]); if (!isNaN(v)) SESSION_MULT_LATE_NIGHT = clampMult(v); }
@@ -2057,6 +2074,148 @@ let LEV_WIN_STREAK_TRIGGER     = 3;     // 3 wins seguidas → leve boost
 let LEV_WIN_STREAK_FACTOR      = 1.10;  // multiplicador (+10%) cuando hay win streak
 let LEV_HIGH_VOL_ATR_PCT       = 1.5;   // ATR > 1.5% del precio → "alta volatilidad"
 let LEV_HIGH_VOL_FACTOR        = 0.75;  // multiplicador (-25%) en alta volatilidad
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TESIS v4.3 — Día 2 — Margin heat protection + cierre rápido perdedoras
+// (autorizado por Luis vía Break, 6-may-2026 — observación: margin heat 97%
+//  con $179 USDT, avg_loss subió a -$0.155 vs avg_win $0.056, ratio 0.36)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// 1. MARGIN HEAT PROTECTION (siempre ON, no es flag — safety transversal)
+//    Distinto del daily-loss circuit breaker (v4.2) y del drawdown 18% (legacy):
+//    este protege contra liquidación inminente por sobre-exposición de margen.
+let MARGIN_HEAT_BLOCK_PCT           = 85;  // bloquea NUEVAS aperturas si > este %
+let MARGIN_HEAT_DEFENSIVE_CLOSE_PCT = 95;  // cierra la pos más pequeña en rojo si > este %
+let _lastMarginHeatDefensiveAt      = 0;
+const MARGIN_HEAT_DEFENSIVE_COOLDOWN_MS = 60 * 1000; // 1 min entre cierres defensivos
+
+// 2. LEVERAGE PROGRESIVO CONDICIONAL (FEAT_PROGRESSIVE_LEV)
+//    Sube leverage gradual cuando WR sostenido alto Y margin heat bajo.
+//    Baja al mínimo cuando WR cae o margin heat sube. Cooldown 3 min.
+//    Cap absoluto duro 10x (NUNCA pasa, sin importar la condición).
+let FEAT_PROGRESSIVE_LEV  = true;
+let LEV_PROG_HARD_CAP     = 10;
+let LEV_PROG_MIN          = 5;             // floor (== DYNAMIC_LEV_ENTRY actual)
+let LEV_PROG_WR_UP        = 70;            // WR % sostenido para subir leverage
+let LEV_PROG_WR_DOWN      = 65;            // WR % para bajar a min
+let LEV_PROG_HEAT_OK      = 80;            // heat máximo permitido para subir
+let LEV_PROG_HEAT_BAIL    = 85;            // heat para forzar bajada
+let LEV_PROG_COOLDOWN_MS  = 3 * 60 * 1000; // 3 min entre cambios
+let LEV_PROG_WINDOW       = 20;            // últimos N trades para WR
+let _lastProgLevValue: number | null = null;
+let _lastProgLevChangeAt = 0;
+
+// 3. BREAKEVEN AGRESIVO POR PRECIO (FEAT_BREAKEVEN_AGGRESSIVE)
+//    Distinto del TRAILING_SL_STAGE1_PCT (que es % de PnL/margen, depende del leverage).
+//    Este es % del PRECIO, leverage-independent: si el precio se movió X% en favor,
+//    SL a entry. Más predecible.
+let FEAT_BREAKEVEN_AGGRESSIVE  = true;
+let BREAKEVEN_TRIGGER_PRICE_PCT = 0.3;  // 0.3% de movimiento de precio → BE
+
+// 4. TIME-BASED LOSS EXIT (FEAT_LOSS_TIME_EXIT)
+//    Si una posición está en rojo después de N minutos, cerrarla.
+//    Más estricto que el mosquito exit (que requiere |pnl%| < banda):
+//    este cierra cualquier perdedora vieja, sin importar magnitud.
+let FEAT_LOSS_TIME_EXIT  = true;
+let LOSS_TIME_EXIT_MIN   = 10;  // minutos antes de forzar exit en perdedora
+
+function getCurrentMarginHeatPct(): number {
+  const equity = state.liveMode ? (state.liveBalance ?? 0) : (state.simBalance ?? 0);
+  const available = state.liveAvailable ?? equity;
+  if (equity <= 0) return 0;
+  return ((equity - available) / equity) * 100;
+}
+
+function isMarginHeatBlocking(): { blocking: boolean; heat: number; reason: string | null } {
+  const heat = getCurrentMarginHeatPct();
+  if (heat > MARGIN_HEAT_BLOCK_PCT) {
+    return { blocking: true, heat, reason: `Margin heat ${heat.toFixed(1)}% > ${MARGIN_HEAT_BLOCK_PCT}% — bloqueando nuevas aperturas hasta que baje` };
+  }
+  return { blocking: false, heat, reason: null };
+}
+
+function getRecentWinRatePct(window = LEV_PROG_WINDOW): number {
+  const recent = state.tradeLog.slice(0, window);
+  if (recent.length < 5) return 50; // sin datos suficientes — neutral
+  const wins = recent.filter((t: any) => (t.pnl ?? 0) > 0).length;
+  return (wins / recent.length) * 100;
+}
+
+async function maybeDefensiveClose(): Promise<void> {
+  const heat = getCurrentMarginHeatPct();
+  if (heat <= MARGIN_HEAT_DEFENSIVE_CLOSE_PCT) return;
+  const now = Date.now();
+  if (now - _lastMarginHeatDefensiveAt < MARGIN_HEAT_DEFENSIVE_COOLDOWN_MS) return;
+
+  // Encuentra la posición en rojo más PEQUEÑA (notional × |unrealizedPnl|)
+  // entre las que vienen de Bybit live. Más pequeña = menor impacto al cerrar.
+  try {
+    const { closePosition } = await import("./bybit-auth");
+    const positions = await bybitGetOpenPositions();
+    type Cand = { symbol: string; direction: "LONG" | "SHORT"; size: number; pnl: number; notional: number; qty: string };
+    const losers: Cand[] = positions
+      .filter((p: any) => parseFloat(p.size) > 0 && parseFloat(p.unrealisedPnl ?? "0") < 0)
+      .map((p: any) => ({
+        symbol: String(p.symbol),
+        direction: (p.side === "Buy" ? "LONG" : "SHORT") as "LONG" | "SHORT",
+        size: parseFloat(p.size ?? "0"),
+        qty: String(p.size ?? "0"),
+        pnl: parseFloat(p.unrealisedPnl ?? "0"),
+        notional: parseFloat(p.positionValue ?? "0") || (parseFloat(p.size ?? "0") * parseFloat(p.markPrice ?? "0")),
+      }));
+    if (losers.length === 0) {
+      console.warn(TAG, `[MARGIN-HEAT-DEFENSIVE] heat ${heat.toFixed(1)}% > ${MARGIN_HEAT_DEFENSIVE_CLOSE_PCT}% pero no hay perdedoras — todas en verde`);
+      return;
+    }
+    losers.sort((a, b) => a.notional - b.notional);
+    const target = losers[0];
+    _lastMarginHeatDefensiveAt = now;
+    const msg = `🚨 DEFENSIVE CLOSE (margin heat ${heat.toFixed(1)}% > ${MARGIN_HEAT_DEFENSIVE_CLOSE_PCT}%): cerrando ${target.symbol} ${target.direction} (notional $${target.notional.toFixed(2)}, PnL $${target.pnl.toFixed(4)})`;
+    console.error(TAG, `[MARGIN-HEAT-DEFENSIVE] ${msg}`);
+    sendTelegram(`🚨 <b>MARGIN HEAT DEFENSIVO</b>\n${msg}`).catch(() => {});
+    state.lastAction = msg;
+    await closePosition(target.symbol, target.direction, target.qty);
+  } catch (err) {
+    console.error(TAG, "[MARGIN-HEAT-DEFENSIVE] error:", err);
+  }
+}
+
+function chooseProgressiveLeverage(baseLev: number): number {
+  if (!FEAT_PROGRESSIVE_LEV) return baseLev;
+  const now = Date.now();
+  const heat = getCurrentMarginHeatPct();
+  const wr = getRecentWinRatePct();
+  const lastLev = _lastProgLevValue ?? baseLev;
+
+  // Cooldown: no cambies más rápido que cada 3 min
+  const elapsed = now - _lastProgLevChangeAt;
+  if (elapsed < LEV_PROG_COOLDOWN_MS) {
+    return Math.max(LEV_PROG_MIN, Math.min(LEV_PROG_HARD_CAP, lastLev));
+  }
+
+  // Bail: condiciones malas → mínimo (prioridad sobre subir)
+  if (wr < LEV_PROG_WR_DOWN || heat > LEV_PROG_HEAT_BAIL) {
+    if (lastLev !== LEV_PROG_MIN) {
+      console.log(TAG, `[PROG-LEV] BAIL: WR=${wr.toFixed(1)}% heat=${heat.toFixed(1)}% → ${LEV_PROG_MIN}x (was ${lastLev}x)`);
+      _lastProgLevChangeAt = now;
+    }
+    _lastProgLevValue = LEV_PROG_MIN;
+    return LEV_PROG_MIN;
+  }
+
+  // Up: condiciones buenas → +1x (gradual, no salto grande)
+  if (wr >= LEV_PROG_WR_UP && heat < LEV_PROG_HEAT_OK && lastLev < LEV_PROG_HARD_CAP) {
+    const newLev = Math.min(LEV_PROG_HARD_CAP, lastLev + 1);
+    if (newLev !== lastLev) {
+      console.log(TAG, `[PROG-LEV] UP: WR=${wr.toFixed(1)}% heat=${heat.toFixed(1)}% → ${newLev}x (was ${lastLev}x)`);
+      _lastProgLevChangeAt = now;
+    }
+    _lastProgLevValue = newLev;
+    return newLev;
+  }
+
+  return Math.max(LEV_PROG_MIN, Math.min(LEV_PROG_HARD_CAP, lastLev));
+}
 
 const ESCALERA_TIERS = [
   { leverageX: DYNAMIC_LEV_ENTRY, capitalWeight: 1.0, get slAtrMult() { return ATR_SL_MULTIPLIER; }, label: "Dinámica" },
@@ -2316,6 +2475,15 @@ function evaluatePosition(input: PositionEvalInput): { action: "HOLD" | "CLOSE";
     return { action: "CLOSE", reason: `Mosquito exit (${Math.round(ageSec/60)}min estancado, PnL ${pnlPct.toFixed(2)}%)` };
   }
 
+  // ── TESIS v4.3 — Time-based loss exit ───────────────────────────────
+  // Más estricto que mosquito: cualquier perdedora vieja se corta. Resuelve el
+  // problema observado 6-may: avg_loss subió a -$0.155 (ratio W/L 0.36) porque
+  // las perdedoras corren tanto como las ganadoras. Esto fuerza el corte.
+  if (FEAT_LOSS_TIME_EXIT && pnl < 0 && ageSec > LOSS_TIME_EXIT_MIN * 60) {
+    _pnlPeak[symbol] = 0;
+    return { action: "CLOSE", reason: `Loss time exit (${Math.round(ageSec/60)}min en rojo, PnL $${pnl.toFixed(4)})` };
+  }
+
   // ── 1. Reversión sostenida — score bajo por ≥2 ciclos consecutivos ───
   //    Un dip momentáneo no cierra. Requiere convicción sostenida.
   if (dirScore < 35) {
@@ -2415,6 +2583,13 @@ async function escaleraOpenLayer(
   if (breaker.tripped) {
     console.log(TAG, `[ESCALERA] Apertura bloqueada por daily-loss breaker: ${breaker.reason}`);
     state.lastAction = `🛑 Daily breaker activo — no abrir ${sym}`;
+    return null;
+  }
+  // ── TESIS v4.3 — Margin heat protection (siempre ON) ────────────────────
+  const heatGate = isMarginHeatBlocking();
+  if (heatGate.blocking) {
+    console.log(TAG, `[ESCALERA] Apertura bloqueada: ${heatGate.reason}`);
+    state.lastAction = `🛑 Margin heat ${heatGate.heat.toFixed(1)}% — no abrir ${sym}`;
     return null;
   }
   const tier = ESCALERA_TIERS[tierIdx];
@@ -2534,7 +2709,9 @@ async function escaleraOpenLayer(
     return null;
   }
 
-  const effLev = DYNAMIC_LEV_ENTRY;
+  // ── TESIS v4.3 — Leverage progresivo condicional ────────────────────────
+  // Reemplaza el effLev fijo. Si FEAT_PROGRESSIVE_LEV=off, devuelve baseLev sin cambios.
+  const effLev = chooseProgressiveLeverage(DYNAMIC_LEV_ENTRY);
   console.log(TAG, `[DINÁMICA] Entrada ${effLev}x ${sym}: margen=$${layerCapital.toFixed(2)} nocional=$${(layerCapital * effLev).toFixed(2)} (libre=$${capitalFree.toFixed(2)} slots=${openNow}/${smartSlots})${volSizingNote}`);
 
   let slPct: number;
@@ -5280,6 +5457,23 @@ ${(() => {
   ].join("\n");
 })()}
 
+=== TESIS v4.3 — Día 2 (autorizado por Luis vía Break, 6-may-2026) ===
+${(() => {
+  const heat = getCurrentMarginHeatPct();
+  const wr = getRecentWinRatePct();
+  const heatStatus = heat > MARGIN_HEAT_DEFENSIVE_CLOSE_PCT
+    ? `🚨 CRÍTICO ${heat.toFixed(1)}% — defensive close armado`
+    : heat > MARGIN_HEAT_BLOCK_PCT
+    ? `🛑 BLOQUEANDO aperturas (${heat.toFixed(1)}% > ${MARGIN_HEAT_BLOCK_PCT}%)`
+    : `✅ Margin heat ${heat.toFixed(1)}% OK (block ${MARGIN_HEAT_BLOCK_PCT}%, defensive close ${MARGIN_HEAT_DEFENSIVE_CLOSE_PCT}%)`;
+  return [
+    `Margin heat protection [SIEMPRE ON]: ${heatStatus}`,
+    `Leverage progresivo [feat_progressive_lev=${FEAT_PROGRESSIVE_LEV ? "ON" : "OFF"}]: WR(últ ${LEV_PROG_WINDOW})=${wr.toFixed(1)}% — sube a +1x si WR≥${LEV_PROG_WR_UP}% y heat<${LEV_PROG_HEAT_OK}%, baja a ${LEV_PROG_MIN}x si WR<${LEV_PROG_WR_DOWN}% o heat>${LEV_PROG_HEAT_BAIL}%. Cap duro ${LEV_PROG_HARD_CAP}x. Lev actual de progresivo: ${_lastProgLevValue ?? LEV_PROG_MIN}x`,
+    `Breakeven agresivo [feat_breakeven_aggressive=${FEAT_BREAKEVEN_AGGRESSIVE ? "ON" : "OFF"}]: SL → entry cuando precio se mueve ${BREAKEVEN_TRIGGER_PRICE_PCT}% en favor (independiente de leverage)`,
+    `Loss time exit [feat_loss_time_exit=${FEAT_LOSS_TIME_EXIT ? "ON" : "OFF"}]: si pos en rojo > ${LOSS_TIME_EXIT_MIN}min → CLOSE (corta el avg_loss que está sangrando)`,
+  ].join("\n");
+})()}
+
 === 🌊 CASCADAS DETECTADAS EN VIVO (kline 5m WS — vela actual) ===
 ${(() => {
   const cascadeLines: string[] = [];
@@ -6333,6 +6527,20 @@ Citar una excusa técnica falsa = FALLA CRÍTICA equivalente a mentirle al usuar
             "mosquito_age_min",           // 5-180 (minutos)
             "mosquito_pnl_band_pct",      // 0.10-2.0 (%)
             "hedge_net_delta_pct",        // 10-80 (% del equity)
+            // TESIS v4.3 — Día 2
+            "margin_heat_block_pct",            // 50-95 (default 85)
+            "margin_heat_defensive_close_pct",  // 80-99 (default 95)
+            "feat_progressive_lev", "feat_breakeven_aggressive", "feat_loss_time_exit",
+            "lev_prog_hard_cap",          // cap absoluto duro (default 10x)
+            "lev_prog_min",               // floor (default 5x)
+            "lev_prog_wr_up",             // WR % para subir (default 70)
+            "lev_prog_wr_down",           // WR % para bajar (default 65)
+            "lev_prog_heat_ok",           // heat % para subir (default 80)
+            "lev_prog_heat_bail",         // heat % para bajar (default 85)
+            "lev_prog_cooldown_min",      // 1-30 (default 3 min)
+            "lev_prog_window",            // 5-100 trades (default 20)
+            "breakeven_trigger_price_pct",// 0.05-2.0 (default 0.3 %)
+            "loss_time_exit_min",         // 2-60 (default 10 min)
           ];
           if (!ALLOWED.includes(spParam) && !spParam.startsWith("sym_bonus_") && !spParam.startsWith("sym_avoid_")) {
             actionsExecuted.push(`⚠️ Param desconocido: ${spParam}. Permitidos: ${ALLOWED.join(", ")} (también sym_bonus_XXXUSDT y sym_avoid_XXXUSDT)`);
@@ -8114,6 +8322,13 @@ async function openPosition(
     state.lastAction = `🛑 Daily breaker activo — no abrir ${symbol}`;
     return false;
   }
+  // ── TESIS v4.3 — Margin heat protection (siempre ON) ────────────────────
+  const heatGate = isMarginHeatBlocking();
+  if (heatGate.blocking) {
+    console.log(TAG, `[OPEN] Apertura ${symbol} ${direction} bloqueada: ${heatGate.reason}`);
+    state.lastAction = `🛑 Margin heat ${heatGate.heat.toFixed(1)}% — no abrir ${symbol}`;
+    return false;
+  }
   if (state.openPositions[symbol]) return false;
 
   // ── Cooldown por símbolo — no re-abrir si cerró hace menos de 3 min ─────────
@@ -8585,9 +8800,20 @@ function moveSlToBreakeven(pos: OpenPos, currentPrice: number): void {
     : (pos.entryPrice - currentPrice) / pos.entryPrice;
 
   // Mueve a breakeven rápido — cuando el precio avanzó 20% del SL en dirección favorable
-  // Esto bloquea el trade como "sin riesgo" antes y deja correr la ganancia
-  const breakevenTrigger = slPct * 0.02;
-  if (pctFromEntry > breakevenTrigger && (
+  // Esto bloquea el trade como "sin riesgo" antes y deja correr la ganancia.
+  //
+  // TESIS v4.3 — Breakeven AGRESIVO POR PRECIO: si FEAT_BREAKEVEN_AGGRESSIVE=ON,
+  // usamos un piso adicional independiente del leverage: si el precio se movió
+  // BREAKEVEN_TRIGGER_PRICE_PCT% en favor (default 0.3%), también mover SL a BE.
+  // Esto resuelve el problema observado 6-may donde avg_loss > avg_win × 2.7 —
+  // las ganadoras nunca llegaban a quedar protegidas porque el trigger antiguo
+  // requería que el precio se moviera mucho más a leverage bajo.
+  const breakevenTriggerLegacy = slPct * 0.02;
+  const breakevenTriggerAggressive = FEAT_BREAKEVEN_AGGRESSIVE
+    ? BREAKEVEN_TRIGGER_PRICE_PCT / 100
+    : Number.POSITIVE_INFINITY;
+  const beTrigger = Math.min(breakevenTriggerLegacy, breakevenTriggerAggressive);
+  if (pctFromEntry > beTrigger && (
     (pos.side === "LONG"  && pos.stopLoss < pos.entryPrice) ||
     (pos.side === "SHORT" && pos.stopLoss > pos.entryPrice)
   )) {
@@ -8889,6 +9115,11 @@ async function scan(): Promise<void> {
     await stopEngine();
     return;
   }
+
+  // ── TESIS v4.3 — Defensive close a margin heat > 95% ─────────────────────
+  // Cierra la posición en rojo MÁS PEQUEÑA para liberar margen y alejar
+  // liquidación. Cooldown 1min para no hacer cascada de cierres.
+  await maybeDefensiveClose();
 
   if (state.simBalance <= 0 && !state.liveMode) {
     state.lastAction = "Balance agotado.";
