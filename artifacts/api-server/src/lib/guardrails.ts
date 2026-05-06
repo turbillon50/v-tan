@@ -16,6 +16,15 @@ import { pool } from "@workspace/db";
 
 const TAG = "[GUARDRAILS]";
 
+// Rate-limit del log LEV_COOLDOWN: máx 1 INSERT por símbolo cada N seg.
+// Sin esto, el fast SL/TP loop (cada 500ms) genera 1 INSERT/tick cuando un
+// símbolo intenta escalar leverage en cooldown. Reportado 6-may-2026: 15K
+// events/24h en TONUSDT, 100% LEV_COOLDOWN, sobrescribiendo guardrail_events
+// y enmascarando otros guardrails reales. La PROTECCIÓN sigue 100% activa
+// — solo reduce el ruido del log.
+const _lastLevCooldownLogAt: Record<string, number> = {};
+const LEV_COOLDOWN_LOG_RATE_MS = 60 * 1000;
+
 export const GUARDRAILS = {
   /** Lección 22-abr (memoria id=2714): ATR_SL < 1.5 = stop-outs constantes en cada wick. */
   MIN_ATR_SL_MULTIPLIER: 1.5,
@@ -136,13 +145,20 @@ export async function validateLeverageEscalation(
   const elapsed = Date.now() - lastTs;
   if (lastTs > 0 && elapsed < GUARDRAILS.LEVERAGE_ESCALATION_COOLDOWN_MS) {
     const remainingMs = GUARDRAILS.LEVERAGE_ESCALATION_COOLDOWN_MS - elapsed;
-    await persistGuardrailEvent({
-      type: "LEV_COOLDOWN",
-      symbol,
-      requested: { from: currentLeverage, to: newLeverage },
-      enforced: { blocked: true, remainingMs },
-      lessonRef: LESSON_REFS.LEV_COOLDOWN,
-    });
+    // Rate-limit: solo logear si pasaron >= LEV_COOLDOWN_LOG_RATE_MS desde el
+    // último log de este símbolo. La protección sigue 100% activa — solo
+    // reduce ruido (de 1 evento/500ms a máx 1/60s por símbolo).
+    const lastLogAt = _lastLevCooldownLogAt[symbol] ?? 0;
+    if (Date.now() - lastLogAt > LEV_COOLDOWN_LOG_RATE_MS) {
+      _lastLevCooldownLogAt[symbol] = Date.now();
+      await persistGuardrailEvent({
+        type: "LEV_COOLDOWN",
+        symbol,
+        requested: { from: currentLeverage, to: newLeverage },
+        enforced: { blocked: true, remainingMs },
+        lessonRef: LESSON_REFS.LEV_COOLDOWN,
+      });
+    }
     return { proceed: false, reason: "COOLDOWN_ACTIVE", remainingMs };
   }
   return { proceed: true, reason: "OK" };
