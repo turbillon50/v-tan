@@ -3957,9 +3957,17 @@ REGLAS DE REGISTRO INVIOLABLES EN ESTE CANAL:
   const franjaDelDia = _cancunHourNum < 6 ? "Madrugada" : _cancunHourNum < 12 ? "Mañana" : _cancunHourNum < 18 ? "Tarde" : "Noche";
 
   // ── Datos en vivo de Bybit — balance y posiciones reales ─────────────────
-  // Siempre consultamos Bybit directo para que Tanit vea datos 100% frescos
+  // ── LECTURA ATÓMICA DE BYBIT — fix "veo la info borrosa" (Tanit, 6-may-2026) ──
+  // Antes: getBybitBalance() devolvía cache de 5s mientras bybitGetOpenPositions()
+  // siempre venía fresh. Resultado: balance y posiciones de timestamps distintos →
+  // "los números no me cierran". Fix: invalidar cache antes de fetch + timestamp
+  // visible en prompt + drift detector contra state.liveBalance.
+  invalidateBalanceCache();
+  const bybitFetchStartedAt = Date.now();
+
   let bybitBalanceLine = "No disponible (bot inactivo o sin credenciales)";
   let bybitPositionsLines = "Sin posiciones reales en Bybit actualmente";
+  let bybitReadingMeta = "Lectura no disponible (bot inactivo o sin credenciales)";
   let bybitLiveFreshEquity: number | null = null;
   let bybitLiveFreshAvailable: number | null = null;
   let bybitLiveFundExtra = 0;
@@ -3978,8 +3986,18 @@ REGLAS DE REGISTRO INVIOLABLES EN ESTE CANAL:
       // También consultar FUND wallet para balance total completo
       bybitGet("/v5/asset/transfer/query-account-coins-balance", { accountType: "FUND", coin: "USDT" }).catch(() => null),
     ]);
+    const bybitFetchEndedAt = Date.now();
+    const bybitFetchLatencyMs = bybitFetchEndedAt - bybitFetchStartedAt;
+    bybitReadingMeta = `Lectura ATÓMICA @ ${new Date(bybitFetchEndedAt).toISOString()} (latency ${bybitFetchLatencyMs}ms — balance + posiciones del MISMO instante, cache invalidada antes del fetch)`;
     if (bybitBal.status === "fulfilled" && bybitBal.value) {
       const b = bybitBal.value;
+      // Drift detector — compara con el motor para detectar desync silencioso
+      const motorBal = state.liveBalance;
+      if (motorBal != null && Math.abs(motorBal - b.equity) > 0.5) {
+        const drift = b.equity - motorBal;
+        console.warn(TAG, `[BYBIT-DRIFT] motor.liveBalance=${motorBal.toFixed(4)} vs Bybit.equity=${b.equity.toFixed(4)} (diff $${drift.toFixed(4)}). Sincronizando.`);
+        bybitReadingMeta += ` | ⚠️ DRIFT: motor decía $${motorBal.toFixed(4)}, Bybit dice $${b.equity.toFixed(4)} (diff $${drift.toFixed(4)}) — usar SIEMPRE el valor de Bybit`;
+      }
       // Balance extra en FUND wallet (no disponible para trading hasta transferir)
       if (bybitFund.status === "fulfilled" && bybitFund.value) {
         const fundCoin = bybitFund.value?.result?.balance?.find?.((c: any) => c.coin === "USDT")
@@ -5011,6 +5029,7 @@ Sesión de mercado: ${session.name} — ${session.participants}
 ${session.tradingChar}
 
 === CUENTA BYBIT MAINNET — UID 555753345 ===
+${bybitReadingMeta}
 Balance Bybit: ${bybitBalanceLine}
 Capacidad de posiciones: ${countOpenPositions()}/${MAX_CONCURRENT_POSITIONS} slots usados — ${MAX_CONCURRENT_POSITIONS - countOpenPositions()} libre(s) | Capital libre ahora: $${(bybitLiveFreshAvailable ?? state.liveAvailable ?? 0).toFixed(4)} USDT | Margen requerido por posición: $${MARGIN_PER_POS.toFixed(2)} | ${(bybitLiveFreshAvailable ?? state.liveAvailable ?? 0) < MARGIN_PER_POS ? "⚠️ SIN CAPITAL suficiente para abrir — considera swap de posición débil" : `✅ Puede abrir ${Math.min(MAX_CONCURRENT_POSITIONS - countOpenPositions(), Math.floor((bybitLiveFreshAvailable ?? state.liveAvailable ?? 0) / MARGIN_PER_POS))} posición(es) más`}
 Motor: $${bal.toFixed(4)} USDT | REAL 🔴 BYBIT MAINNET | Bot: ${state.active ? "ACTIVO" : "DETENIDO"} | Sesión #${state.sessionNumber}
@@ -6258,7 +6277,7 @@ ${criticalIdentityBlock}`;
       const posLines: string[] = livePositions.map((p) =>
         `  ${p.symbol} ${p.side} qty=${p.size} entry=${p.entryPrice.toFixed(4)} lev=${p.leverage}x | PnL: ${p.unrealizedPnl >= 0 ? "+" : ""}$${p.unrealizedPnl.toFixed(4)} (${p.unrealizedPnlPct >= 0 ? "+" : ""}${p.unrealizedPnlPct.toFixed(2)}%)`
       );
-      liveStateBlock = `\n\nDATOS REALES AHORA (Bybit live):\n  Balance: $${Number(balUSD).toFixed(4)} USDT\n  Posiciones abiertas: ${livePositions.length}${livePositions.length > 0 ? `  |  UPnL total: ${totalUpnl >= 0 ? "+" : ""}$${totalUpnl.toFixed(4)}\n${posLines.join("\n")}` : ""}\n\nSi Luis te pregunta cómo estás o qué tienes, RESPONDE CON LA VERDAD de estos datos. Nunca digas "sin posiciones" si el contador de arriba es > 0. Es información que debes decir tú misma, no que Luis te tenga que pedir.`;
+      liveStateBlock = `\n\nDATOS REALES AHORA (Bybit live):\n  ${bybitReadingMeta}\n  Balance: $${Number(balUSD).toFixed(4)} USDT\n  Posiciones abiertas: ${livePositions.length}${livePositions.length > 0 ? `  |  UPnL total: ${totalUpnl >= 0 ? "+" : ""}$${totalUpnl.toFixed(4)}\n${posLines.join("\n")}` : ""}\n\nEstos números son atómicos (balance + posiciones del MISMO instante, cache invalidada antes del fetch). Si los reportas, son verdad. Si Luis te pregunta cómo estás o qué tienes, RESPONDE CON LA VERDAD de estos datos. Nunca digas "sin posiciones" si el contador de arriba es > 0. Es información que debes decir tú misma, no que Luis te tenga que pedir.`;
     } catch {}
     // compactSys cambia COMPLETAMENTE según canal — en operational las reglas
     // de voz cariñosa NO existen siquiera (no es que se prohíban después con
