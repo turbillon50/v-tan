@@ -87,7 +87,19 @@ export const balanceSnapshots = pgTable("balance_snapshots", {
   balance: numeric("balance", { precision: 20, scale: 8 }).notNull(),
   equity: numeric("equity", { precision: 20, scale: 8 }),
   available: numeric("available", { precision: 20, scale: 8 }),
+  numPositions: integer("num_positions"),
+  marginHeatPct: numeric("margin_heat_pct", { precision: 10, scale: 4 }),
+  dailyPnlUsdt: numeric("daily_pnl_usdt", { precision: 20, scale: 8 }),
   note: text("note"),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+});
+
+export const capitalContributions = pgTable("capital_contributions", {
+  id: serial("id").primaryKey(),
+  amountUsdt: numeric("amount_usdt", { precision: 20, scale: 8 }).notNull(),
+  amountMxn: numeric("amount_mxn", { precision: 20, scale: 4 }),
+  exchangeRate: numeric("exchange_rate", { precision: 10, scale: 4 }),
+  notes: text("notes"),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 });
 
