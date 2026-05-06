@@ -158,6 +158,11 @@ async function cleanStaleOpenTrades(): Promise<void> {
              WHERE id=$4`,
             [status, exec.avgPrice, netPnl, id]
           );
+          // FIX 6-may-2026: el daily-loss circuit breaker (v4.2) no disparaba con -9.2%
+          // porque recordRealizedPnlV42 solo se llamaba desde escaleraCloseLayer y los
+          // cierres externos por SL/TP en Bybit (sincronizados aquí) actualizaban DB
+          // pero NO el _dailyPnlTracker. Agujero de contabilidad. Plug aquí.
+          recordRealizedPnlV42(netPnl);
           console.log(TAG, `[HISTORY] ${symbol} cerrada con PnL real: ${netPnl >= 0 ? "+" : ""}${netPnl.toFixed(4)} → ${status}`);
           settled++;
           continue;
@@ -1049,6 +1054,11 @@ const PRICE_HIST_LEN = 20;
 // ── Tracking per-symbol para lógica de hold/exit inteligente ──────────────────
 const _lowScoreConsecutive: Record<string, number> = {};   // ciclos con score < 35
 const _pnlPeak: Record<string, number> = {};               // PnL máximo visto para trailing drawdown
+// FIX 6-may-2026 — cooldown post-loss por símbolo. Sin esto Tanit re-entraba a
+// TONUSDT inmediato tras un SL hit (8/15 trades en TON observados), repitiendo
+// el mismo error. Wins NO entran a este cooldown — ahí sí se quiere reentrada.
+const _lastSymbolLossAt: Record<string, number> = {};
+let SYMBOL_LOSS_COOLDOWN_MS = 5 * 60 * 1000;  // 5 min default
 const _scaleInCooldown: Record<string, number> = {};       // timestamp del último scale-in por símbolo
 
 interface ScaleInEvent {
@@ -1266,9 +1276,23 @@ async function _runSlTpFastLoopInner(): Promise<void> {
     }
 
     // Tanit puede fijar leverage manualmente — si hay override activo, respetarlo
-    const targetLev = (state.manualLeverage && state.manualLeverage > 0)
+    let targetLev = (state.manualLeverage && state.manualLeverage > 0)
       ? Math.max(DYNAMIC_LEV_ENTRY, Math.min(DYNAMIC_LEV_MAX, state.manualLeverage))
       : calcTargetLeverage(momentum, curLev);
+
+    // FIX 6-may-2026 — Salvavidas: cuando margin heat >70%, capamos los saltos
+    // de leverage a +3 por ciclo. calcTargetLeverage puede saltar +7/+15 por
+    // momentum, lo que disparaba heat 78% y luego losses gigantes (-$0.14/-$0.18).
+    // chooseProgressiveLeverage (open) ya solo sube +1x — esto extiende esa
+    // disciplina al fast-loop (running).
+    if (targetLev > curLev) {
+      const heatNow = getCurrentMarginHeatPct();
+      if (heatNow > 70 && (targetLev - curLev) > 3) {
+        const capped = curLev + 3;
+        console.log(TAG, `[LEV-CAP] ${sym} heat=${heatNow.toFixed(1)}% → cap salto ${curLev}x→${targetLev}x a ${curLev}x→${capped}x`);
+        targetLev = capped;
+      }
+    }
 
     if (targetLev !== curLev) {
       const levKey = sym;
@@ -1877,6 +1901,9 @@ export function applyTanitConfig(): void {
   if (cfg["lev_prog_window"])    { const v = parseFloat(cfg["lev_prog_window"]);    if (!isNaN(v)) LEV_PROG_WINDOW    = Math.max(5, Math.min(100, v)); }
   if (cfg["breakeven_trigger_price_pct"]) { const v = parseFloat(cfg["breakeven_trigger_price_pct"]); if (!isNaN(v)) BREAKEVEN_TRIGGER_PRICE_PCT = Math.max(0.05, Math.min(2.0, v)); }
   if (cfg["loss_time_exit_min"]) { const v = parseFloat(cfg["loss_time_exit_min"]); if (!isNaN(v)) LOSS_TIME_EXIT_MIN = Math.max(2, Math.min(60, v)); }
+  // PR #18 — params nuevos para que Tanit los pueda tunear runtime
+  if (cfg["loss_magnitude_pct_margin"]) { const v = parseFloat(cfg["loss_magnitude_pct_margin"]); if (!isNaN(v)) LOSS_MAGNITUDE_PCT_MARGIN = Math.max(5, Math.min(50, v)); }
+  if (cfg["symbol_loss_cooldown_min"]) { const v = parseFloat(cfg["symbol_loss_cooldown_min"]); if (!isNaN(v)) SYMBOL_LOSS_COOLDOWN_MS = Math.max(0, Math.min(60, v)) * 60 * 1000; }
 
   // ── Multiplicadores de agresividad por sesión ──────────────────────────────
   const clampMult = (v: number) => Math.max(0.70, Math.min(1.50, v));
@@ -2046,7 +2073,10 @@ let _dailyBreakerTrippedDay: string | null = null; // 'YYYY-MM-DD' UTC del día 
 //   Cuando una posición alcanza +PARTIAL_TP_R_TRIGGER · R (R = riesgo SL inicial),
 //   cierra PARTIAL_TP_FRACTION del tamaño y mueve el SL a break-even.
 let FEAT_TRAILING_PARTIAL_TP   = true;  // (set: feat_trailing_partial_tp on|off)
-let PARTIAL_TP_R_TRIGGER       = 1.5;   // múltiplo de R para gatillar partial TP
+// Bajado 6-may de 1.5→1.0: con avg_win $0.04 muy pocos winners llegaban a +1.5R
+// antes de cerrar por mosquito/loss-time. 1.0R asegura el trailing-tight más temprano
+// y convierte ganadoras tibias en wins consolidadas.
+let PARTIAL_TP_R_TRIGGER       = 1.0;   // múltiplo de R para gatillar partial TP
 let PARTIAL_TP_FRACTION        = 0.50;  // fracción de la posición a cerrar (0.30-0.70)
 
 // Componente 2 — Mosquito exit (time-based)
@@ -2085,7 +2115,10 @@ let LEV_HIGH_VOL_FACTOR        = 0.75;  // multiplicador (-25%) en alta volatili
 //    Distinto del daily-loss circuit breaker (v4.2) y del drawdown 18% (legacy):
 //    este protege contra liquidación inminente por sobre-exposición de margen.
 let MARGIN_HEAT_BLOCK_PCT           = 85;  // bloquea NUEVAS aperturas si > este %
-let MARGIN_HEAT_DEFENSIVE_CLOSE_PCT = 95;  // cierra la pos más pequeña en rojo si > este %
+// Bajado 6-may de 95→88: el gap de 10pp entre block(85) y defensive(95) era
+// tierra de nadie. Con $158 USDT cualquier oscilación brusca saltaba 85→95 en un
+// tick y el defensive era decorativo. 88 actúa antes de que la liquidación esté cerca.
+let MARGIN_HEAT_DEFENSIVE_CLOSE_PCT = 88;  // cierra la pos más pequeña en rojo si > este %
 let _lastMarginHeatDefensiveAt      = 0;
 const MARGIN_HEAT_DEFENSIVE_COOLDOWN_MS = 60 * 1000; // 1 min entre cierres defensivos
 
@@ -2117,7 +2150,13 @@ let BREAKEVEN_TRIGGER_PRICE_PCT = 0.3;  // 0.3% de movimiento de precio → BE
 //    Más estricto que el mosquito exit (que requiere |pnl%| < banda):
 //    este cierra cualquier perdedora vieja, sin importar magnitud.
 let FEAT_LOSS_TIME_EXIT  = true;
-let LOSS_TIME_EXIT_MIN   = 10;  // minutos antes de forzar exit en perdedora
+// Bajado 6-may de 10→5: una posición a 5-12x leverage perdiendo 1-3% del precio
+// durante 10min produce drawdown 15-30% del margen. avg_loss observado -$0.14/-$0.18
+// vs avg_win $0.04 (ratio W/L 0.36) — las losers corren porque tienen demasiado tiempo.
+let LOSS_TIME_EXIT_MIN   = 5;
+// Cap de magnitud: si la pérdida sobre el margen supera este %, cerrar inmediato
+// sin importar tiempo (no esperes los 5min completos si ya está sangrando feo).
+let LOSS_MAGNITUDE_PCT_MARGIN = 15;  // -15% del margen → cierre inmediato
 
 function getCurrentMarginHeatPct(): number {
   const equity = state.liveMode ? (state.liveBalance ?? 0) : (state.simBalance ?? 0);
@@ -2475,13 +2514,21 @@ function evaluatePosition(input: PositionEvalInput): { action: "HOLD" | "CLOSE";
     return { action: "CLOSE", reason: `Mosquito exit (${Math.round(ageSec/60)}min estancado, PnL ${pnlPct.toFixed(2)}%)` };
   }
 
-  // ── TESIS v4.3 — Time-based loss exit ───────────────────────────────
+  // ── TESIS v4.3 — Time-based loss exit + magnitude cap ────────────────
   // Más estricto que mosquito: cualquier perdedora vieja se corta. Resuelve el
   // problema observado 6-may: avg_loss subió a -$0.155 (ratio W/L 0.36) porque
   // las perdedoras corren tanto como las ganadoras. Esto fuerza el corte.
-  if (FEAT_LOSS_TIME_EXIT && pnl < 0 && ageSec > LOSS_TIME_EXIT_MIN * 60) {
-    _pnlPeak[symbol] = 0;
-    return { action: "CLOSE", reason: `Loss time exit (${Math.round(ageSec/60)}min en rojo, PnL $${pnl.toFixed(4)})` };
+  if (FEAT_LOSS_TIME_EXIT && pnl < 0) {
+    if (ageSec > LOSS_TIME_EXIT_MIN * 60) {
+      _pnlPeak[symbol] = 0;
+      return { action: "CLOSE", reason: `Loss time exit (${Math.round(ageSec/60)}min en rojo, PnL $${pnl.toFixed(4)})` };
+    }
+    // Cap de magnitud — no esperes el timeout si ya sangra feo.
+    const pnlPctMargin = pnlPct * input.leverage;
+    if (pnlPctMargin < -LOSS_MAGNITUDE_PCT_MARGIN) {
+      _pnlPeak[symbol] = 0;
+      return { action: "CLOSE", reason: `Loss magnitude cap (${pnlPctMargin.toFixed(1)}% del margen, PnL $${pnl.toFixed(4)})` };
+    }
   }
 
   // ── 1. Reversión sostenida — score bajo por ≥2 ciclos consecutivos ───
@@ -2531,10 +2578,13 @@ function evaluatePosition(input: PositionEvalInput): { action: "HOLD" | "CLOSE";
     return { action: "HOLD", reason: `ATR×4 alcanzado — esperando confirmación debilitamiento (${dirScore})` };
   }
 
-  // ── 4. Pérdida acelerada sin momentum ────────────────────────────────
-  if (pnlPct < -3.0 && dirScore < 50) {
+  // ── 4. Pérdida acelerada — endurecido 6-may post-revisión ────────────
+  // ANTES: pnlPct<-3.0 && dirScore<50 (doble gate). Si score≥50 la perdedora
+  // corría 10min hasta loss-time-exit, generando -$0.14/-$0.18 vs win $0.04.
+  // AHORA: cap absoluto a -1.5% O cap blando -1.0% si score se debilitó (<60).
+  if (pnlPct < -1.5 || (pnlPct < -1.0 && dirScore < 60)) {
     _pnlPeak[symbol] = 0;
-    return { action: "CLOSE", reason: `Cut loss ${pnlPct.toFixed(1)}%` };
+    return { action: "CLOSE", reason: `Cut loss ${pnlPct.toFixed(1)}% (score=${dirScore})` };
   }
 
   // ── 5. Engulfing contra — solo cerrar si hay ganancia real o pérdida clara ─
@@ -2889,6 +2939,7 @@ async function escaleraCloseLayer(sym: string, inst: EscaleraSymState, layerIdx:
     state.consecutiveLosses++;
     state.sessionLosses++;
     state.lastLossAt = Date.now();
+    _lastSymbolLossAt[sym] = Date.now();  // FIX 6-may: cooldown anti-revenge mismo símbolo
     // Drawdown protection — activar por racha de pérdidas O por % drawdown acumulado
     // Incluir netPnl actual (aún no en tradeLog) para trigger sincronizado
     const recentDdPct = calcRecentDrawdownPct(netPnl);
@@ -3431,6 +3482,11 @@ function countOpenPositions(): number {
 
 function canSymbolTradeCapa1(sym: string, _numSymsDivisor: number): boolean {
   if (isSymbolOpen(sym)) return false;  // anti-stack: mismo símbolo no puede tener 2 posiciones
+  // FIX 6-may-2026 — cooldown anti-revenge: si el último cierre de este símbolo
+  // fue una pérdida hace <SYMBOL_LOSS_COOLDOWN_MS, no re-entrar. Sin esto Tanit
+  // se pegaba a TONUSDT (8/15 trades observados) repitiendo el mismo error.
+  const lastLossAt = _lastSymbolLossAt[sym] ?? 0;
+  if (lastLossAt > 0 && Date.now() - lastLossAt < SYMBOL_LOSS_COOLDOWN_MS) return false;
   const baseBalance = state.liveMode ? (state.liveBalance ?? 0) : state.simBalance;
   const smartSlots = calcSmartSlots(baseBalance);
   const openNow = countOpenPositions();
@@ -8664,6 +8720,7 @@ async function closePosition(symbol: string, reason: string, exitPrice: number):
     state.consecutiveLosses++;
     state.sessionLosses++;
     state.lastLossAt = Date.now(); // para el cooldown entre trades
+    _lastSymbolLossAt[symbol] = Date.now();  // FIX 6-may: cooldown anti-revenge mismo símbolo
     // Drawdown protection — activar por racha de pérdidas O por % drawdown acumulado
     // Pasar netPnl para computar el drawdown incluyendo el trade actual (pre-tradeLog)
     const recentDdPct2 = calcRecentDrawdownPct(netPnl);
