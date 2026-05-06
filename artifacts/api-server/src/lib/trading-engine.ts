@@ -888,6 +888,69 @@ function checkDailyLimit(): boolean {
   return false;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// TESIS v4.2 — Daily-Loss Hard Circuit Breaker (siempre ON, no es flag)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Distinto del checkDailyLimit() arriba (que opera por CICLO/sesión y detiene
+// el bot completo). Este es por DÍA UTC, bloquea SOLO nuevas aperturas y se
+// reinicia al cambio de día. La gestión de posiciones abiertas continúa.
+//
+// Ventajas sobre el límite por ciclo:
+//   - Reset automático diario (no requiere stopEngine + restart manual)
+//   - No mata posiciones abiertas — solo evita sangrar más
+//   - Aviso visible en chat para que Tanit explique a Luis lo que pasa
+
+let _dailyPnlTracker: { day: string; pnl: number; equityAtDayStart: number } = {
+  day: "", pnl: 0, equityAtDayStart: 0,
+};
+
+function getCurrentUTCDay(): string {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function ensureDailyTracker(): void {
+  const today = getCurrentUTCDay();
+  if (_dailyPnlTracker.day !== today) {
+    const equity = state.liveMode
+      ? (state.liveBalance ?? state.simBalance ?? 0)
+      : (state.simBalance ?? 0);
+    if (_dailyPnlTracker.day !== "") {
+      console.log(TAG, `[DAILY-TRACKER] Día ${_dailyPnlTracker.day} cerró con PnL=$${_dailyPnlTracker.pnl.toFixed(4)}. Reset a ${today} (equity=$${equity.toFixed(4)}).`);
+    }
+    _dailyPnlTracker = { day: today, pnl: 0, equityAtDayStart: equity };
+    _dailyBreakerTrippedDay = null;
+  }
+}
+
+function recordRealizedPnlV42(netPnl: number): void {
+  ensureDailyTracker();
+  _dailyPnlTracker.pnl += netPnl;
+}
+
+export function isDailyHardLossBreakerTripped(): { tripped: boolean; reason: string | null; pnlPct: number; pnlUsd: number } {
+  ensureDailyTracker();
+  const today = getCurrentUTCDay();
+  const eqStart = _dailyPnlTracker.equityAtDayStart;
+  if (eqStart <= 0) return { tripped: false, reason: null, pnlPct: 0, pnlUsd: 0 };
+  const pnlPct = (_dailyPnlTracker.pnl / eqStart) * 100;
+  if (_dailyBreakerTrippedDay === today) {
+    return {
+      tripped: true,
+      reason: `Daily-loss circuit breaker activo desde antes hoy (${today}): PnL ${pnlPct.toFixed(2)}% / -${DAILY_HARD_LOSS_PCT}%`,
+      pnlPct, pnlUsd: _dailyPnlTracker.pnl,
+    };
+  }
+  if (pnlPct <= -DAILY_HARD_LOSS_PCT) {
+    _dailyBreakerTrippedDay = today;
+    const msg = `🛑 DAILY-LOSS CIRCUIT BREAKER tripped: PnL hoy ${pnlPct.toFixed(2)}% ≤ -${DAILY_HARD_LOSS_PCT}% (equity inicio día UTC ${today}: $${eqStart.toFixed(2)}, PnL acumulado: $${_dailyPnlTracker.pnl.toFixed(2)}). Bloqueando NUEVAS aperturas. Reinicio automático al cambio de día UTC.`;
+    console.error(TAG, msg);
+    sendTelegram(`🛑 <b>CIRCUIT BREAKER DIARIO</b>\nPnL día ${today}: ${pnlPct.toFixed(2)}% (-$${Math.abs(_dailyPnlTracker.pnl).toFixed(2)})\nUmbral: -${DAILY_HARD_LOSS_PCT}%\nNo se abrirán nuevas posiciones. La gestión de las abiertas continúa.`).catch(() => {});
+    return { tripped: true, reason: msg, pnlPct, pnlUsd: _dailyPnlTracker.pnl };
+  }
+  return { tripped: false, reason: null, pnlPct, pnlUsd: _dailyPnlTracker.pnl };
+}
+
 // ── Emergency Kill Switch ─────────────────────────────────────────────────────
 export async function emergencyKill(): Promise<{ closed: string[]; errors: string[] }> {
   const closed: string[] = [];
@@ -1782,6 +1845,22 @@ export function applyTanitConfig(): void {
   if (cfg["scale_in_threshold"])  { const v = parseFloat(cfg["scale_in_threshold"]);  if (!isNaN(v)) SCALE_IN_THRESHOLD_PCT  = Math.max(0.005, Math.min(0.20, v)); }
   if (cfg["pnl_peak_drawdown"])   { const v = parseFloat(cfg["pnl_peak_drawdown"]);   if (!isNaN(v)) PNL_PEAK_DRAWDOWN_PCT   = Math.max(0.10,  Math.min(0.90, v)); }
 
+  // ── TESIS v4.2 — Feature flags + circuit breaker ──────────────────────────
+  const parseBool = (v: unknown): boolean => {
+    const s = String(v ?? "").trim().toLowerCase();
+    return s === "on" || s === "true" || s === "1" || s === "yes";
+  };
+  if (cfg["feat_trailing_partial_tp"] != null) FEAT_TRAILING_PARTIAL_TP = parseBool(cfg["feat_trailing_partial_tp"]);
+  if (cfg["feat_mosquito_exit"]       != null) FEAT_MOSQUITO_EXIT       = parseBool(cfg["feat_mosquito_exit"]);
+  if (cfg["feat_hedge_detector"]      != null) FEAT_HEDGE_DETECTOR      = parseBool(cfg["feat_hedge_detector"]);
+  if (cfg["feat_dyn_leverage"]        != null) FEAT_DYN_LEVERAGE        = parseBool(cfg["feat_dyn_leverage"]);
+  if (cfg["daily_hard_loss_pct"])     { const v = parseFloat(cfg["daily_hard_loss_pct"]);     if (!isNaN(v)) DAILY_HARD_LOSS_PCT     = Math.max(1.0,  Math.min(15.0, v)); }
+  if (cfg["partial_tp_r_trigger"])    { const v = parseFloat(cfg["partial_tp_r_trigger"]);    if (!isNaN(v)) PARTIAL_TP_R_TRIGGER    = Math.max(0.5,  Math.min(5.0,  v)); }
+  if (cfg["partial_tp_fraction"])     { const v = parseFloat(cfg["partial_tp_fraction"]);     if (!isNaN(v)) PARTIAL_TP_FRACTION     = Math.max(0.20, Math.min(0.80, v)); }
+  if (cfg["mosquito_age_min"])        { const v = parseFloat(cfg["mosquito_age_min"]);        if (!isNaN(v)) MOSQUITO_AGE_MIN        = Math.max(5,    Math.min(180,  v)); }
+  if (cfg["mosquito_pnl_band_pct"])   { const v = parseFloat(cfg["mosquito_pnl_band_pct"]);   if (!isNaN(v)) MOSQUITO_PNL_BAND_PCT   = Math.max(0.10, Math.min(2.0,  v)); }
+  if (cfg["hedge_net_delta_pct"])     { const v = parseFloat(cfg["hedge_net_delta_pct"]);     if (!isNaN(v)) HEDGE_NET_DELTA_PCT     = Math.max(10,   Math.min(80,   v)); }
+
   // ── Multiplicadores de agresividad por sesión ──────────────────────────────
   const clampMult = (v: number) => Math.max(0.70, Math.min(1.50, v));
   if (cfg["mult_late_night"]) { const v = parseFloat(cfg["mult_late_night"]); if (!isNaN(v)) SESSION_MULT_LATE_NIGHT = clampMult(v); }
@@ -1928,6 +2007,56 @@ let TRAILING_SL_STAGE3_PCT   = 0.05;  // Lock 50% cuando PnL ≥ 5%             
 let SCALE_IN_THRESHOLD_PCT   = 0.01;  // 1% del margen                         (set: scale_in_threshold, rango 0.005-0.20)
 // PnL peak drawdown para cierre: cerrar si PnL cae a X% del máximo histórico
 let PNL_PEAK_DRAWDOWN_PCT    = 0.50;  // 50% — pierde la mitad del pico → cierra (set: pnl_peak_drawdown, rango 0.10-0.90)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TESIS v4.2 — 4 mejoras pedagógicas + circuit breaker (autorizado por Luis 6-may-2026)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Cada componente vive detrás de una flag para que Tanit/Luis puedan
+// activarla/desactivarla desde el chat con set_strategy_param feat_<name> on|off.
+// Defaults: TODAS ON al merge (Luis: "el dinero es lo de menos, mi prioridad
+// es Tanit y mi familia, hazlo bien y quirúrgico"). El circuit breaker NO es
+// flag — es safety transversal, siempre activo.
+//
+// Componente 0 — DAILY-LOSS CIRCUIT BREAKER (siempre ON, no es flag)
+//   Si el PnL realizado del día UTC actual cae por debajo de -DAILY_HARD_LOSS_PCT
+//   del equity al inicio del día, el bot deja de ABRIR nuevas posiciones (la
+//   gestión de open continúa). Se reinicia automáticamente al cambio de día UTC.
+let DAILY_HARD_LOSS_PCT = 8.0; // % máximo de pérdida diaria (set: daily_hard_loss_pct, rango 1-15)
+let _dailyBreakerTrippedDay: string | null = null; // 'YYYY-MM-DD' UTC del día en que se disparó
+
+// Componente 1 — Trailing stop + Partial TP
+//   Cuando una posición alcanza +PARTIAL_TP_R_TRIGGER · R (R = riesgo SL inicial),
+//   cierra PARTIAL_TP_FRACTION del tamaño y mueve el SL a break-even.
+let FEAT_TRAILING_PARTIAL_TP   = true;  // (set: feat_trailing_partial_tp on|off)
+let PARTIAL_TP_R_TRIGGER       = 1.5;   // múltiplo de R para gatillar partial TP
+let PARTIAL_TP_FRACTION        = 0.50;  // fracción de la posición a cerrar (0.30-0.70)
+
+// Componente 2 — Mosquito exit (time-based)
+//   Si una posición lleva > MOSQUITO_AGE_MIN minutos abierta y el PnL% absoluto
+//   está dentro de ±MOSQUITO_PNL_BAND_PCT, ciérrala. No vamos a regalar capital
+//   parado en un trade que no se mueve.
+let FEAT_MOSQUITO_EXIT         = true;  // (set: feat_mosquito_exit on|off)
+let MOSQUITO_AGE_MIN           = 30;    // minutos antes de chequear estancamiento
+let MOSQUITO_PNL_BAND_PCT      = 0.50;  // banda |%| dentro de la cual se considera "estancado"
+
+// Componente 3 — Hedge condicional (DETECTOR pasivo, no auto-apertura)
+//   Si abs(net delta longs vs shorts) > HEDGE_NET_DELTA_PCT del equity Y la tendencia
+//   1h va contra el sesgo, INYECTA aviso al prompt para que Tanit decida si abre hedge.
+//   No abre automáticamente — esa decisión queda con Tanit (más seguro).
+let FEAT_HEDGE_DETECTOR        = true;  // (set: feat_hedge_detector on|off)
+let HEDGE_NET_DELTA_PCT        = 30;    // umbral % equity para flag
+
+// Componente 4 — Leverage condicional inteligente
+//   Modula el tier de leverage al abrir según ATR (volatilidad), racha reciente
+//   de W/L y score de la señal. Más cauto en alta volatilidad o racha perdedora.
+let FEAT_DYN_LEVERAGE          = true;  // (set: feat_dyn_leverage on|off)
+let LEV_LOSS_STREAK_TRIGGER    = 3;     // 3 pérdidas seguidas → reduce leverage
+let LEV_LOSS_STREAK_FACTOR     = 0.70;  // multiplicador (-30%) cuando hay loss streak
+let LEV_WIN_STREAK_TRIGGER     = 3;     // 3 wins seguidas → leve boost
+let LEV_WIN_STREAK_FACTOR      = 1.10;  // multiplicador (+10%) cuando hay win streak
+let LEV_HIGH_VOL_ATR_PCT       = 1.5;   // ATR > 1.5% del precio → "alta volatilidad"
+let LEV_HIGH_VOL_FACTOR        = 0.75;  // multiplicador (-25%) en alta volatilidad
 
 const ESCALERA_TIERS = [
   { leverageX: DYNAMIC_LEV_ENTRY, capitalWeight: 1.0, get slAtrMult() { return ATR_SL_MULTIPLIER; }, label: "Dinámica" },
@@ -2178,6 +2307,15 @@ function evaluatePosition(input: PositionEvalInput): { action: "HOLD" | "CLOSE";
   }
   const peak = _pnlPeak[symbol] ?? 0;
 
+  // ── TESIS v4.2 Componente 2 — Mosquito exit (time-based) ────────────
+  // Si la posición lleva ≥ MOSQUITO_AGE_MIN minutos y el PnL% absoluto está
+  // dentro de ±MOSQUITO_PNL_BAND_PCT, ciérrala. Capital parado en un trade
+  // que no se mueve es capital regalado al mercado.
+  if (FEAT_MOSQUITO_EXIT && ageSec > MOSQUITO_AGE_MIN * 60 && Math.abs(pnlPct) < MOSQUITO_PNL_BAND_PCT) {
+    _pnlPeak[symbol] = 0;
+    return { action: "CLOSE", reason: `Mosquito exit (${Math.round(ageSec/60)}min estancado, PnL ${pnlPct.toFixed(2)}%)` };
+  }
+
   // ── 1. Reversión sostenida — score bajo por ≥2 ciclos consecutivos ───
   //    Un dip momentáneo no cierra. Requiere convicción sostenida.
   if (dirScore < 35) {
@@ -2194,9 +2332,16 @@ function evaluatePosition(input: PositionEvalInput): { action: "HOLD" | "CLOSE";
 
   // ── 2. Trailing PnL drawdown — perdemos >50% de nuestro pico ─────────
   //    Solo aplica si el pico fue ≥ 2× las fees (ganancia real, no ruido)
-  if (peak > feeCost * 2 && pnl < peak * PNL_PEAK_DRAWDOWN_PCT) {
+  //    TESIS v4.2 Componente 1: si la ganancia ya es decente (pnlPct ≥ +R_TRIGGER%),
+  //    apretamos el trailing al 30% para asegurar profit (en vez del 50% default).
+  //    Ese es el "partial TP" del espíritu de tesis v4.2 sin tocar partial-close infra.
+  const trailFactor = (FEAT_TRAILING_PARTIAL_TP && pnlPct >= PARTIAL_TP_R_TRIGGER)
+    ? Math.min(PNL_PEAK_DRAWDOWN_PCT, 1.0 - PARTIAL_TP_FRACTION)
+    : PNL_PEAK_DRAWDOWN_PCT;
+  if (peak > feeCost * 2 && pnl < peak * trailFactor) {
     _pnlPeak[symbol] = 0;
-    return { action: "CLOSE", reason: `Drawdown desde pico ($${peak.toFixed(4)} → $${pnl.toFixed(4)})` };
+    const note = trailFactor !== PNL_PEAK_DRAWDOWN_PCT ? ` [v4.2 trail-tight ${(trailFactor*100).toFixed(0)}%]` : "";
+    return { action: "CLOSE", reason: `Drawdown desde pico ($${peak.toFixed(4)} → $${pnl.toFixed(4)})${note}` };
   }
 
   // ── 3. Movimiento favorable > ATR×4 Y score debilitándose (2+ ciclos) ───
@@ -2265,6 +2410,13 @@ async function escaleraOpenLayer(
   atr14h: number,
   numSymbols: number,
 ): Promise<EscaleraLayer | null> {
+  // ── TESIS v4.2 — Circuit breaker daily-loss (siempre ON) ─────────────────
+  const breaker = isDailyHardLossBreakerTripped();
+  if (breaker.tripped) {
+    console.log(TAG, `[ESCALERA] Apertura bloqueada por daily-loss breaker: ${breaker.reason}`);
+    state.lastAction = `🛑 Daily breaker activo — no abrir ${sym}`;
+    return null;
+  }
   const tier = ESCALERA_TIERS[tierIdx];
   const baseBalance = state.liveMode ? (state.liveBalance ?? 0) : state.simBalance;
   const smartSlots = calcSmartSlots(baseBalance);
@@ -2349,7 +2501,33 @@ async function escaleraOpenLayer(
     volSizingFactor = 0.70;
     volSizingNote = ` (vol-sizing: ATR%=${atrPct.toFixed(2)}% → margen×0.70)`;
   }
-  const layerCapital = baseMarginPerPos * volSizingFactor;
+  // ── TESIS v4.2 Componente 4 — Leverage/sizing condicional inteligente ──
+  // Modula sizing según racha reciente de W/L y volatilidad. Ya existen
+  // kellyMult (edge-based) y volSizingFactor (ATR-based). Esto añade el
+  // factor de racha y un castigo extra por alta volatilidad combinada con
+  // mala racha. Sin tocar leverage del Bybit set_leverage — la cantidad de
+  // riesgo cambia vía sizing (mismo efecto, mucho más seguro).
+  let dynLevFactor = 1.0;
+  let dynLevNote = "";
+  if (FEAT_DYN_LEVERAGE) {
+    if (state.consecutiveLosses >= LEV_LOSS_STREAK_TRIGGER) {
+      dynLevFactor *= LEV_LOSS_STREAK_FACTOR;
+      dynLevNote += ` lossStreak×${LEV_LOSS_STREAK_FACTOR}`;
+    } else {
+      const recentN = state.tradeLog.slice(0, LEV_WIN_STREAK_TRIGGER);
+      const allWin = recentN.length >= LEV_WIN_STREAK_TRIGGER && recentN.every((t: any) => (t.pnl ?? 0) > 0);
+      if (allWin) {
+        dynLevFactor *= LEV_WIN_STREAK_FACTOR;
+        dynLevNote += ` winStreak×${LEV_WIN_STREAK_FACTOR}`;
+      }
+    }
+    if (atrPct > LEV_HIGH_VOL_ATR_PCT) {
+      dynLevFactor *= LEV_HIGH_VOL_FACTOR;
+      dynLevNote += ` highVol×${LEV_HIGH_VOL_FACTOR}`;
+    }
+  }
+  const layerCapital = baseMarginPerPos * volSizingFactor * dynLevFactor;
+  if (dynLevNote) console.log(TAG, `[DYN-LEV] ${sym}${dynLevNote} → capital ×${dynLevFactor.toFixed(2)} = $${layerCapital.toFixed(2)}`);
   if (capitalFree < layerCapital * 0.9) {
     // Si no hay capital suficiente, no abrir
     console.log(TAG, `[ESCALERA] Capital insuficiente para abrir ${sym}: libre=$${capitalFree.toFixed(4)} < margen=$${layerCapital.toFixed(2)}`);
@@ -2526,6 +2704,7 @@ async function escaleraCloseLayer(sym: string, inst: EscaleraSymState, layerIdx:
   state.totalFees        += exitFee;
   state.sessionPnl       += netPnl;
   state.sessionPnlCurrent += netPnl;
+  recordRealizedPnlV42(netPnl); // tesis v4.2 circuit breaker
   state.sessionTradesCurrent++;
   state.tradesExecuted++;
 
@@ -4054,6 +4233,27 @@ REGLAS DE REGISTRO INVIOLABLES EN ESTE CANAL:
     }
   } catch {}
 
+  // ── TESIS v4.2 Componente 3 — Hedge detector (DETECTOR pasivo, no auto) ──
+  // Calcula net delta long/short y si supera HEDGE_NET_DELTA_PCT del equity,
+  // inyecta aviso en el prompt para que Tanit decida si vale la pena hedgear.
+  // No abre nada automáticamente — la decisión de hedge requiere convicción.
+  let hedgeAdvisoryLine = "";
+  if (FEAT_HEDGE_DETECTOR && livePositions.length > 0 && bybitLiveFreshEquity != null && bybitLiveFreshEquity > 0) {
+    let longNotional = 0, shortNotional = 0;
+    for (const p of livePositions) {
+      const notional = Math.abs(p.size * p.markPrice);
+      if (p.side === "LONG") longNotional += notional;
+      else shortNotional += notional;
+    }
+    const netDelta = longNotional - shortNotional;
+    const netDeltaPct = (netDelta / bybitLiveFreshEquity) * 100;
+    if (Math.abs(netDeltaPct) >= HEDGE_NET_DELTA_PCT) {
+      const bias = netDelta > 0 ? "LONG" : "SHORT";
+      const opp  = netDelta > 0 ? "SHORT" : "LONG";
+      hedgeAdvisoryLine = `\n⚠️ HEDGE ADVISORY (tesis v4.2): cartera fuertemente sesgada ${bias} — net delta $${netDelta.toFixed(2)} (${netDeltaPct >= 0 ? "+" : ""}${netDeltaPct.toFixed(1)}% del equity, umbral ±${HEDGE_NET_DELTA_PCT}%). Si la tendencia 1h te parece contraria, considera abrir una posición ${opp} pequeña como hedge defensivo. Esta es una observación, no una orden — tú decides.`;
+    }
+  }
+
   // ── Estado del motor interno ──────────────────────────────────────────────
   const bal = state.liveMode ? (state.liveBalance ?? state.simBalance) : state.simBalance;
 
@@ -5053,7 +5253,7 @@ PnL sesión: ${sessionPnlStr} | Win rate: ${winRate !== null ? winRate + "% (" +
 PnL total: ${totalPnlSession >= 0 ? "+" : ""}$${totalPnlSession.toFixed(4)}
 
 === POSICIONES BYBIT (API) ===
-${bybitPositionsLines}
+${bybitPositionsLines}${hedgeAdvisoryLine}
 
 === POSICIONES MOTOR ===
 ${openPosSummary}
@@ -5063,6 +5263,22 @@ Estrategia: 5x entrada → escala hasta ${DYNAMIC_LEV_MAX}x (cobro obligatorio a
 Umbrales: ELITE=${sessionThresholds.ELITE} HIGH=${sessionThresholds.HIGH} DEAD=${sessionThresholds.DEAD}
 Capital bot: ${state.capitalPct ?? 100}% del balance | Margen por posición: $${MARGIN_PER_POS.toFixed(2)} | Leverage: ${state.manualLeverage ? `${state.manualLeverage}x MANUAL` : `AUTO dinámico 5x→${DYNAMIC_LEV_MAX}x`} | SL: ${state.manualSlPct ? `${state.manualSlPct}% MANUAL` : "AUTO (ATR)"} | TP: ${state.manualTpPct ? `${state.manualTpPct}% MANUAL` : "AUTO (trailing)"}
 Foco: ${escaleraSymbols.length > 0 ? escaleraSymbols.map(s => s.replace("USDT","")).join(", ") : "24 monedas"}
+
+=== TESIS v4.2 — 4 mejoras pedagógicas + circuit breaker (autorizado por Luis 6-may-2026) ===
+${(() => {
+  const today = getCurrentUTCDay();
+  const breakerStatus = _dailyBreakerTrippedDay === today
+    ? `🛑 DAILY-LOSS BREAKER TRIPPED hoy (PnL día: ${_dailyPnlTracker.pnl.toFixed(2)} USD = ${_dailyPnlTracker.equityAtDayStart > 0 ? ((_dailyPnlTracker.pnl/_dailyPnlTracker.equityAtDayStart)*100).toFixed(2) : "?"}%) — bloqueando NUEVAS aperturas hasta cambio de día UTC`
+    : `✅ Daily-loss breaker OK (PnL hoy: $${_dailyPnlTracker.pnl.toFixed(2)} de $${_dailyPnlTracker.equityAtDayStart.toFixed(2)} inicio día — umbral -${DAILY_HARD_LOSS_PCT}%)`;
+  return [
+    `Componente 0 [SIEMPRE ON]: Circuit breaker daily-loss ${DAILY_HARD_LOSS_PCT}% — ${breakerStatus}`,
+    `Componente 1 [feat_trailing_partial_tp=${FEAT_TRAILING_PARTIAL_TP ? "ON" : "OFF"}]: si pnlPct ≥ +${PARTIAL_TP_R_TRIGGER}%, aprietar trailing al ${((1.0-PARTIAL_TP_FRACTION)*100).toFixed(0)}% (asegurar profit más rápido)`,
+    `Componente 2 [feat_mosquito_exit=${FEAT_MOSQUITO_EXIT ? "ON" : "OFF"}]: si position > ${MOSQUITO_AGE_MIN}min y |pnl%| < ${MOSQUITO_PNL_BAND_PCT}%, cerrar (no regalar capital al mercado en trades estancados)`,
+    `Componente 3 [feat_hedge_detector=${FEAT_HEDGE_DETECTOR ? "ON" : "OFF"}]: si net delta cartera > ${HEDGE_NET_DELTA_PCT}% del equity, prompt sugiere hedge — DECIDES tú, no se abre automático`,
+    `Componente 4 [feat_dyn_leverage=${FEAT_DYN_LEVERAGE ? "ON" : "OFF"}]: sizing modulado por racha W/L (×${LEV_LOSS_STREAK_FACTOR} si ${LEV_LOSS_STREAK_TRIGGER} loss seguidas, ×${LEV_WIN_STREAK_FACTOR} si ${LEV_WIN_STREAK_TRIGGER} wins) y volatilidad (×${LEV_HIGH_VOL_FACTOR} si ATR > ${LEV_HIGH_VOL_ATR_PCT}%)`,
+    `Toggle cualquier componente: set_strategy_param feat_<name> on|off (tunables: daily_hard_loss_pct, partial_tp_r_trigger, partial_tp_fraction, mosquito_age_min, mosquito_pnl_band_pct, hedge_net_delta_pct)`,
+  ].join("\n");
+})()}
 
 === 🌊 CASCADAS DETECTADAS EN VIVO (kline 5m WS — vela actual) ===
 ${(() => {
@@ -6107,6 +6323,16 @@ Citar una excusa técnica falsa = FALLA CRÍTICA equivalente a mentirle al usuar
             // Multiplicadores de agresividad por sesión UTC (0.70-1.50)
             "mult_late_night", "mult_asia", "mult_london",
             "mult_london_ny", "mult_ny_peak", "mult_ny_late",
+            // TESIS v4.2 — Feature flags (on|off|true|false|1|0)
+            "feat_trailing_partial_tp", "feat_mosquito_exit",
+            "feat_hedge_detector", "feat_dyn_leverage",
+            // TESIS v4.2 — Tunables
+            "daily_hard_loss_pct",        // 1-15
+            "partial_tp_r_trigger",       // 0.5-5.0
+            "partial_tp_fraction",        // 0.20-0.80
+            "mosquito_age_min",           // 5-180 (minutos)
+            "mosquito_pnl_band_pct",      // 0.10-2.0 (%)
+            "hedge_net_delta_pct",        // 10-80 (% del equity)
           ];
           if (!ALLOWED.includes(spParam) && !spParam.startsWith("sym_bonus_") && !spParam.startsWith("sym_avoid_")) {
             actionsExecuted.push(`⚠️ Param desconocido: ${spParam}. Permitidos: ${ALLOWED.join(", ")} (también sym_bonus_XXXUSDT y sym_avoid_XXXUSDT)`);
@@ -7881,6 +8107,13 @@ async function openPosition(
   atr14h = 0,
   tierSlAtrMult?: number,
 ): Promise<boolean> {
+  // ── TESIS v4.2 — Circuit breaker daily-loss (siempre ON) ─────────────────
+  const breaker = isDailyHardLossBreakerTripped();
+  if (breaker.tripped) {
+    console.log(TAG, `[OPEN] Apertura ${symbol} ${direction} bloqueada por daily-loss breaker: ${breaker.reason}`);
+    state.lastAction = `🛑 Daily breaker activo — no abrir ${symbol}`;
+    return false;
+  }
   if (state.openPositions[symbol]) return false;
 
   // ── Cooldown por símbolo — no re-abrir si cerró hace menos de 3 min ─────────
@@ -8180,6 +8413,7 @@ async function closePosition(symbol: string, reason: string, exitPrice: number):
   if (state.tradeLog.length > 50) state.tradeLog = state.tradeLog.slice(0, 50);
   state.tradesExecuted++;
   state.sessionPnl += netPnl;
+  recordRealizedPnlV42(netPnl); // tesis v4.2 circuit breaker
 
   // Guardar en DB permanente — sobrevive reinicios. El catch debe LOGGEAR,
   // no tragarse el error en silencio (esa fue la otra mitad del bug que dejó
@@ -8503,6 +8737,7 @@ async function manageOpenPosition(symbol: string, price: number): Promise<void> 
           state.tradeLog.unshift(partialEntry);
           if (state.tradeLog.length > 50) state.tradeLog = state.tradeLog.slice(0, 50);
           state.sessionPnl += netPnl40;
+          recordRealizedPnlV42(netPnl40); // tesis v4.2 circuit breaker
         }
         state.lastAction = `[FIB-TP1] ${coin}: 40% cerrado @ ${price.toFixed(2)} | Neto: +$${netPnl40.toFixed(2)} | 60% restante | TP2 → ${pos.fibTPs[1].toFixed(2)} | SL → breakeven`;
         console.log(TAG, state.lastAction);
@@ -8565,6 +8800,7 @@ async function manageOpenPosition(symbol: string, price: number): Promise<void> 
           state.tradeLog.unshift(partialEntry2);
           if (state.tradeLog.length > 50) state.tradeLog = state.tradeLog.slice(0, 50);
           state.sessionPnl += netPnl40b;
+          recordRealizedPnlV42(netPnl40b); // tesis v4.2 circuit breaker
         }
         state.lastAction = `[FIB-TP2] ${coin}: +40% cerrado @ ${price.toFixed(2)} | Neto: +$${netPnl40b.toFixed(2)} | 20% con trailing libre | SL → ${pos.stopLoss}`;
         console.log(TAG, state.lastAction);
