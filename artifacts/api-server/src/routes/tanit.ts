@@ -488,6 +488,30 @@ router.get("/tanit/balance-history", async (req, res): Promise<void> => {
   }
 });
 
+// ─── Equity now (lightweight realtime tick for /monitor overlay) ──────────────
+//
+// Cheap reuse of getStateLive() (Bybit cache 30s). Frontend polls every 5s to
+// give the curve a "live tick" while the DB-backed history covers the long tail.
+
+router.get("/tanit/equity-now", async (_req, res): Promise<void> => {
+  try {
+    const live = await getStateLive();
+    const equity = live.balance?.totalEquity ?? null;
+    const available = live.balance?.availableBalance ?? null;
+    const upnlTotal = live.positions.reduce((s, p) => s + p.unrealizedPnl, 0);
+    res.json({
+      ok: true,
+      ts: Date.now(),
+      equity,
+      available,
+      positions: live.positions.length,
+      upnl: parseFloat(upnlTotal.toFixed(4)),
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
 // ─── Capital contributions (Luis deposits) ────────────────────────────────────
 
 router.get("/tanit/capital-contributions", async (req, res): Promise<void> => {

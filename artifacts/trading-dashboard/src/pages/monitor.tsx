@@ -142,11 +142,20 @@ export default function Monitor() {
   const [lastUpdated, setLastUpdated]   = useState<Date | null>(null);
   const [error, setError]               = useState(false);
   const [showContrib, setShowContrib]   = useState(false);
+  const [liveTick, setLiveTick]         = useState<{ ts: number; equity: number } | null>(null);
+  const [anchorMs, setAnchorMs]         = useState<number | null>(() => {
+    const v = localStorage.getItem("monitor-anchor-ms");
+    return v ? parseInt(v, 10) : null;
+  });
   const mountedRef = useRef(true);
   useEffect(() => { return () => { mountedRef.current = false; }; }, []);
 
   // Persist range preference
   useEffect(() => { localStorage.setItem("monitor-range", range); }, [range]);
+  useEffect(() => {
+    if (anchorMs == null) localStorage.removeItem("monitor-anchor-ms");
+    else localStorage.setItem("monitor-anchor-ms", String(anchorMs));
+  }, [anchorMs]);
 
   // ── Polling ─────────────────────────────────────────────
   const loadAll = async () => {
@@ -175,6 +184,25 @@ export default function Monitor() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [range]);
 
+  // ── Live tick (5s) — overlay realtime sobre la curva DB ──────────────
+  useEffect(() => {
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const r = await fetch(`${BASE_URL}api/tanit/equity-now`);
+        if (!r.ok) return;
+        const d = await r.json();
+        if (cancelled || !mountedRef.current) return;
+        if (d?.ok && typeof d.equity === "number") {
+          setLiveTick({ ts: Number(d.ts ?? Date.now()), equity: Number(d.equity) });
+        }
+      } catch { /* swallow — DB curve still works */ }
+    };
+    tick();
+    const id = setInterval(tick, 5_000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, []);
+
   // ── Derived state ───────────────────────────────────────
   const live         = !!botState?.liveMode;
   const equity       = live ? (botState?.liveBalance ?? 0) : (botState?.effectiveBalance ?? 0);
@@ -195,15 +223,23 @@ export default function Monitor() {
   const grossLosses = Math.abs(tradeLog.filter(t => t.pnl < 0).reduce((s, t) => s + t.pnl, 0));
   const pf = grossLosses > 0 ? grossWins / grossLosses : null;
 
-  // Chart data
+  // Chart data — DB history + live tick overlay + anchor filter
   const chartData = useMemo(() => {
+    let base: { time: number; equity: number }[] = [];
     if (history.length === 0) {
-      // Fallback: use botState session balance history
       const fallback: any[] = botState?.balanceHistory ?? [];
-      return fallback.map((h: any) => ({ time: h.time, equity: h.balance ?? h.equity }));
+      base = fallback.map((h: any) => ({ time: Number(h.time), equity: Number(h.balance ?? h.equity) }));
+    } else {
+      base = history.map(h => ({ time: Number(h.time), equity: Number(h.equity ?? h.balance) }));
     }
-    return history.map(h => ({ time: Number(h.time), equity: Number(h.equity ?? h.balance) }));
-  }, [history, botState]);
+    // Append live tick if newer than the last DB point (so the curve breathes 5s a 5s)
+    if (liveTick && (base.length === 0 || liveTick.ts > base[base.length - 1].time)) {
+      base = [...base, { time: liveTick.ts, equity: liveTick.equity }];
+    }
+    // Apply anchor filter ("anclar inicio aquí")
+    if (anchorMs != null) base = base.filter(p => p.time >= anchorMs);
+    return base;
+  }, [history, botState, liveTick, anchorMs]);
 
   const chartMin = useMemo(() => chartData.length ? Math.min(...chartData.map(d => d.equity)) * 0.998 : 0, [chartData]);
   const chartMax = useMemo(() => chartData.length ? Math.max(...chartData.map(d => d.equity)) * 1.002 : 1, [chartData]);
@@ -356,6 +392,39 @@ export default function Monitor() {
                 {r.toUpperCase()}
               </button>
             ))}
+          </div>
+
+          {/* Anchor inicio — corta el "INICIO $4.71" viejo sin borrar la DB */}
+          <div style={{ display: "flex", gap: 6, padding: "0 16px 4px", alignItems: "center", justifyContent: "space-between" }}>
+            <div style={{ fontFamily: "monospace", fontSize: 7, color: DIM, letterSpacing: "0.1em" }}>
+              {anchorMs != null
+                ? `ANCLA: ${new Date(anchorMs).toLocaleString()}`
+                : `${chartData.length} pts · live tick 5s`}
+            </div>
+            <div style={{ display: "flex", gap: 4 }}>
+              <button
+                onClick={() => setAnchorMs(Date.now())}
+                style={{
+                  padding: "4px 10px", borderRadius: 6, cursor: "pointer",
+                  border: `1px solid ${GREEN}40`, background: `${GREEN}10`, color: GREEN,
+                  fontFamily: "monospace", fontSize: 8, letterSpacing: "0.05em",
+                }}
+              >
+                Anclar aquí
+              </button>
+              {anchorMs != null && (
+                <button
+                  onClick={() => setAnchorMs(null)}
+                  style={{
+                    padding: "4px 10px", borderRadius: 6, cursor: "pointer",
+                    border: `1px solid ${LINE}`, background: "transparent", color: DIM2,
+                    fontFamily: "monospace", fontSize: 8, letterSpacing: "0.05em",
+                  }}
+                >
+                  Reset
+                </button>
+              )}
+            </div>
           </div>
 
           {/* Chart */}

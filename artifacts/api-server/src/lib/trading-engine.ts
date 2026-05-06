@@ -3760,7 +3760,7 @@ const PERPLEXITY_CACHE_TTL = 5 * 60 * 1000; // 5 minutos
 // para el dashboard /monitor. Los campos adicionales (num_positions, margin_heat_pct,
 // daily_pnl_usdt) se añadieron en la migración migrate-dashboard.mjs (5-may-2026).
 let _lastSnapshotSavedAt = 0;
-const SNAPSHOT_INTERVAL_MS = 5 * 60 * 1000; // 5 minutos
+const SNAPSHOT_INTERVAL_MS = 60 * 1000; // 1 minuto — granularidad fina para curva /monitor
 
 function saveBalanceSnapshotThrottled(balance: number): void {
   const now = Date.now();
