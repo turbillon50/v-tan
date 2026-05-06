@@ -2054,7 +2054,7 @@ let PARTIAL_TP_FRACTION        = 0.50;  // fracción de la posición a cerrar (0
 //   está dentro de ±MOSQUITO_PNL_BAND_PCT, ciérrala. No vamos a regalar capital
 //   parado en un trade que no se mueve.
 let FEAT_MOSQUITO_EXIT         = true;  // (set: feat_mosquito_exit on|off)
-let MOSQUITO_AGE_MIN           = 30;    // minutos antes de chequear estancamiento
+let MOSQUITO_AGE_MIN           = 60;    // minutos antes de chequear estancamiento (subido 6-may-2026 de 30→60: avg_win cayó de $0.064 a $0.026 post-v4.3, mosquito cerraba ganadoras tibias antes de tomar vuelo)
 let MOSQUITO_PNL_BAND_PCT      = 0.50;  // banda |%| dentro de la cual se considera "estancado"
 
 // Componente 3 — Hedge condicional (DETECTOR pasivo, no auto-apertura)
