@@ -19,6 +19,7 @@ import Furtivo from "@/pages/furtivo";
 import Manual from "@/pages/manual";
 import Historial from "@/pages/historial";
 import Live from "@/pages/live";
+import Monitor from "@/pages/monitor";
 
 const queryClient = new QueryClient({
   defaultOptions: { queries: { retry: 1, staleTime: 10_000 } },
@@ -41,6 +42,7 @@ function Router() {
       <Route path="/manual"    component={Manual}    />
       <Route path="/historial" component={Historial} />
       <Route path="/live"      component={Live}      />
+      <Route path="/monitor"   component={Monitor}   />
       <Route component={NotFound} />
     </Switch>
   );
