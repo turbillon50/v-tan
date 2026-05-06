@@ -447,11 +447,18 @@ router.get("/tanit/trades", async (req, res): Promise<void> => {
 router.get("/tanit/balance-snapshots", async (req, res): Promise<void> => {
   try {
     const limit = safeLimit(req.query.limit, 200);
-    const list = await db
+    // CRÍTICO: orderBy DESC para devolver los snapshots MÁS RECIENTES.
+    // Sin desc(), Drizzle ordena ASC y .limit(N) trae los N más VIEJOS — eso
+    // hacía que el frontend viera "Sin datos en ventana 6h" porque sus 500
+    // snapshots eran todos de hace semanas. Reportado por Luis 6-may-2026.
+    // Devolvemos en orden cronológico ASC para que el chart no tenga que
+    // re-ordenar (revertimos en JS para entregar oldest→newest).
+    const recentDesc = await db
       .select()
       .from(balanceSnapshots)
-      .orderBy(balanceSnapshots.createdAt)
+      .orderBy(desc(balanceSnapshots.createdAt))
       .limit(limit);
+    const list = recentDesc.slice().reverse();
     res.json({ ok: true, count: list.length, snapshots: list });
   } catch (err) {
     res.status(500).json({ ok: false, error: String(err) });

@@ -1,0 +1,15 @@
+import { neon } from "@neondatabase/serverless";
+const sql = neon(process.env.DATABASE_URL);
+const total = await sql`SELECT COUNT(*)::int n FROM balance_snapshots`;
+const last1h = await sql`SELECT COUNT(*)::int n FROM balance_snapshots WHERE created_at >= NOW() - INTERVAL '1 hour'`;
+const last6h = await sql`SELECT COUNT(*)::int n FROM balance_snapshots WHERE created_at >= NOW() - INTERVAL '6 hours'`;
+const last24h = await sql`SELECT COUNT(*)::int n FROM balance_snapshots WHERE created_at >= NOW() - INTERVAL '24 hours'`;
+const newest = await sql`SELECT created_at, equity, balance FROM balance_snapshots ORDER BY created_at DESC LIMIT 5`;
+const distinctMins72h = await sql`SELECT COUNT(DISTINCT date_trunc('minute', created_at))::int n FROM balance_snapshots WHERE created_at >= NOW() - INTERVAL '72 hours'`;
+console.log("TOTAL:", total[0].n);
+console.log("Última hora:", last1h[0].n);
+console.log("Últimas 6h:", last6h[0].n);
+console.log("Últimas 24h:", last24h[0].n);
+console.log("Minutos distintos últimas 72h:", distinctMins72h[0].n);
+console.log("5 más recientes:");
+for (const r of newest) console.log("  ", r.created_at, "$" + r.equity);
