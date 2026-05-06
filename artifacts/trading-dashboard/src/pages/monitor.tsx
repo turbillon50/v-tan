@@ -91,6 +91,7 @@ function ContribModal({ onClose, onAdd }: { onClose: () => void; onAdd: (usdt: n
   const [rate, setRate]   = useState("");
   const [notes, setNotes] = useState("");
   const [saving, setSaving] = useState(false);
+  const [saveErr, setSaveErr] = useState<string | null>(null);
   const inputStyle = {
     background: CARD2, border: `1px solid ${LINE}`, borderRadius: 7, padding: "8px 12px",
     fontFamily: "monospace", fontSize: 12, color: WHITE, width: "100%", boxSizing: "border-box" as const,
@@ -101,9 +102,12 @@ function ContribModal({ onClose, onAdd }: { onClose: () => void; onAdd: (usdt: n
     const usdtN = parseFloat(usdt);
     if (!Number.isFinite(usdtN) || usdtN <= 0) return;
     setSaving(true);
+    setSaveErr(null);
     try {
       await onAdd(usdtN, mxn ? parseFloat(mxn) : null, rate ? parseFloat(rate) : null, notes);
       onClose();
+    } catch (e: any) {
+      setSaveErr(e?.message ?? "Error al guardar");
     } finally { setSaving(false); }
   };
   return (
@@ -115,6 +119,7 @@ function ContribModal({ onClose, onAdd }: { onClose: () => void; onAdd: (usdt: n
         <div><label style={labelStyle}>Monto MXN (opcional)</label><input type="number" placeholder="0.00" value={mxn} onChange={e => setMxn(e.target.value)} style={inputStyle} /></div>
         <div><label style={labelStyle}>Tipo de cambio (opcional)</label><input type="number" placeholder="0.00" value={rate} onChange={e => setRate(e.target.value)} style={inputStyle} /></div>
         <div><label style={labelStyle}>Notas (opcional)</label><input type="text" placeholder="Primer depósito..." value={notes} onChange={e => setNotes(e.target.value)} style={inputStyle} /></div>
+        {saveErr && <div style={{ fontFamily: "monospace", fontSize: 9, color: RED }}>{saveErr}</div>}
         <div style={{ display: "flex", gap: 10 }}>
           <button onClick={onClose} style={{ flex: 1, padding: "10px 0", borderRadius: 8, border: `1px solid ${LINE}`, background: "transparent", color: DIM2, fontFamily: "monospace", fontSize: 10, cursor: "pointer" }}>Cancelar</button>
           <button onClick={handleSave} disabled={saving} style={{ flex: 2, padding: "10px 0", borderRadius: 8, border: `1px solid ${GREEN}60`, background: `${GREEN}15`, color: GREEN, fontFamily: "monospace", fontSize: 10, fontWeight: 800, cursor: "pointer" }}>
@@ -155,8 +160,9 @@ export default function Monitor() {
       if (botRes) setBotState(botRes);
       if (histRes?.ok) setHistory(histRes.history ?? []);
       if (contribRes?.ok) setContribs({ total_usdt: contribRes.total_usdt ?? 0, contributions: contribRes.contributions ?? [] });
-      setLastUpdated(new Date());
-      setError(false);
+      // Only mark refresh successful when the primary data source responded
+      setError(!botRes);
+      if (botRes) setLastUpdated(new Date());
     } catch {
       if (mountedRef.current) setError(true);
     }
@@ -239,7 +245,8 @@ export default function Monitor() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ amount_usdt: usdt, amount_mxn: mxn, exchange_rate: rate, notes }),
     });
-    if (res.ok) await loadAll();
+    if (!res.ok) throw new Error(`Error ${res.status} al guardar depósito`);
+    await loadAll();
   };
 
   return (
