@@ -739,6 +739,9 @@ const calibrationHistory: CalibrationSnapshot[] = [];
 let calibrationCycleCount = 0;
 let liveBalanceTimer: ReturnType<typeof setInterval> | null = null;
 let syncTimer: ReturnType<typeof setInterval> | null = null;
+// Cron incondicional — escribe balance_snapshot cada 60s sin importar
+// actividad de chat/loop. Garantiza densidad de la curva infinita en /analytics.
+let _unconditionalSnapshotTimer: ReturnType<typeof setInterval> | null = null;
 let _proactiveVozTimer: ReturnType<typeof setInterval> | null = null;
 let _proactiveGreetingTimer: ReturnType<typeof setInterval> | null = null;
 let _lastUserMessageAt = Date.now(); // timestamp del último mensaje REAL del usuario (no del sistema)
@@ -3766,14 +3769,19 @@ function saveBalanceSnapshotThrottled(balance: number): void {
   const now = Date.now();
   if (now - _lastSnapshotSavedAt < SNAPSHOT_INTERVAL_MS) return;
   _lastSnapshotSavedAt = now;
+  saveBalanceSnapshotImmediate(balance);
+}
 
-  // Datos adicionales del state global para el dashboard
+// Hace el INSERT sin throttle. Lo usa el cron incondicional (cada 60s desde
+// startEngine) para garantizar punto-por-minuto en la curva aun si no hay
+// actividad de chat/loop. Reportado por Luis 6-may-2026: "Sin datos en 6h ·
+// 1 pts" en la pantalla Analytics — el frontend depende de esta tabla.
+function saveBalanceSnapshotImmediate(balance: number): void {
   const equity    = balance;
   const available = state.liveAvailable ?? balance;
   const numPos    = state.openPositions ? Object.keys(state.openPositions).length : 0;
   const marginHeat = equity > 0 ? parseFloat((((equity - available) / equity) * 100).toFixed(4)) : 0;
 
-  // daily_pnl: sum de netPnl de trade_history de hoy
   pool.query(
     `SELECT COALESCE(SUM(net_pnl), 0)::float AS daily_pnl
      FROM trade_history
@@ -3793,8 +3801,7 @@ function saveBalanceSnapshotThrottled(balance: number): void {
         parseFloat(dailyPnl.toFixed(6)),
       ]
     ).catch(e => console.error(TAG, "balance_snapshot insert error:", e));
-  }).catch(e => {
-    // Si falla la query de daily_pnl, igual guardamos el snapshot básico
+  }).catch(() => {
     pool.query(
       `INSERT INTO balance_snapshots (balance, equity, available, num_positions, margin_heat_pct, created_at)
        VALUES ($1, $2, $3, $4, $5, NOW())`,
@@ -3802,6 +3809,15 @@ function saveBalanceSnapshotThrottled(balance: number): void {
        parseFloat(available.toFixed(6)), numPos, marginHeat]
     ).catch(e2 => console.error(TAG, "balance_snapshot fallback error:", e2));
   });
+}
+
+// Tick del cron incondicional — registrado en startEngine, limpiado en stopEngine.
+function tickUnconditionalSnapshot(): void {
+  const bal = state.liveMode ? (state.liveBalance ?? state.simBalance ?? 0) : (state.simBalance ?? 0);
+  if (bal <= 0) return;
+  saveBalanceSnapshotImmediate(bal);
+  // Mantener throttle alineado para no duplicar con el path de chat/loop.
+  _lastSnapshotSavedAt = Date.now();
 }
 
 export async function getBalanceHistory(days = 30): Promise<{ time: number; balance: number }[]> {
@@ -9668,6 +9684,11 @@ export function startEngine(mode: string, capitalPct: number, _symbols?: string 
     if (liveBalanceTimer) clearInterval(liveBalanceTimer);
     liveBalanceTimer = setInterval(refreshLiveBalance, 5000);
 
+    // Snapshot incondicional cada 60s — densidad para curva /analytics aun
+    // sin actividad de chat/loop. Reportado por Luis 6-may-2026.
+    if (_unconditionalSnapshotTimer) clearInterval(_unconditionalSnapshotTimer);
+    _unconditionalSnapshotTimer = setInterval(tickUnconditionalSnapshot, 60_000);
+
     // Sincronización periódica de posiciones Bybit (cada 60 s)
     // — detecta posiciones nuevas y limpia las que Bybit cerró por SL/TP
     if (syncTimer) clearInterval(syncTimer);
@@ -9892,9 +9913,12 @@ export function setEngineLiveMode(live: boolean): void {
     }).catch(e => console.error(TAG, "[REAL] Error obteniendo balance:", e));
     if (liveBalanceTimer) clearInterval(liveBalanceTimer);
     liveBalanceTimer = setInterval(refreshLiveBalance, 5000);
+    if (_unconditionalSnapshotTimer) clearInterval(_unconditionalSnapshotTimer);
+    _unconditionalSnapshotTimer = setInterval(tickUnconditionalSnapshot, 60_000);
   } else {
     if (liveBalanceTimer) { clearInterval(liveBalanceTimer); liveBalanceTimer = null; }
     if (syncTimer)        { clearInterval(syncTimer);        syncTimer        = null; }
+    if (_unconditionalSnapshotTimer) { clearInterval(_unconditionalSnapshotTimer); _unconditionalSnapshotTimer = null; }
     state.liveBalance   = null;
     state.liveAvailable = null;
     console.log(TAG, "[PAPER] Modo paper activado");
@@ -9932,6 +9956,7 @@ export async function stopEngine(): Promise<void> {
   if (sessionTimer)      { clearTimeout(sessionTimer);       sessionTimer      = null; }
   if (liveBalanceTimer)  { clearInterval(liveBalanceTimer);  liveBalanceTimer  = null; }
   if (syncTimer)         { clearInterval(syncTimer);         syncTimer         = null; }
+  if (_unconditionalSnapshotTimer) { clearInterval(_unconditionalSnapshotTimer); _unconditionalSnapshotTimer = null; }
   if (calibrationTimer)    { clearInterval(calibrationTimer);    calibrationTimer    = null; }
   if (introspectionTimer)  { clearInterval(introspectionTimer);  introspectionTimer  = null; }
   if (_proactiveVozTimer)      { clearInterval(_proactiveVozTimer);      _proactiveVozTimer      = null; }
