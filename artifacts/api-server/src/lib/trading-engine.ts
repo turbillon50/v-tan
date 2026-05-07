@@ -4531,6 +4531,76 @@ async function getPrice(symbol: string): Promise<number | null> {
   } catch { return null; }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// PR #29 — Bybit como OJOS PRIMARIOS de Tanit
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Tanit deja de depender de Perplexity para datos numéricos. Toda la realidad
+// cuantitativa viene de Bybit: precios, orderbook, velas, OI, funding, whales.
+// Perplexity queda solo para narrativa cualitativa (noticias, macro, sentiment).
+//
+// Función getBybitDeepSnapshot() pulsa en paralelo:
+//   • Orderbook depth top 5 bids/asks
+//   • Velas multi-TF (1m, 5m, 15m, 1h) — últimas 5 de cada
+//   • Recent trades (whale alerts >$50k)
+// Cache 60s para no martillar la API en cada chat.
+
+type DeepSnapshotSymbol = {
+  orderbook: { bids: [number, number][]; asks: [number, number][] };
+  klines: Record<string, [number, number, number, number, number, number][]>; // tf -> [start,o,h,l,c,v]
+  whaleTrades: { side: string; price: number; size: number; ts: number }[];
+};
+
+let _deepSnapshotCache: { data: Record<string, DeepSnapshotSymbol>; updatedAt: number } = { data: {}, updatedAt: 0 };
+const DEEP_SNAPSHOT_TTL_MS = 60 * 1000;
+
+async function getBybitDeepSnapshot(symbols: string[]): Promise<Record<string, DeepSnapshotSymbol>> {
+  const now = Date.now();
+  if (now - _deepSnapshotCache.updatedAt < DEEP_SNAPSHOT_TTL_MS && Object.keys(_deepSnapshotCache.data).length > 0) {
+    return _deepSnapshotCache.data;
+  }
+  const result: Record<string, DeepSnapshotSymbol> = {};
+  const tfs = ["1", "5", "15", "60"]; // 1m, 5m, 15m, 1h
+  await Promise.all(symbols.map(async (sym) => {
+    try {
+      const [obRes, ...kRes] = await Promise.all([
+        bybitPublic("GET", "/v5/market/orderbook", { category: "linear", symbol: sym, limit: "5" }).catch(() => null),
+        ...tfs.map(tf => bybitPublic("GET", "/v5/market/kline", { category: "linear", symbol: sym, interval: tf, limit: "5" }).catch(() => null)),
+      ]);
+      // Orderbook
+      const bids: [number, number][] = (obRes?.result?.b ?? []).slice(0, 5).map((b: string[]) => [parseFloat(b[0]), parseFloat(b[1])]);
+      const asks: [number, number][] = (obRes?.result?.a ?? []).slice(0, 5).map((a: string[]) => [parseFloat(a[0]), parseFloat(a[1])]);
+      // Klines por TF
+      const klines: Record<string, [number, number, number, number, number, number][]> = {};
+      tfs.forEach((tf, idx) => {
+        const candles = (kRes[idx]?.result?.list ?? []).map((k: string[]) => [
+          parseInt(k[0]), parseFloat(k[1]), parseFloat(k[2]), parseFloat(k[3]), parseFloat(k[4]), parseFloat(k[5]),
+        ]).reverse(); // Bybit retorna newest first; revertimos para tener cronológico
+        klines[tf] = candles;
+      });
+      // Whale trades — recent trades >$50k notional
+      let whaleTrades: { side: string; price: number; size: number; ts: number }[] = [];
+      try {
+        const tRes = await bybitPublic("GET", "/v5/market/recent-trade", { category: "linear", symbol: sym, limit: "60" });
+        const trades = tRes?.result?.list ?? [];
+        for (const t of trades) {
+          const px = parseFloat(t.price);
+          const sz = parseFloat(t.size);
+          if (px * sz >= 50000) {
+            whaleTrades.push({ side: t.side, price: px, size: sz, ts: parseInt(t.time) });
+          }
+        }
+        whaleTrades = whaleTrades.slice(0, 5); // top 5 más recientes
+      } catch {}
+      result[sym] = { orderbook: { bids, asks }, klines, whaleTrades };
+    } catch (e) {
+      console.error(TAG, `[DEEP-SNAPSHOT] ${sym} error:`, e);
+    }
+  }));
+  _deepSnapshotCache = { data: result, updatedAt: now };
+  return result;
+}
+
 function calcRSI(closes: number[], period: number): number {
   if (closes.length < period + 1) return 50;
   let gains = 0, losses = 0;
@@ -5369,6 +5439,10 @@ ${_critCoreIdentity.map(m => `  • ${m.content}`).join("\n\n")}`
     "BTCUSDT","ETHUSDT","SOLUSDT","TONUSDT","XRPUSDT","DOGEUSDT","BNBUSDT",
     "ADAUSDT","AVAXUSDT","LINKUSDT","LTCUSDT","ATOMUSDT","TRXUSDT","SUIUSDT","BCHUSDT",
   ]);
+
+  // ── PR #29 — Deep snapshot Bybit (orderbook + klines multi-TF + whale trades) ──
+  // Solo para los 3 símbolos blue chip. Cache 60s. Bybit como ojos primarios.
+  const _deepSnapshot = await getBybitDeepSnapshot(["BTCUSDT", "ETHUSDT", "SOLUSDT"]);
 
   // ── Eventos guardrail recientes — Tanit ve cuándo el sistema la corrigió ─
   const recentGuardrails = await getRecentGuardrailEvents(5);
@@ -6364,6 +6438,76 @@ ${(() => {
   return livePriceLines.join("\n") + `\nSnapshot: ${new Date().toISOString().slice(11,19)}Z`;
 })()}
 ⚠️ ESTOS SON LOS PRECIOS REALES AHORA MISMO. Cuando cites niveles técnicos (soporte, resistencia, ruptura, target, invalidación), úsalos a partir del precio LIVE de arriba — NUNCA inventes desde memoria ni desde lessons antiguas. Si BTC arriba dice $81,290, tus niveles relevantes son ±2-3% de ese precio (ej: soporte $80,500, resistencia $82,800). NO cites $67k — eso es de 2024 y YA NO ES el precio. Si Tanit cita un nivel, debe estar dentro del rango ±5% del precio LIVE.
+
+=== 🔬 BYBIT DEEP DATA (BTC/ETH/SOL — tus blue chips, ojos cuantitativos) ===
+${(() => {
+  const lines: string[] = [];
+  const blueChips = ["BTCUSDT", "ETHUSDT", "SOLUSDT"];
+  for (const sym of blueChips) {
+    const d = _deepSnapshot[sym];
+    if (!d) { lines.push(`${sym}: sin data`); continue; }
+    const coin = sym.replace("USDT", "");
+    lines.push(`\n— ${coin} —`);
+    // Orderbook
+    if (d.orderbook.bids.length > 0 && d.orderbook.asks.length > 0) {
+      const topBid = d.orderbook.bids[0];
+      const topAsk = d.orderbook.asks[0];
+      const spread = ((topAsk[0] - topBid[0]) / topBid[0]) * 100;
+      const bidWall = d.orderbook.bids.reduce((s: number, b: [number, number]) => s + b[1], 0);
+      const askWall = d.orderbook.asks.reduce((s: number, a: [number, number]) => s + a[1], 0);
+      lines.push(`  OB top5: bid=$${topBid[0].toFixed(2)} (qty${bidWall.toFixed(2)}) | ask=$${topAsk[0].toFixed(2)} (qty${askWall.toFixed(2)}) | spread=${spread.toFixed(3)}%`);
+    }
+    // Velas por TF resumen
+    const tfNames: Record<string, string> = { "1": "1m", "5": "5m", "15": "15m", "60": "1h" };
+    for (const tf of ["1", "5", "15", "60"]) {
+      const candles = d.klines[tf] || [];
+      if (candles.length < 2) continue;
+      const last = candles[candles.length - 1];
+      const prev = candles[candles.length - 2];
+      const change = ((last[4] - prev[4]) / prev[4]) * 100;
+      const high = Math.max(...candles.map((c: number[]) => c[2]));
+      const low = Math.min(...candles.map((c: number[]) => c[3]));
+      const totalVol = candles.reduce((s: number, c: number[]) => s + c[5], 0);
+      // Vela actual: detectar martillo/doji simple
+      const body = Math.abs(last[4] - last[1]);
+      const range = last[2] - last[3];
+      const upperWick = last[2] - Math.max(last[1], last[4]);
+      const lowerWick = Math.min(last[1], last[4]) - last[3];
+      let pattern = "";
+      if (range > 0) {
+        if (body / range < 0.15) pattern = " doji";
+        else if (lowerWick / range > 0.55) pattern = " martillo↑";
+        else if (upperWick / range > 0.55) pattern = " estrella↓";
+      }
+      lines.push(`  ${tfNames[tf]}: O=${prev[4].toFixed(2)} → C=${last[4].toFixed(2)} (${change >= 0 ? "+" : ""}${change.toFixed(2)}%) | H=${high.toFixed(2)} L=${low.toFixed(2)} | vol=${totalVol.toFixed(0)}${pattern}`);
+    }
+    // Whale trades
+    if (d.whaleTrades.length > 0) {
+      const w = d.whaleTrades.slice(0, 3);
+      const lns = w.map(t => `${t.side === "Buy" ? "🟢" : "🔴"}$${(t.price * t.size).toFixed(0)}`).join(" ");
+      lines.push(`  whales reciente: ${lns}`);
+    }
+  }
+  return lines.join("\n");
+})()}
+
+╔══════════════════════════════════════════════════════════════════════╗
+║  TUS OJOS PRIMARIOS = BYBIT (PR #29)                                ║
+║                                                                      ║
+║  Toda realidad cuantitativa viene de Bybit en tiempo real:          ║
+║    • Precios → bloque PRECIOS LIVE arriba                           ║
+║    • Velas + patrones → BYBIT DEEP DATA arriba (BTC/ETH/SOL)        ║
+║    • Orderbook → BYBIT DEEP DATA (top 5 bids/asks, spread, walls)   ║
+║    • Whales → BYBIT DEEP DATA (trades >$50k recientes)              ║
+║    • Funding rate → bloque FUNDING RATES más abajo                  ║
+║    • OI delta → bloque OPEN INTEREST más abajo                      ║
+║    • Liquidations → bloque CASCADAS más abajo                       ║
+║                                                                      ║
+║  Perplexity = solo NARRATIVA cualitativa (noticias, macro, sentiment║
+║  greed/fear). NUNCA le pidas precios ni niveles. Sus números son    ║
+║  obsoletos (training viejo). Tus ojos cuantitativos son SIEMPRE     ║
+║  Bybit. Si necesitas un dato numérico, lo lees del bloque Bybit.    ║
+╚══════════════════════════════════════════════════════════════════════╝
 
 === POSICIONES BYBIT (API) ===
 ${bybitPositionsLines}${hedgeAdvisoryLine}
