@@ -8,9 +8,14 @@ function sign(payload: string, secret: string): string {
 }
 
 export async function bybitGet(path: string, params: Record<string, string> = {}): Promise<any> {
-  // PR #39 — modo directo es el camino preferido. El proxy ya no es obligatorio
-  // (queda como fallback opcional si BYBIT_PROXY_URL está seteado y FORCE_PROXY=1).
-  const useProxy = !!process.env.BYBIT_PROXY_URL && process.env.FORCE_PROXY === "1";
+  // PR #40 — fallback inteligente: usar proxy si NO hay bybit_key/secret
+  // accesibles (DB o env). Antes había que setear FORCE_PROXY=1 explícito,
+  // pero eso obligaba a config manual. Ahora: si el api-server no tiene
+  // las keys, automáticamente las pide vía proxy donde sí viven.
+  const directKey = await getKey("bybit_key");
+  const directSec = await getKey("bybit_secret");
+  const hasDirect = !!(directKey && directSec);
+  const useProxy = !!process.env.BYBIT_PROXY_URL && (process.env.FORCE_PROXY === "1" || !hasDirect);
   if (useProxy) {
     const proxyUrl = process.env.BYBIT_PROXY_URL!;
     const proxySecret = (await getKey("proxy_secret")) ?? "";
@@ -26,10 +31,10 @@ export async function bybitGet(path: string, params: Record<string, string> = {}
     return data.result;
   }
 
-  // Direct mode: api-server reads keys from DB (fallback env via provider)
-  const key    = await getKey("bybit_key");
-  const secret = await getKey("bybit_secret");
-  if (!key || !secret) throw new Error("No Bybit credentials (configura bybit_key/bybit_secret en tanit_api_keys o env)");
+  // Direct mode: ya teníamos las keys arriba en directKey/directSec
+  const key    = directKey;
+  const secret = directSec;
+  if (!key || !secret) throw new Error("No Bybit credentials (configura bybit_key/bybit_secret en tanit_api_keys o env, o BYBIT_PROXY_URL)");
 
   const ts         = Date.now().toString();
   const recvWindow = "5000";
