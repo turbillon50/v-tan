@@ -6291,6 +6291,19 @@ Motor: $${bal.toFixed(4)} USDT | REAL 🔴 BYBIT MAINNET | Bot: ${state.active ?
 PnL sesión: ${sessionPnlStr} | Win rate: ${winRate !== null ? winRate + "% (" + state.tradeLog.length + " trades)" : "sin trades"}
 PnL total: ${totalPnlSession >= 0 ? "+" : ""}$${totalPnlSession.toFixed(4)}
 
+=== 💰 PRECIOS LIVE (Bybit WS — USA ESTOS, no tu memoria) ===
+${(() => {
+  const livePriceLines: string[] = [];
+  const priceTopSymbols = ["BTCUSDT","ETHUSDT","SOLUSDT","TONUSDT","XRPUSDT","DOGEUSDT","BNBUSDT","ADAUSDT","AVAXUSDT","LINKUSDT","LTCUSDT","ATOMUSDT","TRXUSDT","SUIUSDT","BCHUSDT"];
+  for (const sym of priceTopSymbols) {
+    const p = getWsPrice(sym);
+    if (p && p > 0) livePriceLines.push(`  ${sym.replace("USDT","").padEnd(6)} $${p.toFixed(p > 100 ? 2 : 4)}`);
+  }
+  if (livePriceLines.length === 0) return "  (Sin datos WS — pulsea API o reporta a Luis)";
+  return livePriceLines.join("\n") + `\nSnapshot: ${new Date().toISOString().slice(11,19)}Z`;
+})()}
+⚠️ Cuando cites niveles técnicos (soporte, resistencia, ruptura), úsalos del precio LIVE arriba — NUNCA inventes desde memoria. Tus 171 lessons tienen niveles del pasado que YA NO SON los de ahora. Si BTC arriba dice $81k, no menciones niveles de 67k — esos son del 2024.
+
 === POSICIONES BYBIT (API) ===
 ${bybitPositionsLines}${hedgeAdvisoryLine}
 
