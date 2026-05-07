@@ -4488,6 +4488,37 @@ function simCalcQty(symbol: string, capitalUSDT: number, leverage: number, price
   return stepped.toFixed(rule.dp);
 }
 
+// PR #27 — Snapshot batch de precios live para inyectar al chat-context.
+// Una sola llamada REST a Bybit cada 30s pulsa TODOS los tickers linear y
+// los cachea. Esto resuelve el problema de getWsPrice() que solo devuelve
+// precio si el WS está suscrito al símbolo (lo cual NO incluye BTC/ETH/SOL
+// si no hay posiciones abiertas en ellos). Tanit citaba precios obsoletos
+// (BTC en 67k cuando real es 81k) porque su inject veía "(Sin datos WS)".
+let _priceSnapshotCache: { data: Record<string, number>; updatedAt: number } = { data: {}, updatedAt: 0 };
+const PRICE_SNAPSHOT_TTL_MS = 30 * 1000;
+async function getLivePriceSnapshot(symbols: string[]): Promise<Record<string, number>> {
+  const now = Date.now();
+  if (now - _priceSnapshotCache.updatedAt < PRICE_SNAPSHOT_TTL_MS && Object.keys(_priceSnapshotCache.data).length > 0) {
+    return _priceSnapshotCache.data;
+  }
+  try {
+    // Una sola call que retorna TODOS los linear tickers — más eficiente que N calls
+    const d = await bybitPublic("GET", "/v5/market/tickers", { category: "linear" });
+    const list = d?.result?.list ?? [];
+    const data: Record<string, number> = {};
+    for (const t of list) {
+      const sym = String(t.symbol);
+      const px = parseFloat(t.lastPrice);
+      if (sym && px > 0) data[sym] = px;
+    }
+    _priceSnapshotCache = { data, updatedAt: now };
+    return data;
+  } catch (e) {
+    console.error(TAG, "[PRICE-SNAPSHOT] error fetching tickers:", e);
+    return _priceSnapshotCache.data; // fallback al cache anterior aunque expired
+  }
+}
+
 async function getPrice(symbol: string): Promise<number | null> {
   // WebSocket primero — sin HTTP, sin latencia
   const wsPrice = getWsPrice(symbol);
@@ -5330,6 +5361,14 @@ ${_critCoreIdentity.map(m => `  • ${m.content}`).join("\n\n")}`
   const liquidationsStr = cascadeLines.length > 0
     ? cascadeLines.join("\n")
     : "  (Sin cascadas de liquidación detectadas en este momento)";
+
+  // ── PR #27 — Snapshot de precios live para inyectar al chat-context ──
+  // Awaited aquí para tenerlo disponible en el template del prompt (sync).
+  // Una sola call REST a Bybit cada 30s vía cache.
+  const _priceSnapshot = await getLivePriceSnapshot([
+    "BTCUSDT","ETHUSDT","SOLUSDT","TONUSDT","XRPUSDT","DOGEUSDT","BNBUSDT",
+    "ADAUSDT","AVAXUSDT","LINKUSDT","LTCUSDT","ATOMUSDT","TRXUSDT","SUIUSDT","BCHUSDT",
+  ]);
 
   // ── Eventos guardrail recientes — Tanit ve cuándo el sistema la corrigió ─
   const recentGuardrails = await getRecentGuardrailEvents(5);
@@ -6291,18 +6330,18 @@ Motor: $${bal.toFixed(4)} USDT | REAL 🔴 BYBIT MAINNET | Bot: ${state.active ?
 PnL sesión: ${sessionPnlStr} | Win rate: ${winRate !== null ? winRate + "% (" + state.tradeLog.length + " trades)" : "sin trades"}
 PnL total: ${totalPnlSession >= 0 ? "+" : ""}$${totalPnlSession.toFixed(4)}
 
-=== 💰 PRECIOS LIVE (Bybit WS — USA ESTOS, no tu memoria) ===
+=== 💰 PRECIOS LIVE (Bybit REST — snapshot 30s, USA ESTOS, no tu memoria) ===
 ${(() => {
   const livePriceLines: string[] = [];
   const priceTopSymbols = ["BTCUSDT","ETHUSDT","SOLUSDT","TONUSDT","XRPUSDT","DOGEUSDT","BNBUSDT","ADAUSDT","AVAXUSDT","LINKUSDT","LTCUSDT","ATOMUSDT","TRXUSDT","SUIUSDT","BCHUSDT"];
   for (const sym of priceTopSymbols) {
-    const p = getWsPrice(sym);
+    const p = _priceSnapshot[sym];
     if (p && p > 0) livePriceLines.push(`  ${sym.replace("USDT","").padEnd(6)} $${p.toFixed(p > 100 ? 2 : 4)}`);
   }
-  if (livePriceLines.length === 0) return "  (Sin datos WS — pulsea API o reporta a Luis)";
+  if (livePriceLines.length === 0) return "  (Snapshot vacío — Bybit REST no respondió, reporta a Luis)";
   return livePriceLines.join("\n") + `\nSnapshot: ${new Date().toISOString().slice(11,19)}Z`;
 })()}
-⚠️ Cuando cites niveles técnicos (soporte, resistencia, ruptura), úsalos del precio LIVE arriba — NUNCA inventes desde memoria. Tus 171 lessons tienen niveles del pasado que YA NO SON los de ahora. Si BTC arriba dice $81k, no menciones niveles de 67k — esos son del 2024.
+⚠️ ESTOS SON LOS PRECIOS REALES AHORA MISMO. Cuando cites niveles técnicos (soporte, resistencia, ruptura, target, invalidación), úsalos a partir del precio LIVE de arriba — NUNCA inventes desde memoria ni desde lessons antiguas. Si BTC arriba dice $81,290, tus niveles relevantes son ±2-3% de ese precio (ej: soporte $80,500, resistencia $82,800). NO cites $67k — eso es de 2024 y YA NO ES el precio. Si Tanit cita un nivel, debe estar dentro del rango ±5% del precio LIVE.
 
 === POSICIONES BYBIT (API) ===
 ${bybitPositionsLines}${hedgeAdvisoryLine}
