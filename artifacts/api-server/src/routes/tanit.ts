@@ -275,18 +275,26 @@ router.get("/tanit/api-diagnostics", async (_req, res): Promise<void> => {
     } catch (e: any) { results.gemini.error = String(e?.message ?? e); }
   }
 
-  // OpenAI
+  // OpenAI — test REAL con completion mínima (detecta falta de saldo)
+  // PR #35: antes pulseaba /v1/models que es público sin gastar — daba falso ✅
+  // aunque OpenAI no tuviera saldo. Ahora hacemos chat completion 5 tokens.
   const openaiKey = process.env.OPENAI_API_KEY;
   results.openai = { configured: !!openaiKey, reachable: false };
   if (openaiKey) {
     const start = Date.now();
     try {
-      const r = await fetch("https://api.openai.com/v1/models", {
-        headers: { Authorization: `Bearer ${openaiKey}` }, signal: AbortSignal.timeout(8000),
+      const r = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${openaiKey}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ model: "gpt-4o-mini", max_tokens: 5, messages: [{ role: "user", content: "ping" }] }),
+        signal: AbortSignal.timeout(15000),
       });
       results.openai.reachable = r.ok;
       results.openai.latency_ms = Date.now() - start;
-      if (!r.ok) results.openai.error = `HTTP ${r.status}`;
+      if (!r.ok) {
+        const body = await r.text().catch(() => "");
+        results.openai.error = `HTTP ${r.status} ${body.slice(0,150)}`;
+      }
     } catch (e: any) { results.openai.error = String(e?.message ?? e); }
   }
 
