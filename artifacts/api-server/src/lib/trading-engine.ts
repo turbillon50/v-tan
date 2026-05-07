@@ -2225,6 +2225,26 @@ let PAUSE_WR_THRESHOLD = 40;    // si WR < 40%, pausar
 let PAUSE_DURATION_MIN = 30;    // pausa de 30 min
 let _pauseUntil = 0;            // timestamp ms — 0 = no pausa
 
+// PR#21 (audit#4) — Freeze duro por drawdown desde peak en últimos 60min.
+// Cuando equity cae >8% desde el peak rolling, NO abrir nuevas posiciones
+// hasta que se recupere. Independiente del daily breaker (que mide PnL del día
+// UTC). Este mide tu peak intra-sesión: si tocaste $158 y bajaste a $145, ya
+// estás en -8.2% rolling → freeze.
+const _equityPeakWindow: { ts: number; equity: number }[] = [];
+function checkEquityFreezeFromPeak(): { frozen: boolean; ddPct: number; peak: number; current: number } {
+  const eq = state.liveMode ? (state.liveBalance ?? 0) : (state.simBalance ?? 0);
+  const now = Date.now();
+  if (eq > 0) _equityPeakWindow.push({ ts: now, equity: eq });
+  // Mantener solo última hora
+  while (_equityPeakWindow.length > 0 && now - _equityPeakWindow[0].ts > 60 * 60 * 1000) {
+    _equityPeakWindow.shift();
+  }
+  if (_equityPeakWindow.length < 2 || eq <= 0) return { frozen: false, ddPct: 0, peak: eq, current: eq };
+  const peak = _equityPeakWindow.reduce((m, p) => p.equity > m ? p.equity : m, 0);
+  const ddPct = peak > 0 ? ((peak - eq) / peak) * 100 : 0;
+  return { frozen: ddPct > 8, ddPct, peak, current: eq };
+}
+
 function getCurrentMarginHeatPct(): number {
   const equity = state.liveMode ? (state.liveBalance ?? 0) : (state.simBalance ?? 0);
   const available = state.liveAvailable ?? equity;
@@ -2397,7 +2417,11 @@ function isBtcInFreeFall(): boolean {
 let _drawdownProtectionActive     = false;  // flag cuando está activo
 let _drawdownProtectionBonus      = 0;      // puntos adicionales añadidos al umbral base
 let DRAWDOWN_CONSECUTIVE_TRIGGER  = 8;      // configurable via drawdown_trigger — 8 pérdidas seguidas para activar
-let DRAWDOWN_CONFIDENCE_BOOST     = 0;      // sin boost — las pérdidas son aprendizaje, no razón para congelarse
+// PR#21 (audit#4) — antes era 0 con comentario "las pérdidas son aprendizaje".
+// Pero el drawdown protection se activaba (logs, telegram) sin BOOST real → era
+// puramente decorativo. Ahora +12pts a MIN_ENTRY_CONFIDENCE en drawdown protege
+// de seguir cavando con señales marginales. Tanit puede tunear runtime.
+let DRAWDOWN_CONFIDENCE_BOOST     = 12;
 let DRAWDOWN_PCT_WINDOW           = 10;     // configurable via drawdown_pct_window (últimos N trades)
 let DRAWDOWN_PCT_TRIGGER          = 5.0;    // configurable via drawdown_pct_trigger (% pérdida en ventana, default 5%)
 
@@ -2781,6 +2805,12 @@ async function escaleraOpenLayer(
     console.log(TAG, `[ESCALERA] Apertura bloqueada por pausa-WR — ${remainingMin}min restantes`);
     return null;
   }
+  // ── PR#21 (audit#4) — Freeze por drawdown desde peak 60min ─────────────
+  const freezeStatus = checkEquityFreezeFromPeak();
+  if (freezeStatus.frozen) {
+    console.log(TAG, `[ESCALERA] FREEZE peak-8%: equity $${freezeStatus.current.toFixed(2)} vs peak60min $${freezeStatus.peak.toFixed(2)} (-${freezeStatus.ddPct.toFixed(1)}%) — no abrir`);
+    return null;
+  }
   const tier = ESCALERA_TIERS[tierIdx];
   const baseBalance = state.liveMode ? (state.liveBalance ?? 0) : state.simBalance;
   const smartSlots = calcSmartSlots(baseBalance);
@@ -2890,7 +2920,7 @@ async function escaleraOpenLayer(
       dynLevNote += ` highVol×${LEV_HIGH_VOL_FACTOR}`;
     }
   }
-  const layerCapital = baseMarginPerPos * volSizingFactor * dynLevFactor;
+  let layerCapital = baseMarginPerPos * volSizingFactor * dynLevFactor;
   if (dynLevNote) console.log(TAG, `[DYN-LEV] ${sym}${dynLevNote} → capital ×${dynLevFactor.toFixed(2)} = $${layerCapital.toFixed(2)}`);
   if (capitalFree < layerCapital * 0.9) {
     // Si no hay capital suficiente, no abrir
@@ -2913,6 +2943,22 @@ async function escaleraOpenLayer(
     slPct = Math.min(maxSlPricePct, Math.max(0.005, atrSlPct));
   }
   const sl = direction === "LONG" ? price * (1 - slPct) : price * (1 + slPct);
+
+  // PR#21 (audit#5) — HARD CAP riesgo por trade (anti-Kelly+dyn-lev acumulación).
+  // Industria: max 1-2% del equity por trade. Pero Kelly mult ×1.50 + dyn-lev
+  // win streak ×1.10 + lev progresivo 5x→10x escalan el riesgo real hasta 3-4%
+  // del equity por trade. Con 5 losses seguidas = 15-20% del equity (lo que
+  // estamos viendo). Cap duro: expected_loss = layerCapital × effLev × slPct
+  // no puede pasar del 1.5% del equity. Si pasa, se escala layerCapital.
+  const equityForRiskCap = state.liveMode ? (state.liveBalance ?? 1) : (state.simBalance ?? 1);
+  const MAX_RISK_PER_TRADE_PCT = 0.015;  // 1.5%
+  const expectedLossUsd = layerCapital * effLev * slPct;
+  if (expectedLossUsd / equityForRiskCap > MAX_RISK_PER_TRADE_PCT) {
+    const scale = (equityForRiskCap * MAX_RISK_PER_TRADE_PCT) / expectedLossUsd;
+    const newCap = Math.max(MARGIN_PER_POS, layerCapital * scale);
+    console.log(TAG, `[RISK-CAP] ${sym} margen $${layerCapital.toFixed(2)}→$${newCap.toFixed(2)} (cap 1.5% equity=$${equityForRiskCap.toFixed(2)}, expectedLoss $${expectedLossUsd.toFixed(2)}→$${(newCap*effLev*slPct).toFixed(2)})`);
+    layerCapital = newCap;
+  }
 
   // ── TP automático — objetivo real que el mercado puede alcanzar ──────────
   // Prioridad: manualTpPct > ATR×3 > sin TP
@@ -2959,6 +3005,26 @@ async function escaleraOpenLayer(
     }
     await bybitSwitchPositionMode(sym, 3);
     await safeSetLeverage(sym, effLev);
+
+    // PR#21 (audit#3) — SPREAD PRE-GATE antes de market order.
+    // Logs reales del 7-may: SOL -$1.05 y ADA -$0.46 en hold=0min vinieron de
+    // slippage masivo (libro ilíquido durante volatilidad). Una market order
+    // de $50 nominal en libro fino atraviesa 3-4 niveles. Spread > 0.06% es
+    // señal de iliquidez/volatilidad — abortar. round-trip taker = 0.11%, si
+    // ya el spread es 0.06%+ el slippage típico mata el edge.
+    try {
+      const tk = await getBybitTicker(sym);
+      if (tk && tk.bid1Price > 0 && tk.ask1Price > 0) {
+        const mid = (tk.bid1Price + tk.ask1Price) / 2;
+        const spreadPct = ((tk.ask1Price - tk.bid1Price) / mid) * 100;
+        const SPREAD_MAX_ENTRY = 0.06;
+        if (spreadPct > SPREAD_MAX_ENTRY) {
+          console.log(TAG, `[ESCALERA] ${sym} BLOQUEADO — spread ${spreadPct.toFixed(3)}% > ${SPREAD_MAX_ENTRY}% (libro fino)`);
+          return null;
+        }
+      }
+    } catch {}
+
     const side = direction === "LONG" ? "Buy" : "Sell";
     const posIdx = direction === "LONG" ? 1 : 2;
     const orderId = await bybitPlaceOrder(sym, side, realQty, false, posIdx);
@@ -3905,8 +3971,21 @@ async function escaleraV2Scan(): Promise<void> {
         .filter(s => (getWsPrice(s) ?? 0) > 0)
         .filter(s => canSymbolTradeCapa1(s, MAX_CONCURRENT_POSITIONS));
 
+      // PR#21 (audit#1) — Ranking por edge ANTES de procesar.
+      // Antes los candidatos iban en orden FIFO de ALL_SYMBOLS → BTC siempre primero,
+      // TON octavo. Si BTC neutral pero ADA tenía score 95, ADA jamás entraba.
+      // Resultado: concentración brutal en TON/símbolos tempranos del array.
+      // Ahora ordenamos por edge magnitude = max(score, 100-score). Score directional
+      // 50 = neutro, 100 = LONG fuerte, 0 = SHORT fuerte. Ambos extremos son edge.
+      const ranked = candidates.map(s => {
+        const sig = state.lastSignals[s];
+        const score = sig ? Math.max(sig.score ?? 50, 100 - (sig.score ?? 50)) : 0;
+        return { sym: s, edge: score };
+      });
+      ranked.sort((a, b) => b.edge - a.edge);
+
       // Procesar candidatos UNO A UNO — abre uno, verifica slots, continúa
-      for (const sym of candidates) {
+      for (const { sym } of ranked) {
         if (countOpenPositions() >= MAX_CONCURRENT_POSITIONS) break;
         if (isSymbolOpen(sym)) continue;  // doble-chequeo anti-stack antes de cada apertura
         const inst = getOrCreateInst(sym);
@@ -7661,6 +7740,41 @@ async function getSignalDirection(symbol: string): Promise<{ direction: "LONG" |
     const minAtr = leverage >= 100 ? 0.06 : leverage >= 50 ? 0.04 : 0.03;
     if (atrPct < minAtr) {
       return { direction: "NEUTRAL", score: 50, reasons: [`ATR ${atrPct.toFixed(3)}% — mercado plano, sin momentum`], holdMinutes: 15, dailyRegime: "normal", fibTPLong: [], fibTPShort: [], fibLevel: null, sessionName: "unknown", atr14h: 0, confluenceCount: 0, confluenceFactors: [] };
+    }
+
+    // ── PASO 0.5 (PR#21 audit#2): WICK EXHAUSTION + ATR-RECORRIDO ─────
+    // El score viene de kline 15m. La vela 15m vive 15min sin cerrar; el score
+    // 100 puede aparecer en el minuto 14 cuando el momentum YA se consumió.
+    // Logs reales mostraron entradas con score=100 que perdieron de inmediato
+    // (entras en el TOP). Detectamos:
+    //   (a) Wick contraria >55% del rango → comprador/vendedor agotado.
+    //   (b) Vela actual recorrió >1.5×ATR → entrada tardía, dampear convicción.
+    // closes/highs/lows están en orden cronológico ascendente tras .reverse().
+    const lastIdx = closes.length - 1;
+    if (lastIdx >= 0) {
+      const curOpen  = opens15[lastIdx];
+      const curHigh  = highs[lastIdx];
+      const curLow   = lows[lastIdx];
+      const curClose = closes[lastIdx];
+      const curRange = curHigh - curLow;
+      if (curRange > 0) {
+        const upperWick = curHigh - Math.max(curOpen, curClose);
+        const lowerWick = Math.min(curOpen, curClose) - curLow;
+        if (upperWick / curRange > 0.55) {
+          score -= 18;
+          reasons.push(`EXHAUSTION wick superior ${((upperWick/curRange)*100).toFixed(0)}% — comprador agotado`);
+        }
+        if (lowerWick / curRange > 0.55) {
+          score += 18;
+          reasons.push(`EXHAUSTION wick inferior ${((lowerWick/curRange)*100).toFixed(0)}% — vendedor agotado`);
+        }
+        if (atr > 0 && curRange > atr * 1.5) {
+          // Vela ya recorrió mucho → entrada tardía → dampear convicción al 60%
+          const oldScore = score;
+          score = 50 + (score - 50) * 0.6;
+          reasons.push(`Vela 15m recorrió ${(curRange/atr).toFixed(1)}×ATR — convicción ${oldScore}→${score.toFixed(0)} (entrada tardía)`);
+        }
+      }
     }
 
     // ── PASO 1: TENDENCIA 1H — el marco que manda (+20 / -20) ───────
