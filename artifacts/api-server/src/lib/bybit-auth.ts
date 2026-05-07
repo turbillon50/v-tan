@@ -119,9 +119,13 @@ export async function bybitPrivate(
   await acquireToken(category);
   trackCall();
 
-  // PR #39 — direct mode preferido. Proxy solo si FORCE_PROXY=1 (fallback).
-  const useProxy    = !!process.env.BYBIT_PROXY_URL && process.env.FORCE_PROXY === "1";
+  // PR #40 — fallback inteligente: si no hay bybit_key/secret accesibles,
+  // usar proxy automáticamente (donde sí viven). Sin requerir FORCE_PROXY.
+  const directKey   = await getKey("bybit_key");
+  const directSec   = await getKey("bybit_secret");
+  const hasDirect   = !!(directKey && directSec);
   const proxyUrl    = process.env.BYBIT_PROXY_URL;
+  const useProxy    = !!proxyUrl && (process.env.FORCE_PROXY === "1" || !hasDirect);
   const proxySecret = (await getKey("proxy_secret")) ?? "";
 
   for (let attempt = 1; attempt <= 2; attempt++) {
@@ -148,9 +152,9 @@ export async function bybitPrivate(
 
         result = await res.json();
       } else {
-        const key    = (await getKey("bybit_key"))    ?? "";
-        const secret = (await getKey("bybit_secret")) ?? "";
-        if (!key || !secret) throw new Error("bybit_key / bybit_secret no configurados (DB o env)");
+        const key    = directKey ?? "";
+        const secret = directSec ?? "";
+        if (!key || !secret) throw new Error("bybit_key / bybit_secret no configurados (DB, env o proxy)");
 
         const ts = Date.now().toString();
         let url    = `${getBaseUrl()}${path}`;
@@ -214,9 +218,15 @@ export async function bybitPublic(
   path: string,
   params: Record<string, unknown> = {}
 ): Promise<any> {
-  // Public endpoints: si FORCE_PROXY=1 los pasamos por proxy también
-  if (process.env.BYBIT_PROXY_URL && process.env.FORCE_PROXY === "1") {
-    return bybitPrivate(method, path, params);
+  // PR #40 — public endpoints: si tenemos proxy y NO tenemos keys directas,
+  // los pasamos por proxy también (consistente con private). Si tenemos keys
+  // directas, vamos directo (más rápido, sin auth necesaria para market data).
+  if (process.env.BYBIT_PROXY_URL) {
+    const dKey = await getKey("bybit_key");
+    const dSec = await getKey("bybit_secret");
+    if (process.env.FORCE_PROXY === "1" || !(dKey && dSec)) {
+      return bybitPrivate(method, path, params);
+    }
   }
 
   await acquireToken("public");
