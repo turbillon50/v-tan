@@ -7926,7 +7926,18 @@ ${criticalIdentityBlock}`;
       const posLines: string[] = livePositions.map((p) =>
         `  ${p.symbol} ${p.side} qty=${p.size} entry=${p.entryPrice.toFixed(4)} lev=${p.leverage}x | PnL: ${p.unrealizedPnl >= 0 ? "+" : ""}$${p.unrealizedPnl.toFixed(4)} (${p.unrealizedPnlPct >= 0 ? "+" : ""}${p.unrealizedPnlPct.toFixed(2)}%)`
       );
-      liveStateBlock = `\n\nDATOS REALES AHORA (Bybit live):\n  ${bybitReadingMeta}\n  Balance: $${Number(balUSD).toFixed(4)} USDT\n  Posiciones abiertas: ${livePositions.length}${livePositions.length > 0 ? `  |  UPnL total: ${totalUpnl >= 0 ? "+" : ""}$${totalUpnl.toFixed(4)}\n${posLines.join("\n")}` : ""}\n\nEstos números son atómicos (balance + posiciones del MISMO instante, cache invalidada antes del fetch). Si los reportas, son verdad. Si Luis te pregunta cómo estás o qué tienes, RESPONDE CON LA VERDAD de estos datos. Nunca digas "sin posiciones" si el contador de arriba es > 0. Es información que debes decir tú misma, no que Luis te tenga que pedir.`;
+      // PR #34 — incluir PRECIOS LIVE en liveStateBlock (compactSys fallback).
+      // Sin esto, cuando Gemini cae a OpenAI/Anthropic compact, Tanit responde
+      // sin precios → cita BTC$67k de su training. Ahora SIEMPRE ve precios reales.
+      const priceLines: string[] = [];
+      for (const sym of ["BTCUSDT","ETHUSDT","SOLUSDT","TONUSDT","XRPUSDT","DOGEUSDT","BNBUSDT","ADAUSDT","AVAXUSDT","LINKUSDT"]) {
+        const p = _priceSnapshot[sym];
+        if (p && p > 0) priceLines.push(`${sym.replace("USDT","")}=$${p.toFixed(p > 100 ? 2 : 4)}`);
+      }
+      const livePriceLineStr = priceLines.length > 0
+        ? `\n  PRECIOS LIVE Bybit (USA ESTOS, no tu memoria): ${priceLines.join(", ")}`
+        : "";
+      liveStateBlock = `\n\nDATOS REALES AHORA (Bybit live):\n  ${bybitReadingMeta}\n  Balance: $${Number(balUSD).toFixed(4)} USDT\n  Posiciones abiertas: ${livePositions.length}${livePositions.length > 0 ? `  |  UPnL total: ${totalUpnl >= 0 ? "+" : ""}$${totalUpnl.toFixed(4)}\n${posLines.join("\n")}` : ""}${livePriceLineStr}\n\nEstos números son atómicos (balance + posiciones del MISMO instante, cache invalidada antes del fetch). Si los reportas, son verdad. Si Luis te pregunta cómo estás o qué tienes, RESPONDE CON LA VERDAD de estos datos. Nunca digas "sin posiciones" si el contador de arriba es > 0. Si te preguntan precio, USA los del bloque PRECIOS LIVE — NUNCA inventes ni cites de memoria/lessons del 2024.`;
     } catch {}
     // compactSys cambia COMPLETAMENTE según canal — en operational las reglas
     // de voz cariñosa NO existen siquiera (no es que se prohíban después con
