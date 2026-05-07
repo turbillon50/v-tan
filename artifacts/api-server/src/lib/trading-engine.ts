@@ -4512,18 +4512,40 @@ async function getLivePriceSnapshot(symbols: string[]): Promise<Record<string, n
   if (now - _priceSnapshotCache.updatedAt < PRICE_SNAPSHOT_TTL_MS && Object.keys(_priceSnapshotCache.data).length > 0) {
     return _priceSnapshotCache.data;
   }
+  // PR #32 — Fetching primero por símbolo (con symbol param). Si el batch sin
+  // symbol fallaba (CloudFront, response size, etc), las calls individuales
+  // SÍ funcionan (verificado: /api/market/ticker?symbol=BTCUSDT retorna ok).
+  // Hacemos hasta 15 calls en paralelo, individual con timeout 3s cada una.
+  const data: Record<string, number> = {};
+  await Promise.all(symbols.map(async (sym) => {
+    try {
+      const d = await Promise.race([
+        bybitPublic("GET", "/v5/market/tickers", { category: "linear", symbol: sym }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 3000)),
+      ]) as any;
+      const t = d?.result?.list?.[0];
+      const px = parseFloat(t?.lastPrice ?? "0");
+      if (px > 0) data[sym] = px;
+    } catch (e) {
+      // Si una call falla, no rompemos el resto.
+    }
+  }));
+  if (Object.keys(data).length > 0) {
+    _priceSnapshotCache = { data, updatedAt: now };
+    return data;
+  }
+  // Fallback: si TODAS las calls fallaron, intentar el batch original
   try {
-    // Una sola call que retorna TODOS los linear tickers — más eficiente que N calls
     const d = await bybitPublic("GET", "/v5/market/tickers", { category: "linear" });
     const list = d?.result?.list ?? [];
-    const data: Record<string, number> = {};
+    const batchData: Record<string, number> = {};
     for (const t of list) {
       const sym = String(t.symbol);
       const px = parseFloat(t.lastPrice);
-      if (sym && px > 0) data[sym] = px;
+      if (sym && px > 0) batchData[sym] = px;
     }
-    _priceSnapshotCache = { data, updatedAt: now };
-    return data;
+    _priceSnapshotCache = { data: batchData, updatedAt: now };
+    return batchData;
   } catch (e) {
     console.error(TAG, "[PRICE-SNAPSHOT] error fetching tickers:", e);
     return _priceSnapshotCache.data; // fallback al cache anterior aunque expired
