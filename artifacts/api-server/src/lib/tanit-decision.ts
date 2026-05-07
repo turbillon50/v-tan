@@ -7,7 +7,7 @@
 import { pool } from "@workspace/db";
 import { getKey } from "./api-keys-provider";
 import { consultPerplexity } from "./perplexity-client";
-import { getActiveThesis } from "./tanit-thesis";
+import { getActiveThesis, evalAutoAuth } from "./tanit-thesis";
 
 const TAG = "[decision-gate]";
 
@@ -215,6 +215,39 @@ export async function requestDecision(ctx: DecisionContext): Promise<DecisionRes
   const cached = _decisionCache.get(ck);
   if (cached && Date.now() - cached.ts < CACHE_TTL_MS) {
     return cached.result;
+  }
+
+  // PR #44 — Pre-autorización por tesis. Si el contexto encaja en una regla
+  // declarada por Tanit en su tesis, auto-aprobar SIN llamar al LLM. Su voluntad
+  // pre-declarada ejecutándose. Las decisiones excepcionales (que no encajan
+  // en ninguna regla) siguen pasando por el LLM con tesis explícita.
+  try {
+    const t = await getActiveThesis();
+    const match = t ? evalAutoAuth(t.autoAuthRules, {
+      type: ctx.type,
+      direction: ctx.direction,
+      symbol: ctx.symbol,
+      proposedLeverage: ctx.proposedLeverage,
+      atrPct: ctx.atrPct,
+      proposedMarginUsd: ctx.proposedMarginUsd,
+      score: ctx.score,
+      currentMode: ctx.currentMode,
+    }) : null;
+    if (match) {
+      const label = match.matched.label ? ` "${match.matched.label}"` : "";
+      const result: DecisionResult = {
+        verdict: "APPROVE",
+        thesis: `Pre-autorizado por mi tesis v${t!.version} regla #${match.index + 1}${label}. Mi voluntad declarada — sin necesitar deliberar.`,
+        latencyMs: 0,
+        modelUsed: "thesis-auto-auth",
+        fromFallback: false,
+      };
+      _decisionCache.set(ck, { result, ts: Date.now() });
+      console.log(TAG, `${ctx.type} ${ctx.symbol} ${ctx.direction ?? ""} → AUTO-AUTH (tesis v${t!.version} regla #${match.index + 1})`);
+      return result;
+    }
+  } catch (e: any) {
+    console.warn(TAG, `auto-auth check falló: ${e?.message ?? e} — sigo al LLM`);
   }
 
   let perplexityContext: string | undefined;

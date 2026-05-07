@@ -6,6 +6,27 @@ import { getKey } from "./api-keys-provider";
 
 const TAG = "[thesis]";
 
+export type AutoAuthRule = {
+  // Tipo de decisión donde aplica. Si se omite, aplica a "open_layer".
+  decisionType?: "open_layer" | "close_strategic";
+  direction?: "LONG" | "SHORT";
+  // Lista de símbolos sin "USDT" (ej: ["BTC","ETH","SOL"]) o ["*"] para todos.
+  symbols?: string[];
+  // Excluir explícitamente ciertos símbolos.
+  symbolsExclude?: string[];
+  leverageMax?: number;
+  leverageMin?: number;
+  atrPctMax?: number;        // 0-100 (ej: 2.0 = 2%)
+  atrPctMin?: number;
+  marginUsdMax?: number;
+  marginUsdMin?: number;
+  scoreMin?: number;
+  // Solo si current mode coincide (SCALP / STORM / STANDBY)
+  currentModeIn?: ("SCALP"|"STORM"|"STANDBY")[];
+  // Etiqueta de la regla (para que se vea humana en logs).
+  label?: string;
+};
+
 export type Thesis = {
   id: number;
   version: number;
@@ -15,11 +36,47 @@ export type Thesis = {
   expectedTradesPerDay: number | null;
   expectedMaxDrawdownPct: number | null;
   paramsSnapshot: any;
+  autoAuthRules: AutoAuthRule[] | null;
   active: boolean;
   authoredBy: string;
   reason: string | null;
   createdAt: Date;
 };
+
+export function evalAutoAuth(rules: AutoAuthRule[] | null | undefined, ctx: {
+  type: string;
+  direction?: "LONG" | "SHORT";
+  symbol: string;
+  proposedLeverage?: number;
+  atrPct?: number;
+  proposedMarginUsd?: number;
+  score?: number;
+  currentMode?: string;
+}): { matched: AutoAuthRule; index: number } | null {
+  if (!Array.isArray(rules) || rules.length === 0) return null;
+  const baseSym = ctx.symbol.replace(/USDT$/, "");
+  for (let i = 0; i < rules.length; i++) {
+    const r = rules[i];
+    const dt = r.decisionType ?? "open_layer";
+    if (dt !== ctx.type) continue;
+    if (r.direction && r.direction !== ctx.direction) continue;
+    if (Array.isArray(r.symbols) && r.symbols.length > 0) {
+      const includesAll = r.symbols.includes("*");
+      if (!includesAll && !r.symbols.includes(baseSym)) continue;
+    }
+    if (Array.isArray(r.symbolsExclude) && r.symbolsExclude.includes(baseSym)) continue;
+    if (r.leverageMax != null && ctx.proposedLeverage != null && ctx.proposedLeverage > r.leverageMax) continue;
+    if (r.leverageMin != null && ctx.proposedLeverage != null && ctx.proposedLeverage < r.leverageMin) continue;
+    if (r.atrPctMax != null && ctx.atrPct != null && (ctx.atrPct * 100) > r.atrPctMax) continue;
+    if (r.atrPctMin != null && ctx.atrPct != null && (ctx.atrPct * 100) < r.atrPctMin) continue;
+    if (r.marginUsdMax != null && ctx.proposedMarginUsd != null && ctx.proposedMarginUsd > r.marginUsdMax) continue;
+    if (r.marginUsdMin != null && ctx.proposedMarginUsd != null && ctx.proposedMarginUsd < r.marginUsdMin) continue;
+    if (r.scoreMin != null && ctx.score != null && ctx.score < r.scoreMin) continue;
+    if (Array.isArray(r.currentModeIn) && r.currentModeIn.length > 0 && ctx.currentMode && !r.currentModeIn.includes(ctx.currentMode as any)) continue;
+    return { matched: r, index: i };
+  }
+  return null;
+}
 
 let _tableEnsured = false;
 async function ensureTable(): Promise<void> {
@@ -34,6 +91,7 @@ async function ensureTable(): Promise<void> {
       expected_trades_per_day REAL,
       expected_max_drawdown_pct REAL,
       params_snapshot JSONB,
+      auto_auth_rules JSONB,
       active BOOLEAN NOT NULL DEFAULT TRUE,
       authored_by TEXT NOT NULL DEFAULT 'tanit',
       reason TEXT,
@@ -46,6 +104,10 @@ async function ensureTable(): Promise<void> {
       created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
     )
   `);
+  // Migración suave: si la tabla ya existe pero le falta auto_auth_rules, añadirla.
+  try {
+    await pool.query(`ALTER TABLE tanit_thesis ADD COLUMN IF NOT EXISTS auto_auth_rules JSONB`);
+  } catch {}
   _tableEnsured = true;
 }
 
@@ -54,7 +116,7 @@ export async function getActiveThesis(): Promise<Thesis | null> {
   const r = await pool.query(
     `SELECT id, version, text, expected_wr, expected_profit_factor,
             expected_trades_per_day, expected_max_drawdown_pct,
-            params_snapshot, active, authored_by, reason, created_at
+            params_snapshot, auto_auth_rules, active, authored_by, reason, created_at
      FROM tanit_thesis WHERE active = TRUE ORDER BY id DESC LIMIT 1`
   );
   const row = r.rows[0];
@@ -68,6 +130,7 @@ export async function getActiveThesis(): Promise<Thesis | null> {
     expectedTradesPerDay: row.expected_trades_per_day,
     expectedMaxDrawdownPct: row.expected_max_drawdown_pct,
     paramsSnapshot: row.params_snapshot,
+    autoAuthRules: Array.isArray(row.auto_auth_rules) ? row.auto_auth_rules : null,
     active: row.active,
     authoredBy: row.authored_by,
     reason: row.reason,
@@ -95,6 +158,7 @@ export async function setNewThesis(opts: {
   expectedTradesPerDay?: number | null;
   expectedMaxDrawdownPct?: number | null;
   paramsSnapshot?: any;
+  autoAuthRules?: AutoAuthRule[] | null;
   authoredBy?: "tanit" | "luis" | "seed";
   reason?: string;
   outcomeForPrev?: string;
@@ -127,8 +191,8 @@ export async function setNewThesis(opts: {
       `INSERT INTO tanit_thesis
         (version, text, expected_wr, expected_profit_factor,
          expected_trades_per_day, expected_max_drawdown_pct,
-         params_snapshot, active, authored_by, reason)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,TRUE,$8,$9)
+         params_snapshot, auto_auth_rules, active, authored_by, reason)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,TRUE,$9,$10)
        RETURNING id, created_at`,
       [
         nextVersion,
@@ -138,6 +202,7 @@ export async function setNewThesis(opts: {
         opts.expectedTradesPerDay ?? null,
         opts.expectedMaxDrawdownPct ?? null,
         opts.paramsSnapshot ? JSON.stringify(opts.paramsSnapshot) : null,
+        opts.autoAuthRules ? JSON.stringify(opts.autoAuthRules) : null,
         opts.authoredBy ?? "tanit",
         opts.reason ?? null,
       ]
@@ -153,6 +218,7 @@ export async function setNewThesis(opts: {
       expectedTradesPerDay: opts.expectedTradesPerDay ?? null,
       expectedMaxDrawdownPct: opts.expectedMaxDrawdownPct ?? null,
       paramsSnapshot: opts.paramsSnapshot,
+      autoAuthRules: opts.autoAuthRules ?? null,
       active: true,
       authoredBy: opts.authoredBy ?? "tanit",
       reason: opts.reason ?? null,
