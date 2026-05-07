@@ -1,4 +1,5 @@
 import crypto from "crypto";
+import { getKey } from "./api-keys-provider";
 
 const BASE = "https://api.bybit.com";
 
@@ -7,11 +8,12 @@ function sign(payload: string, secret: string): string {
 }
 
 export async function bybitGet(path: string, params: Record<string, string> = {}): Promise<any> {
-  // Proxy mode: tunnel signed requests through the bybit-proxy service
-  // (keys live in the proxy, not here — better security separation)
-  const proxyUrl = process.env.BYBIT_PROXY_URL;
-  const proxySecret = process.env.PROXY_SECRET ?? "";
-  if (proxyUrl) {
+  // PR #39 — modo directo es el camino preferido. El proxy ya no es obligatorio
+  // (queda como fallback opcional si BYBIT_PROXY_URL está seteado y FORCE_PROXY=1).
+  const useProxy = !!process.env.BYBIT_PROXY_URL && process.env.FORCE_PROXY === "1";
+  if (useProxy) {
+    const proxyUrl = process.env.BYBIT_PROXY_URL!;
+    const proxySecret = (await getKey("proxy_secret")) ?? "";
     const r = await fetch(`${proxyUrl.replace(/\/$/, "")}/proxy`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-proxy-secret": proxySecret },
@@ -24,10 +26,10 @@ export async function bybitGet(path: string, params: Record<string, string> = {}
     return data.result;
   }
 
-  // Direct mode: api-server has the keys itself
-  const key    = process.env.BYBIT_API_KEY;
-  const secret = process.env.BYBIT_API_SECRET;
-  if (!key || !secret) throw new Error("No Bybit credentials (set BYBIT_PROXY_URL or BYBIT_API_KEY+SECRET)");
+  // Direct mode: api-server reads keys from DB (fallback env via provider)
+  const key    = await getKey("bybit_key");
+  const secret = await getKey("bybit_secret");
+  if (!key || !secret) throw new Error("No Bybit credentials (configura bybit_key/bybit_secret en tanit_api_keys o env)");
 
   const ts         = Date.now().toString();
   const recvWindow = "5000";
@@ -54,7 +56,8 @@ export async function bybitGet(path: string, params: Record<string, string> = {}
 }
 
 export function hasCredentials(): boolean {
-  // Either direct API keys or proxy URL counts as having credentials
+  // PR #39 — ahora la fuente principal es la DB. Sólo comprobamos env como
+  // señal de bootstrap; en runtime real getKey() resuelve DB-or-env.
   return !!(
     (process.env.BYBIT_API_KEY && process.env.BYBIT_API_SECRET) ||
     process.env.BYBIT_PROXY_URL

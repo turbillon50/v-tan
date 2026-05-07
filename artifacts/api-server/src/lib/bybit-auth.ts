@@ -1,4 +1,5 @@
 import { createHmac } from "crypto";
+import { getKey } from "./api-keys-provider";
 
 let useTestnet = true;
 const MAINNET_URL = "https://api.bybit.com";
@@ -9,9 +10,9 @@ export function setTestnet(enabled: boolean) { useTestnet = enabled; }
 export function isTestnet() { return useTestnet; }
 function getBaseUrl() { return useTestnet ? TESTNET_URL : MAINNET_URL; }
 
-function sign(secret: string, ts: string, payload: string): string {
+function sign(secret: string, ts: string, payload: string, apiKey: string): string {
   return createHmac("sha256", secret)
-    .update(ts + (process.env.BYBIT_API_KEY ?? "") + RECV_WINDOW + payload)
+    .update(ts + apiKey + RECV_WINDOW + payload)
     .digest("hex");
 }
 
@@ -118,14 +119,16 @@ export async function bybitPrivate(
   await acquireToken(category);
   trackCall();
 
+  // PR #39 — direct mode preferido. Proxy solo si FORCE_PROXY=1 (fallback).
+  const useProxy    = !!process.env.BYBIT_PROXY_URL && process.env.FORCE_PROXY === "1";
   const proxyUrl    = process.env.BYBIT_PROXY_URL;
-  const proxySecret = process.env.PROXY_SECRET ?? "";
+  const proxySecret = (await getKey("proxy_secret")) ?? "";
 
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
       let result: any;
 
-      if (proxyUrl) {
+      if (useProxy && proxyUrl) {
         const res = await fetch(`${proxyUrl.replace(/\/$/, "")}/proxy`, {
           method: "POST",
           headers: {
@@ -145,9 +148,9 @@ export async function bybitPrivate(
 
         result = await res.json();
       } else {
-        const key    = process.env.BYBIT_API_KEY    ?? "";
-        const secret = process.env.BYBIT_API_SECRET ?? "";
-        if (!key || !secret) throw new Error("BYBIT_API_KEY / BYBIT_API_SECRET no configurados");
+        const key    = (await getKey("bybit_key"))    ?? "";
+        const secret = (await getKey("bybit_secret")) ?? "";
+        if (!key || !secret) throw new Error("bybit_key / bybit_secret no configurados (DB o env)");
 
         const ts = Date.now().toString();
         let url    = `${getBaseUrl()}${path}`;
@@ -163,7 +166,7 @@ export async function bybitPrivate(
           payload = body;
         }
 
-        const sig = sign(secret, ts, payload);
+        const sig = sign(secret, ts, payload, key);
 
         const res = await fetch(url, {
           method,
@@ -211,8 +214,10 @@ export async function bybitPublic(
   path: string,
   params: Record<string, unknown> = {}
 ): Promise<any> {
-  const proxyUrl = process.env.BYBIT_PROXY_URL;
-  if (proxyUrl) return bybitPrivate(method, path, params);
+  // Public endpoints: si FORCE_PROXY=1 los pasamos por proxy también
+  if (process.env.BYBIT_PROXY_URL && process.env.FORCE_PROXY === "1") {
+    return bybitPrivate(method, path, params);
+  }
 
   await acquireToken("public");
   trackCall();
