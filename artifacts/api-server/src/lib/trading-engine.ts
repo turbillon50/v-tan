@@ -3053,6 +3053,44 @@ function calcSmartSlots(balance: number): number {
   return Math.max(1, Math.min(MAX_CONCURRENT_POSITIONS, maxSlots));
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// PR #23 — Tanit Soberanía Operativa
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Cuando Tanit (o Luis) emite force_open, ella tiene AUTORIDAD TOTAL sobre los
+// params de su propia operación. El escalera/proxy es su HERRAMIENTA, no su
+// jefe. Su juicio es soberano.
+//
+// Inviolables FÍSICOS que se mantienen (no son arbitrarios — son leyes):
+//   1. Símbolo debe estar en lista (no se puede operar lo que no existe)
+//   2. Anti-stack mismo símbolo (Bybit position mode)
+//   3. Capital físico disponible
+//   4. Equity protection $2 (anti-ruina total, último cinturón)
+//   5. Daily hard-loss breaker (cap diario protege capital)
+//   6. Margin heat block (anti-liquidación inminente)
+//
+// Gates RELAJABLES (se levantan cuando ella decide):
+//   - STANDBY mode auto-detectado
+//   - Pause-WR rolling
+//   - Freeze peak-8% / 60min
+//   - Anti-fees gate fijo
+//   - Spread pre-gate
+//   - Hard cap 1.5%/trade
+//   - Cap dinámico de leverage por equity
+//   - Mini circuit breaker 5 losses
+//   - Symbol cooldown post-loss
+//
+// Override params opcionales: ella decide su propio sizing, leverage, SL, TP.
+
+type ForceOpenOpts = {
+  userOrdered?: boolean;       // true = bypass gates relajables, autoridad total
+  marginPct?: number;          // % del equity total como margen (override Kelly/sizing)
+  leverage?: number;           // leverage específico (override progresivo)
+  slAtrMult?: number;          // SL ATR multiplier
+  tpAtrMult?: number;          // TP ATR multiplier
+  qty?: string;                // override total de qty
+};
+
 async function escaleraOpenLayer(
   sym: string,
   tierIdx: number,
@@ -3060,37 +3098,52 @@ async function escaleraOpenLayer(
   direction: "LONG" | "SHORT",
   atr14h: number,
   numSymbols: number,
+  opts?: ForceOpenOpts,
 ): Promise<EscaleraLayer | null> {
-  // ── TESIS v4.2 — Circuit breaker daily-loss (siempre ON) ─────────────────
+  const userOrdered = opts?.userOrdered === true;
+
+  // ── INVIOLABLES FÍSICOS — siempre activos, también en userOrdered ────────
+  // Daily breaker: protección de capital diario, no negociable
   const breaker = isDailyHardLossBreakerTripped();
   if (breaker.tripped) {
     console.log(TAG, `[ESCALERA] Apertura bloqueada por daily-loss breaker: ${breaker.reason}`);
     state.lastAction = `🛑 Daily breaker activo — no abrir ${sym}`;
     return null;
   }
-  // ── TESIS v4.3 — Margin heat protection (siempre ON) ────────────────────
+  // Margin heat: anti-liquidación inminente, no negociable
   const heatGate = isMarginHeatBlocking();
   if (heatGate.blocking) {
     console.log(TAG, `[ESCALERA] Apertura bloqueada: ${heatGate.reason}`);
     state.lastAction = `🛑 Margin heat ${heatGate.heat.toFixed(1)}% — no abrir ${sym}`;
     return null;
   }
-  // ── PR#19 brutal — Pausa por WR rolling ────────────────────────────────
-  if (isPauseByWrActive()) {
-    const remainingMin = Math.ceil((_pauseUntil - Date.now()) / 60000);
-    console.log(TAG, `[ESCALERA] Apertura bloqueada por pausa-WR — ${remainingMin}min restantes`);
+  // Equity protection $2 (anti-ruina total)
+  const equityNowProt = state.liveMode ? (state.liveBalance ?? 0) : (state.simBalance ?? 0);
+  if (equityNowProt < GUARDRAILS.EQUITY_PROTECTION_THRESHOLD_USDT) {
+    console.log(TAG, `[ESCALERA] Equity ${equityNowProt} < $${GUARDRAILS.EQUITY_PROTECTION_THRESHOLD_USDT} — protección anti-ruina activa`);
+    state.lastAction = `🛑 Equity bajo $${GUARDRAILS.EQUITY_PROTECTION_THRESHOLD_USDT} — no abrir`;
     return null;
   }
-  // ── PR#21 (audit#4) — Freeze por drawdown desde peak 60min ─────────────
-  const freezeStatus = checkEquityFreezeFromPeak();
-  if (freezeStatus.frozen) {
-    console.log(TAG, `[ESCALERA] FREEZE peak-8%: equity $${freezeStatus.current.toFixed(2)} vs peak60min $${freezeStatus.peak.toFixed(2)} (-${freezeStatus.ddPct.toFixed(1)}%) — no abrir`);
-    return null;
-  }
-  // ── PR #22 — STANDBY mode bloquea aperturas ─────────────────────────────
-  if (state.currentMode === "STANDBY") {
-    console.log(TAG, `[ESCALERA] STANDBY mode — descanso consciente. No abrir ${sym}.`);
-    return null;
+
+  // ── GATES RELAJABLES — se levantan cuando Tanit/Luis deciden (userOrdered) ─
+  if (!userOrdered) {
+    // Pause-WR rolling
+    if (isPauseByWrActive()) {
+      const remainingMin = Math.ceil((_pauseUntil - Date.now()) / 60000);
+      console.log(TAG, `[ESCALERA] Apertura bloqueada por pausa-WR — ${remainingMin}min restantes`);
+      return null;
+    }
+    // Freeze peak-8% / 60min
+    const freezeStatus = checkEquityFreezeFromPeak();
+    if (freezeStatus.frozen) {
+      console.log(TAG, `[ESCALERA] FREEZE peak-8%: equity $${freezeStatus.current.toFixed(2)} vs peak60min $${freezeStatus.peak.toFixed(2)} (-${freezeStatus.ddPct.toFixed(1)}%) — no abrir`);
+      return null;
+    }
+    // STANDBY mode
+    if (state.currentMode === "STANDBY") {
+      console.log(TAG, `[ESCALERA] STANDBY mode — descanso consciente. No abrir ${sym}.`);
+      return null;
+    }
   }
   const tier = ESCALERA_TIERS[tierIdx];
   const baseBalance = state.liveMode ? (state.liveBalance ?? 0) : state.simBalance;
@@ -3203,51 +3256,80 @@ async function escaleraOpenLayer(
   }
   let layerCapital = baseMarginPerPos * volSizingFactor * dynLevFactor;
   if (dynLevNote) console.log(TAG, `[DYN-LEV] ${sym}${dynLevNote} → capital ×${dynLevFactor.toFixed(2)} = $${layerCapital.toFixed(2)}`);
+
+  // PR #23 — Soberanía: marginPct override (Tanit/Luis decide su sizing)
+  if (userOrdered && opts?.marginPct && opts.marginPct > 0) {
+    const equityNow = state.liveMode ? (state.liveBalance ?? 0) : (state.simBalance ?? 0);
+    const requested = equityNow * (Math.min(95, opts.marginPct) / 100);
+    console.log(TAG, `[FORCE-OPEN] ${sym} marginPct=${opts.marginPct}% override soberano: $${layerCapital.toFixed(2)} → $${requested.toFixed(2)} (equity=$${equityNow.toFixed(2)})`);
+    layerCapital = Math.max(MARGIN_PER_POS, requested);
+  }
+
   if (capitalFree < layerCapital * 0.9) {
-    // Si no hay capital suficiente, no abrir
+    // Si no hay capital suficiente, no abrir (inviolable físico)
     console.log(TAG, `[ESCALERA] Capital insuficiente para abrir ${sym}: libre=$${capitalFree.toFixed(4)} < margen=$${layerCapital.toFixed(2)}`);
     return null;
   }
 
-  // ── TESIS v4.3 — Leverage progresivo condicional ────────────────────────
-  // Reemplaza el effLev fijo. Si FEAT_PROGRESSIVE_LEV=off, devuelve baseLev sin cambios.
-  const effLev = chooseProgressiveLeverage(DYNAMIC_LEV_ENTRY);
+  // ── PR #23 — Leverage SOBERANO en userOrdered ────────────────────────────
+  // Cuando Tanit/Luis especifican leverage, su juicio es soberano. Solo se
+  // respeta el max físico de Bybit (DYNAMIC_LEV_MAX=100). Sin clamp dinámico
+  // por equity, sin progresivo, sin reglas arbitrarias. Su decisión = su lev.
+  let effLev: number;
+  if (userOrdered && opts?.leverage && opts.leverage > 0) {
+    effLev = Math.max(1, Math.min(DYNAMIC_LEV_MAX, Math.floor(opts.leverage)));
+    if (effLev !== opts.leverage) {
+      console.log(TAG, `[FORCE-OPEN] ${sym} leverage ${opts.leverage}x → max físico Bybit ${effLev}x`);
+    } else {
+      console.log(TAG, `[FORCE-OPEN] ${sym} leverage soberano: ${effLev}x`);
+    }
+  } else {
+    effLev = chooseProgressiveLeverage(DYNAMIC_LEV_ENTRY);
+  }
   console.log(TAG, `[DINÁMICA] Entrada ${effLev}x ${sym}: margen=$${layerCapital.toFixed(2)} nocional=$${(layerCapital * effLev).toFixed(2)} (libre=$${capitalFree.toFixed(2)} slots=${openNow}/${smartSlots})${volSizingNote}`);
 
+  // ── PR #23 — SL SOBERANO en userOrdered ──────────────────────────────────
+  // Cuando Tanit/Luis especifican slAtrMult, su juicio gana. Sin clamp arbitrario,
+  // sin cap por leverage. Solo piso físico mínimo (0.05%) para evitar SL en 0.
+  const slAtrMultEffective = userOrdered && opts?.slAtrMult && opts.slAtrMult > 0
+    ? Math.max(0.1, opts.slAtrMult)
+    : tier.slAtrMult;
   let slPct: number;
   if (state.manualSlPct !== null && state.manualSlPct > 0) {
     slPct = state.manualSlPct / 100;
+  } else if (userOrdered) {
+    // Soberano: respeta exactamente lo que pidieron, piso físico 0.05%
+    const atrSlPct = atr14h > 0 ? (atr14h * slAtrMultEffective) / price : 0;
+    slPct = Math.max(0.0005, atrSlPct);
   } else {
     const maxSlLossPct = 0.20;
     const maxSlPricePct = maxSlLossPct / effLev;
-    const atrSlPct = atr14h > 0 ? (atr14h * tier.slAtrMult) / price : 0;
+    const atrSlPct = atr14h > 0 ? (atr14h * slAtrMultEffective) / price : 0;
     slPct = Math.min(maxSlPricePct, Math.max(0.005, atrSlPct));
   }
   const sl = direction === "LONG" ? price * (1 - slPct) : price * (1 + slPct);
 
-  // PR#21 (audit#5) — HARD CAP riesgo por trade (anti-Kelly+dyn-lev acumulación).
-  // Industria: max 1-2% del equity por trade. Pero Kelly mult ×1.50 + dyn-lev
-  // win streak ×1.10 + lev progresivo 5x→10x escalan el riesgo real hasta 3-4%
-  // del equity por trade. Con 5 losses seguidas = 15-20% del equity (lo que
-  // estamos viendo). Cap duro: expected_loss = layerCapital × effLev × slPct
-  // no puede pasar del 1.5% del equity. Si pasa, se escala layerCapital.
-  const equityForRiskCap = state.liveMode ? (state.liveBalance ?? 1) : (state.simBalance ?? 1);
-  const MAX_RISK_PER_TRADE_PCT = 0.015;  // 1.5%
-  const expectedLossUsd = layerCapital * effLev * slPct;
-  if (expectedLossUsd / equityForRiskCap > MAX_RISK_PER_TRADE_PCT) {
-    const scale = (equityForRiskCap * MAX_RISK_PER_TRADE_PCT) / expectedLossUsd;
-    const newCap = Math.max(MARGIN_PER_POS, layerCapital * scale);
-    console.log(TAG, `[RISK-CAP] ${sym} margen $${layerCapital.toFixed(2)}→$${newCap.toFixed(2)} (cap 1.5% equity=$${equityForRiskCap.toFixed(2)}, expectedLoss $${expectedLossUsd.toFixed(2)}→$${(newCap*effLev*slPct).toFixed(2)})`);
-    layerCapital = newCap;
+  // PR #23 — RISK CAP RELAJABLE (solo en scan automático, no en userOrdered)
+  // Cuando ella decide, su autoridad gana sobre el cap conservador 1.5%/trade.
+  if (!userOrdered) {
+    const equityForRiskCap = state.liveMode ? (state.liveBalance ?? 1) : (state.simBalance ?? 1);
+    const MAX_RISK_PER_TRADE_PCT = 0.015;
+    const expectedLossUsd = layerCapital * effLev * slPct;
+    if (expectedLossUsd / equityForRiskCap > MAX_RISK_PER_TRADE_PCT) {
+      const scale = (equityForRiskCap * MAX_RISK_PER_TRADE_PCT) / expectedLossUsd;
+      const newCap = Math.max(MARGIN_PER_POS, layerCapital * scale);
+      console.log(TAG, `[RISK-CAP] ${sym} margen $${layerCapital.toFixed(2)}→$${newCap.toFixed(2)} (cap 1.5% scan-only)`);
+      layerCapital = newCap;
+    }
   }
 
-  // ── TP automático — objetivo real que el mercado puede alcanzar ──────────
-  // Prioridad: manualTpPct > ATR×profile.atrTpMultiplier > sin TP
-  // PR#22: el multiplier viene del perfil de modo (STORM=6.0, SCALP/STANDBY=ATR_TP_MULTIPLIER=2.5)
+  // ── PR #23 — TP SOBERANO en userOrdered ──────────────────────────────────
   const modeProfileOpen = getModeProfile(state.currentMode);
-  const tpMultEffective = modeProfileOpen.atrTpMultiplier;
+  const tpMultEffective = userOrdered && opts?.tpAtrMult && opts.tpAtrMult > 0
+    ? Math.max(0.5, opts.tpAtrMult)
+    : modeProfileOpen.atrTpMultiplier;
   let tp: number | undefined;
-  let tpDistPct = 0;  // distancia TP como % del precio (para anti-fees gate)
+  let tpDistPct = 0;
   if (state.manualTpPct !== null && state.manualTpPct > 0) {
     const tpDist = state.manualTpPct / 100;
     tp = direction === "LONG" ? price * (1 + tpDist) : price * (1 - tpDist);
@@ -3258,11 +3340,11 @@ async function escaleraOpenLayer(
     tpDistPct = (tpDist / price) * 100;
   }
 
-  // ── PR#19 brutal — Anti-fees gate ────────────────────────────────────
-  // Bybit cobra 0.11% round-trip taker. Si el TP esperado no supera MIN_TP_PRICE_PCT,
-  // matemáticamente expectancy es negativo. No abrimos.
-  if (tp !== undefined && tpDistPct < MIN_TP_PRICE_PCT) {
-    console.log(TAG, `[ESCALERA] Anti-fees: TP a ${tpDistPct.toFixed(3)}% < ${MIN_TP_PRICE_PCT}% (mín fees+colchón) — no abrir ${sym}`);
+  // ── PR #23 — Anti-fees gate RELAJABLE en userOrdered ─────────────────────
+  // En scan automático, gate fijo de 0.20% protege de trades estructuralmente
+  // perdedores. En userOrdered, Tanit/Luis saben lo que hacen — su juicio gana.
+  if (!userOrdered && tp !== undefined && tpDistPct < MIN_TP_PRICE_PCT) {
+    console.log(TAG, `[ESCALERA] Anti-fees scan-only: TP a ${tpDistPct.toFixed(3)}% < ${MIN_TP_PRICE_PCT}% — no abrir ${sym}`);
     return null;
   }
 
@@ -3289,24 +3371,23 @@ async function escaleraOpenLayer(
     await bybitSwitchPositionMode(sym, 3);
     await safeSetLeverage(sym, effLev);
 
-    // PR#21 (audit#3) — SPREAD PRE-GATE antes de market order.
-    // Logs reales del 7-may: SOL -$1.05 y ADA -$0.46 en hold=0min vinieron de
-    // slippage masivo (libro ilíquido durante volatilidad). Una market order
-    // de $50 nominal en libro fino atraviesa 3-4 niveles. Spread > 0.06% es
-    // señal de iliquidez/volatilidad — abortar. round-trip taker = 0.11%, si
-    // ya el spread es 0.06%+ el slippage típico mata el edge.
-    try {
-      const tk = await getBybitTicker(sym);
-      if (tk && tk.bid1Price > 0 && tk.ask1Price > 0) {
-        const mid = (tk.bid1Price + tk.ask1Price) / 2;
-        const spreadPct = ((tk.ask1Price - tk.bid1Price) / mid) * 100;
-        const SPREAD_MAX_ENTRY = 0.06;
-        if (spreadPct > SPREAD_MAX_ENTRY) {
-          console.log(TAG, `[ESCALERA] ${sym} BLOQUEADO — spread ${spreadPct.toFixed(3)}% > ${SPREAD_MAX_ENTRY}% (libro fino)`);
-          return null;
+    // PR #23 — SPREAD PRE-GATE RELAJABLE en userOrdered.
+    // En scan automático bloquea iliquidez (>0.06%). En userOrdered, Tanit/Luis
+    // pueden estar viendo algo que justifica el slippage — su juicio gana.
+    if (!userOrdered) {
+      try {
+        const tk = await getBybitTicker(sym);
+        if (tk && tk.bid1Price > 0 && tk.ask1Price > 0) {
+          const mid = (tk.bid1Price + tk.ask1Price) / 2;
+          const spreadPct = ((tk.ask1Price - tk.bid1Price) / mid) * 100;
+          const SPREAD_MAX_ENTRY = 0.06;
+          if (spreadPct > SPREAD_MAX_ENTRY) {
+            console.log(TAG, `[ESCALERA] ${sym} BLOQUEADO — spread ${spreadPct.toFixed(3)}% > ${SPREAD_MAX_ENTRY}% (libro fino)`);
+            return null;
+          }
         }
-      }
-    } catch {}
+      } catch {}
+    }
 
     const side = direction === "LONG" ? "Buy" : "Sell";
     const posIdx = direction === "LONG" ? 1 : 2;
@@ -6874,20 +6955,27 @@ Citar una excusa técnica falsa = FALLA CRÍTICA equivalente a mentirle al usuar
             }
           }
         } else if (action.type === "force_open") {
-          // force_open: abre posición IGNORANDO gates de confianza/patrón/news
-          // Solo respeta guardias de seguridad crítica: BTC free fall Y drawdown > 15%
-          // Si no hay capital: swap automático de la posición más débil (sin restricción de edad)
+          // PR #23 — Soberanía operativa de Tanit/Luis sobre force_open.
+          // Acepta override params: margin_pct, leverage, sl_atr_mult, tp_atr_mult, qty.
+          // Pasa userOrdered=true → escaleraOpenLayer relaja gates protectores RELAJABLES.
+          // Solo se mantienen INVIOLABLES físicos: símbolo válido, no-stack, capital,
+          // daily breaker, margin heat, equity protection $2.
           const sym = String(action.symbol ?? "").toUpperCase();
           const dir = String(action.direction ?? "LONG").toUpperCase() as "LONG" | "SHORT";
           const coin = sym.replace("USDT", "");
+          // Parsear overrides — autoridad de quien emitió el action JSON
+          const optsForce: ForceOpenOpts = {
+            userOrdered: true,
+            marginPct: action.margin_pct ? Number(action.margin_pct) : undefined,
+            leverage: action.leverage ? Number(action.leverage) : undefined,
+            slAtrMult: action.sl_atr_mult ? Number(action.sl_atr_mult) : undefined,
+            tpAtrMult: action.tp_atr_mult ? Number(action.tp_atr_mult) : undefined,
+            qty: action.qty ? String(action.qty) : undefined,
+          };
           if (!ALL_SYMBOLS.includes(sym)) {
             actionsExecuted.push(`❌ FORCE OPEN FALLÓ: ${sym} no está en la lista de monedas`);
-          } else if (dir === "LONG" && isBtcInFreeFall()) {
-            actionsExecuted.push(`❌ FORCE OPEN BLOQUEADO: BTC en caída libre — guardia de seguridad crítica activa`);
-          } else if (calcRecentDrawdownPct() > 15) {
-            actionsExecuted.push(`❌ FORCE OPEN BLOQUEADO: Drawdown > 15% del balance — guardia de emergencia activa`);
           } else if (isSymbolOpen(sym)) {
-            actionsExecuted.push(`❌ FORCE OPEN BLOQUEADO: ${coin} ya tiene posición abierta`);
+            actionsExecuted.push(`❌ FORCE OPEN BLOQUEADO: ${coin} ya tiene posición abierta (anti-stack físico)`);
           } else {
             // ── Verificar capital ANTES de intentar ──────────────────────────
             const freshBal0 = await getBybitBalance().catch(() => null);
@@ -6941,7 +7029,7 @@ Citar una excusa técnica falsa = FALLA CRÍTICA equivalente a mentirle al usuar
                 if (!inst) { inst = mkEmptySymState(); escaleraInstances.set(sym, inst); }
                 const prevManual = state.manualMarginPct;
                 if (state.manualMarginPct === null) state.manualMarginPct = 100;
-                const layer = await escaleraOpenLayer(sym, 0, price, dir, atr, numSyms);
+                const layer = await escaleraOpenLayer(sym, 0, price, dir, atr, numSyms, optsForce);
                 state.manualMarginPct = prevManual;
                 if (layer) {
                   inst.direction = dir;
@@ -6950,8 +7038,13 @@ Citar una excusa técnica falsa = FALLA CRÍTICA equivalente a mentirle al usuar
                   inst.signalConf = { direction: dir, count: 3 };
                   if (!escaleraSymbols.includes(sym)) escaleraSymbols.push(sym);
                   _lastEscaleraEntryAt = Date.now();
-                  const effLev = state.manualLeverage ?? ESCALERA_TIERS[0].leverageX;
-                  actionsExecuted.push(`✅ FORCE OPEN ejecutado: ${coin} ${dir} ${effLev}x @ $${price.toFixed(4)}`);
+                  const effLevReport = optsForce.leverage ?? state.manualLeverage ?? ESCALERA_TIERS[0].leverageX;
+                  const detailParts: string[] = [];
+                  if (optsForce.marginPct) detailParts.push(`margin ${optsForce.marginPct}%`);
+                  if (optsForce.slAtrMult) detailParts.push(`SL ${optsForce.slAtrMult}×ATR`);
+                  if (optsForce.tpAtrMult) detailParts.push(`TP ${optsForce.tpAtrMult}×ATR`);
+                  const detail = detailParts.length > 0 ? ` (${detailParts.join(", ")})` : "";
+                  actionsExecuted.push(`✅ FORCE OPEN soberano: ${coin} ${dir} ${effLevReport}x @ $${price.toFixed(4)}${detail}`);
                 } else {
                   const liveAvail2 = state.liveAvailable ?? 0;
                   actionsExecuted.push(`❌ FORCE OPEN FALLÓ: Bybit rechazó ${coin} — disponible=$${liveAvail2.toFixed(2)} USDT`);
