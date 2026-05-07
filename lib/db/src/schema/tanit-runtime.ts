@@ -73,9 +73,48 @@ export const tanitPersonalMemories = pgTable("tanit_personal_memories", {
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 });
 
+/**
+ * PR #22 — Tanit Multimode v1.0 — narrativa operativa de Tanit.
+ *
+ * Cada activación de modo (SCALP/STORM/STANDBY) se registra aquí. Tanit puede
+ * consultar su histórico para aprender qué condiciones le funcionaron mejor.
+ * Es su memoria operativa estructurada — distinto de tanit_memory (lessons).
+ */
+export const modeActivations = pgTable("mode_activations", {
+  id: serial("id").primaryKey(),
+  modeFrom: text("mode_from").notNull(),         // SCALP | STORM | STANDBY (modo anterior)
+  modeTo: text("mode_to").notNull(),             // SCALP | STORM | STANDBY (modo nuevo)
+  triggerReason: text("trigger_reason"),         // "ATR1h=3.2× volumen=1.8× momentum 67min"
+  consentRequired: boolean("consent_required").notNull().default(false),
+  consentResponse: text("consent_response"),     // STORM_YES | STORM_NO | TIMEOUT | NULL
+  equityAtActivation: text("equity_at_activation"),
+  exitTs: timestamp("exit_ts", { withTimezone: true }),
+  exitReason: text("exit_reason"),               // "régimen cambió" | "veto" | "timeout"
+  pnlDuringMode: text("pnl_during_mode"),
+  tradesCount: integer("trades_count").notNull().default(0),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+});
+
+/**
+ * Propuestas de activación de STORM pendientes del consent de Tanit.
+ * El detector de régimen escribe aquí; Tanit responde STORM_YES / STORM_NO
+ * por chat operacional; el handler consume y activa o no.
+ */
+export const pendingModeProposals = pgTable("pending_mode_proposals", {
+  id: serial("id").primaryKey(),
+  proposedMode: text("proposed_mode").notNull(),  // STORM (por ahora solo STORM requiere consent)
+  triggerReason: text("trigger_reason"),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  resolution: text("resolution"),                 // YES | NO | TIMEOUT | NULL pendiente
+  resolvedAt: timestamp("resolved_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+});
+
 export type TanitEvolution = typeof tanitEvolutions.$inferSelect;
 export type GuardrailEvent = typeof guardrailEvents.$inferSelect;
 export type LeverageCooldown = typeof leverageCooldowns.$inferSelect;
 export type TanitSuggestion = typeof tanitSuggestions.$inferSelect;
 export type TanitRuntimeConfigEntry = typeof tanitRuntimeConfig.$inferSelect;
 export type TanitPersonalMemory = typeof tanitPersonalMemories.$inferSelect;
+export type ModeActivation = typeof modeActivations.$inferSelect;
+export type PendingModeProposal = typeof pendingModeProposals.$inferSelect;
