@@ -20,6 +20,7 @@ import {
   type Provider,
 } from "../lib/api-keys-provider";
 import { listRecentDecisions } from "../lib/tanit-decision";
+import { getActiveThesis, listRecentThesis, computeRecentMetrics, checkDivergence } from "../lib/tanit-thesis";
 
 // Tesis v4.1 / observabilidad — los campos balance + openPositions del estado
 // se pullean de Bybit en vivo (mismas fuentes que /api/portfolio/balance y
@@ -391,6 +392,25 @@ router.get("/tanit/admin/export-keys", async (req, res): Promise<void> => {
   try {
     const exported = await exportAllDecrypted();
     res.json({ ok: true, keys: exported });
+  } catch (err: any) {
+    res.status(500).json({ ok: false, error: String(err?.message ?? err) });
+  }
+});
+
+// PR #43 — Auditar la tesis viva (versionada) escrita por Tanit.
+router.get("/tanit/thesis", async (_req, res): Promise<void> => {
+  try {
+    const active = await getActiveThesis();
+    const history = await listRecentThesis(20);
+    const metrics = await computeRecentMetrics();
+    const divergence = await checkDivergence();
+    res.json({
+      ok: true,
+      active,
+      history,
+      metrics_24h: metrics,
+      divergence: { diverges: divergence.diverges, notes: divergence.notes },
+    });
   } catch (err: any) {
     res.status(500).json({ ok: false, error: String(err?.message ?? err) });
   }
