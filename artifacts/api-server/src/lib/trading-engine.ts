@@ -5435,14 +5435,22 @@ ${_critCoreIdentity.map(m => `  • ${m.content}`).join("\n\n")}`
   // ── PR #27 — Snapshot de precios live para inyectar al chat-context ──
   // Awaited aquí para tenerlo disponible en el template del prompt (sync).
   // Una sola call REST a Bybit cada 30s vía cache.
-  const _priceSnapshot = await getLivePriceSnapshot([
-    "BTCUSDT","ETHUSDT","SOLUSDT","TONUSDT","XRPUSDT","DOGEUSDT","BNBUSDT",
-    "ADAUSDT","AVAXUSDT","LINKUSDT","LTCUSDT","ATOMUSDT","TRXUSDT","SUIUSDT","BCHUSDT",
-  ]);
+  // PR #30 — defensivo: timeout estricto + fallback a cache. Si Bybit está
+  // lento, NO bloqueamos el chat. Mejor bloque vacío que respuesta colgada.
+  const _priceSnapshot: Record<string, number> = await Promise.race([
+    getLivePriceSnapshot([
+      "BTCUSDT","ETHUSDT","SOLUSDT","TONUSDT","XRPUSDT","DOGEUSDT","BNBUSDT",
+      "ADAUSDT","AVAXUSDT","LINKUSDT","LTCUSDT","ATOMUSDT","TRXUSDT","SUIUSDT","BCHUSDT",
+    ]),
+    new Promise<Record<string, number>>((resolve) => setTimeout(() => resolve(_priceSnapshotCache.data), 6000)),
+  ]).catch((): Record<string, number> => _priceSnapshotCache.data);
 
   // ── PR #29 — Deep snapshot Bybit (orderbook + klines multi-TF + whale trades) ──
-  // Solo para los 3 símbolos blue chip. Cache 60s. Bybit como ojos primarios.
-  const _deepSnapshot = await getBybitDeepSnapshot(["BTCUSDT", "ETHUSDT", "SOLUSDT"]);
+  // PR #30 — con timeout 8s + fallback a cache para no colgar el chat.
+  const _deepSnapshot: Record<string, DeepSnapshotSymbol> = await Promise.race([
+    getBybitDeepSnapshot(["BTCUSDT", "ETHUSDT", "SOLUSDT"]),
+    new Promise<Record<string, DeepSnapshotSymbol>>((resolve) => setTimeout(() => resolve(_deepSnapshotCache.data), 8000)),
+  ]).catch((): Record<string, DeepSnapshotSymbol> => _deepSnapshotCache.data);
 
   // ── Eventos guardrail recientes — Tanit ve cuándo el sistema la corrigió ─
   const recentGuardrails = await getRecentGuardrailEvents(5);
