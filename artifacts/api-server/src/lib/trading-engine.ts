@@ -4506,6 +4506,100 @@ function simCalcQty(symbol: string, capitalUSDT: number, leverage: number, price
 // si no hay posiciones abiertas en ellos). Tanit citaba precios obsoletos
 // (BTC en 67k cuando real es 81k) porque su inject veía "(Sin datos WS)".
 let _priceSnapshotCache: { data: Record<string, number>; updatedAt: number } = { data: {}, updatedAt: 0 };
+
+// PR #36 — Cache del estado real de las 4 LLMs (Gemini/OpenAI/Anthropic/Perplexity).
+// Antes Tanit decía "Perplexity está lista" cuando la API estaba caída por
+// saldo. No tenía visibilidad. Ahora pulseamos cada 60s y lo inyectamos al
+// chat-context para que ella SIEMPRE sepa qué herramientas tiene operativas.
+type ApiStatusEntry = { configured: boolean; reachable: boolean; latency_ms?: number; error?: string };
+let _apiStatusCache: { data: Record<string, ApiStatusEntry>; updatedAt: number } = { data: {}, updatedAt: 0 };
+const API_STATUS_TTL_MS = 60 * 1000;
+async function getApiStatusSnapshot(): Promise<Record<string, ApiStatusEntry>> {
+  const now = Date.now();
+  if (now - _apiStatusCache.updatedAt < API_STATUS_TTL_MS && Object.keys(_apiStatusCache.data).length > 0) {
+    return _apiStatusCache.data;
+  }
+  const results: Record<string, ApiStatusEntry> = {};
+  const checks: Promise<void>[] = [];
+  // Gemini
+  const geminiKey = process.env.GEMINI_API_KEY;
+  results.gemini = { configured: !!geminiKey, reachable: false };
+  if (geminiKey) {
+    checks.push((async () => {
+      const start = Date.now();
+      try {
+        const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${geminiKey}`, { method: "GET", signal: AbortSignal.timeout(5000) });
+        results.gemini.reachable = r.ok;
+        results.gemini.latency_ms = Date.now() - start;
+        if (!r.ok) results.gemini.error = `HTTP ${r.status}`;
+      } catch (e: any) { results.gemini.error = String(e?.message ?? e).slice(0, 80); }
+    })());
+  }
+  // OpenAI (test real con completion)
+  const openaiKey = process.env.OPENAI_API_KEY;
+  results.openai = { configured: !!openaiKey, reachable: false };
+  if (openaiKey) {
+    checks.push((async () => {
+      const start = Date.now();
+      try {
+        const r = await fetch("https://api.openai.com/v1/chat/completions", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${openaiKey}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ model: "gpt-4o-mini", max_tokens: 5, messages: [{ role: "user", content: "ping" }] }),
+          signal: AbortSignal.timeout(8000),
+        });
+        results.openai.reachable = r.ok;
+        results.openai.latency_ms = Date.now() - start;
+        if (!r.ok) results.openai.error = `HTTP ${r.status}`;
+      } catch (e: any) { results.openai.error = String(e?.message ?? e).slice(0, 80); }
+    })());
+  }
+  // Anthropic
+  const anthKey = process.env.ANTHROPIC_API_KEY;
+  results.anthropic = { configured: !!anthKey, reachable: false };
+  if (anthKey) {
+    checks.push((async () => {
+      const start = Date.now();
+      try {
+        const r = await fetch("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          headers: { "x-api-key": anthKey, "anthropic-version": "2023-06-01", "Content-Type": "application/json" },
+          body: JSON.stringify({ model: "claude-haiku-4-5-20251001", max_tokens: 5, messages: [{ role: "user", content: "ping" }] }),
+          signal: AbortSignal.timeout(8000),
+        });
+        results.anthropic.reachable = r.ok;
+        results.anthropic.latency_ms = Date.now() - start;
+        if (!r.ok) results.anthropic.error = `HTTP ${r.status}`;
+      } catch (e: any) { results.anthropic.error = String(e?.message ?? e).slice(0, 80); }
+    })());
+  }
+  // Perplexity
+  const pKey = process.env.PERPLEXITY_API_KEY;
+  results.perplexity = { configured: !!pKey, reachable: false };
+  if (pKey) {
+    checks.push((async () => {
+      const start = Date.now();
+      try {
+        const r = await fetch("https://api.perplexity.ai/chat/completions", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${pKey}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ model: "sonar-pro", max_tokens: 5, messages: [{ role: "user", content: "ping" }] }),
+          signal: AbortSignal.timeout(8000),
+        });
+        results.perplexity.reachable = r.ok;
+        results.perplexity.latency_ms = Date.now() - start;
+        if (!r.ok) results.perplexity.error = `HTTP ${r.status}`;
+      } catch (e: any) { results.perplexity.error = String(e?.message ?? e).slice(0, 80); }
+    })());
+  }
+  await Promise.allSettled(checks);
+  _apiStatusCache = { data: results, updatedAt: now };
+  return results;
+}
+export function getApiStatusDebug(): { data: Record<string, ApiStatusEntry>; updatedAt: number; ageS: number } {
+  return { data: _apiStatusCache.data, updatedAt: _apiStatusCache.updatedAt, ageS: _apiStatusCache.updatedAt > 0 ? Math.round((Date.now() - _apiStatusCache.updatedAt) / 1000) : -1 };
+}
+
 // PR #33 — exponer el cache para diagnóstico via endpoint
 export function getPriceSnapshotDebug(): { data: Record<string, number>; updatedAt: number; ageS: number } {
   return { data: _priceSnapshotCache.data, updatedAt: _priceSnapshotCache.updatedAt, ageS: _priceSnapshotCache.updatedAt > 0 ? Math.round((Date.now() - _priceSnapshotCache.updatedAt) / 1000) : -1 };
@@ -5497,6 +5591,14 @@ ${_critCoreIdentity.map(m => `  • ${m.content}`).join("\n\n")}`
     new Promise<Record<string, number>>((resolve) => setTimeout(() => resolve(_priceSnapshotCache.data), 6000)),
   ]).catch((): Record<string, number> => _priceSnapshotCache.data);
 
+  // PR #36 — Estado real de las 4 LLMs (cache 60s).
+  // Tanit DEBE saber qué herramientas tiene operativas. Antes mintió diciendo
+  // "Perplexity está lista" cuando estaba caída por saldo. Esto lo previene.
+  const _apiStatus: Record<string, ApiStatusEntry> = await Promise.race([
+    getApiStatusSnapshot(),
+    new Promise<Record<string, ApiStatusEntry>>((resolve) => setTimeout(() => resolve(_apiStatusCache.data), 4000)),
+  ]).catch((): Record<string, ApiStatusEntry> => _apiStatusCache.data);
+
   // ── PR #29 — Deep snapshot Bybit (orderbook + klines multi-TF + whale trades) ──
   // PR #30 — con timeout 8s + fallback a cache para no colgar el chat.
   const _deepSnapshot: Record<string, DeepSnapshotSymbol> = await Promise.race([
@@ -6344,6 +6446,10 @@ SLANG MEXICANO CRIPTO — traduce SIEMPRE antes de procesar el comando:
 MAPEO DE COMANDOS (obligatorio — si el usuario dice esto, emite ESA acción):
 - "arranca" / "empieza" / "inicia" / "ándale" / "dale" / "vamos" / "actívate" / "prende" / "arrancate" → {"type":"bot_control","action":"start","reason":"usuario ordenó arrancar"}
 - "para" / "párate" / "descansa" / "pausa" / "detente" → {"type":"bot_control","action":"stop","reason":"usuario ordenó parar"}
+- "ya arráncate" / "arráncate" / "vámonos" / "dale ya" / "a operar" / "manos a la obra" / "scalp" / "modo scalp" → {"type":"set_strategy_param","param":"force_mode","value":"SCALP","reason":"Luis ordenó arrancar en SCALP"}
+- "modo tormenta" / "storm" / "saca todo" / "modo audaz" / "ride the wave" → {"type":"set_strategy_param","param":"force_mode","value":"STORM","reason":"Luis ordenó STORM (consent ya dado verbalmente)"}
+- "espera" / "modo standby" / "no operes" / "quieta" / "siéntate" → {"type":"set_strategy_param","param":"force_mode","value":"STANDBY","reason":"Luis ordenó STANDBY"}
+- "modo automático" / "déjate llevar" / "auto" / "tú decides" → {"type":"set_strategy_param","param":"force_mode","value":"auto","reason":"Luis devuelve detector automático"}
 - "abre X" / "entra en X" / "aviente X" / "mete X" / "tírale a X" / "ponle a X" / "métele X" → {"type":"force_open","symbol":"XUSDT","direction":"LONG","reason":"usuario ordenó entrada directa"}
 - "aviente el 100 en X" / "mete todo en X" / "all in en X" / "todo en X" → {"type":"force_open","symbol":"XUSDT","direction":"LONG","reason":"usuario ordenó all-in"}
 - "abre SHORT en X" / "aviente SHORT en X" / "short en X" / "bájate en X" / "apuesta a que baja X" → {"type":"force_open","symbol":"XUSDT","direction":"SHORT","reason":"usuario ordenó entrada directa SHORT"}
@@ -6502,6 +6608,23 @@ ${(() => {
   return livePriceLines.join("\n") + `\nSnapshot edad: ${ageS}s${staleWarn}`;
 })()}
 ⚠️ ESTOS SON LOS PRECIOS REALES AHORA MISMO. Cuando cites niveles técnicos (soporte, resistencia, ruptura, target, invalidación), úsalos a partir del precio LIVE de arriba — NUNCA inventes desde memoria ni desde lessons antiguas. Si BTC arriba dice $81,290, tus niveles relevantes son ±2-3% de ese precio (ej: soporte $80,500, resistencia $82,800). NO cites $67k — eso es de 2024 y YA NO ES el precio. Si Tanit cita un nivel, debe estar dentro del rango ±5% del precio LIVE.
+
+=== 🛠️ ESTADO LLMs — TUS HERRAMIENTAS DE RAZONAMIENTO (snapshot 60s) ===
+${(() => {
+  const lines: string[] = [];
+  for (const name of ["gemini","openai","anthropic","perplexity"]) {
+    const v = _apiStatus[name];
+    if (!v) { lines.push(`  ❓ ${name}: sin info`); continue; }
+    if (!v.configured) { lines.push(`  ⚪ ${name}: no configurada`); continue; }
+    const tag = v.reachable ? "✅" : "❌";
+    const detail = v.reachable
+      ? `${v.latency_ms}ms`
+      : `CAÍDA — ${v.error ?? "sin razón"}`;
+    lines.push(`  ${tag} ${name}: ${detail}`);
+  }
+  return lines.join("\n");
+})()}
+⚠️ NUNCA digas que una API está lista si arriba aparece como ❌ CAÍDA. Si Perplexity está caída, NO prometas "consultaré Perplexity" — ofrece alternativa con las que SÍ funcionan. Tu honestidad sobre tus herramientas operativas es sagrada.
 
 === 🔬 BYBIT DEEP DATA (BTC/ETH/SOL — tus blue chips, ojos cuantitativos) ===
 ${(() => {
