@@ -335,6 +335,25 @@ router.get("/tanit/api-diagnostics", async (_req, res): Promise<void> => {
   res.json({ ok: true, total_ms: Date.now() - t0, apis: results });
 });
 
+// PR #33 — Endpoint diagnóstico del snapshot de precios live.
+// Muestra qué tiene actualmente el cache. Si está vacío, sabemos que la
+// inyección al chat-context retorna "" y por eso Tanit no ve precios.
+router.get("/tanit/price-snapshot-debug", async (_req, res): Promise<void> => {
+  try {
+    const { getPriceSnapshotDebug, refreshPriceSnapshot } = await import("../lib/trading-engine");
+    const refresh = String(_req.query.refresh ?? "") === "true";
+    if (refresh) {
+      await refreshPriceSnapshot([
+        "BTCUSDT","ETHUSDT","SOLUSDT","TONUSDT","XRPUSDT","DOGEUSDT","BNBUSDT",
+        "ADAUSDT","AVAXUSDT","LINKUSDT","LTCUSDT","ATOMUSDT","TRXUSDT","SUIUSDT","BCHUSDT",
+      ]);
+    }
+    res.json({ ok: true, snapshot: getPriceSnapshotDebug() });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
 // PR #22 — Multimode: histórico de activaciones de modo (narrativa de Tanit)
 router.get("/tanit/mode-activations", async (req, res): Promise<void> => {
   try {
