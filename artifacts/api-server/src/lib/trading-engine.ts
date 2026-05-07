@@ -1280,6 +1280,15 @@ async function _runSlTpFastLoopInner(): Promise<void> {
       ? Math.max(DYNAMIC_LEV_ENTRY, Math.min(DYNAMIC_LEV_MAX, state.manualLeverage))
       : calcTargetLeverage(momentum, curLev);
 
+    // PR#20 — Cap dinámico por equity (anti-suicidio). Capeado siempre, en
+    // cualquier path. Equity $148 → max 30x. El de DYNAMIC_LEV_MAX (100x) sigue
+    // existiendo como techo absoluto pero el cap dinámico actúa por debajo.
+    const dynLevCap = getDynamicLevCap();
+    if (targetLev > dynLevCap) {
+      console.log(TAG, `[LEV-DYN-CAP] ${sym} target ${targetLev}x > cap dinámico ${dynLevCap}x (equity-based) → ${dynLevCap}x`);
+      targetLev = dynLevCap;
+    }
+
     // FIX 6-may-2026 — Salvavidas: cuando margin heat >70%, capamos los saltos
     // de leverage a +3 por ciclo. calcTargetLeverage puede saltar +7/+15 por
     // momentum, lo que disparaba heat 78% y luego losses gigantes (-$0.14/-$0.18).
@@ -2024,6 +2033,22 @@ export async function tanitApplyEvolution(
 // ── Parámetros de estrategia dinámica — MUTABLES por Tanit en tiempo real ──
 const DYNAMIC_LEV_ENTRY = 5;  // Leverage de entrada — FIJO en 5x (no configurable por Tanit)
 let DYNAMIC_LEV_MAX    = 100; // Leverage máximo — techo real de Bybit, libertad total
+
+// PR#20 — Cap dinámico por equity (anti-suicidio).
+// El default 100x con $148 USDT es matemáticamente liquidación a 1% adverso.
+// Esta función calcula un cap razonable según el equity actual:
+//   $50  → 15x
+//   $148 → 30x
+//   $250 → 50x
+//   $500+→ 100x (DYNAMIC_LEV_MAX)
+// Tanit puede subir DYNAMIC_LEV_MAX runtime con set_strategy_param lev_max <n>
+// si su tesis lo justifica. Pero el cap dinámico es un piso de seguridad.
+function getDynamicLevCap(): number {
+  const equity = state.liveMode ? (state.liveBalance ?? 0) : (state.simBalance ?? 0);
+  if (equity <= 0) return DYNAMIC_LEV_ENTRY;
+  const dynamic = Math.max(15, Math.min(DYNAMIC_LEV_MAX, Math.floor(equity / 5)));
+  return dynamic;
+}
 // ── SISTEMA DE RESERVA ───────────────────────────────────────────────────────
 // 20% del equity se mantiene libre en Bybit (no entra en trades normales).
 // Esa reserva permite: (a) reducir leverage en posiciones perdedoras sin
@@ -2230,6 +2255,20 @@ function maybeActivatePauseByWr(): boolean {
   const now = Date.now();
   if (now < _pauseUntil) return true;  // ya en pausa
   const recent = state.tradeLog.filter((t: any) => (t.pnl ?? 0) !== 0).slice(0, PAUSE_WR_WINDOW);
+
+  // PR#20 — Mini circuit breaker por racha de losses consecutivos.
+  // Si las últimas 5 cerradas son TODAS perdedoras → pausa 10min (más corta
+  // que la pause-WR pero dispara MÁS RÁPIDO). Defiende del "cavar más hondo"
+  // cuando la sesión se torció. Independiente del threshold de WR rolling.
+  const lossStreakWindow = recent.slice(0, 5);
+  if (lossStreakWindow.length === 5 && lossStreakWindow.every((t: any) => (t.pnl ?? 0) < 0)) {
+    _pauseUntil = now + 10 * 60 * 1000;
+    console.warn(TAG, `[PAUSE-STREAK] 5 losses seguidas — pausa 10min`);
+    state.lastAction = `🛑 Pausa 10min — racha 5 losses`;
+    sendTelegram(`🛑 <b>PAUSA POR RACHA</b>\nÚltimos 5 trades: TODAS pérdidas.\nPausa 10min — gestión de abiertas continúa.`).catch(() => {});
+    return true;
+  }
+
   if (recent.length < PAUSE_WR_WINDOW) return false;  // no hay suficientes trades
   const wins = recent.filter((t: any) => (t.pnl ?? 0) > 0).length;
   const wr = (wins / recent.length) * 100;
@@ -2572,12 +2611,15 @@ function evaluatePosition(input: PositionEvalInput): { action: "HOLD" | "CLOSE";
   }
   const peak = _pnlPeak[symbol] ?? 0;
 
-  // ── PR#19 brutal — Hold-max absoluto ────────────────────────────────
-  // Modo scalping puro: ningún trade vive más de MAX_HOLD_MIN minutos. Si llegó
-  // hasta aquí sin cerrar por TP/SL/microgain, cerrar ahora (toma lo que haya).
-  if (ageSec > MAX_HOLD_MIN * 60) {
+  // ── PR#19/20 — Hold-max ADAPTATIVO POR SCORE ────────────────────────
+  // <70 score: 3min (pos sin convicción → corta rápido).
+  // ≥70 score: 5min (la señal sigue fuerte → dale espacio para desarrollarse).
+  // Logs reales del 7-may mostraron trades con score=100 cerrando en pérdida
+  // a 3min cuando podían recuperar. Adaptativo evita matar tu mejor convicción.
+  const holdMaxMin = dirScore >= 70 ? Math.max(MAX_HOLD_MIN, 5) : MAX_HOLD_MIN;
+  if (ageSec > holdMaxMin * 60) {
     _pnlPeak[symbol] = 0;
-    return { action: "CLOSE", reason: `Hold-max (${Math.round(ageSec/60)}min, PnL $${pnl.toFixed(4)})` };
+    return { action: "CLOSE", reason: `Hold-max (${Math.round(ageSec/60)}min score=${dirScore.toFixed(0)}, PnL $${pnl.toFixed(4)})` };
   }
 
   // ── TESIS v4.2 Componente 2 — Mosquito exit (time-based) ────────────
@@ -2594,15 +2636,24 @@ function evaluatePosition(input: PositionEvalInput): { action: "HOLD" | "CLOSE";
   // problema observado 6-may: avg_loss subió a -$0.155 (ratio W/L 0.36) porque
   // las perdedoras corren tanto como las ganadoras. Esto fuerza el corte.
   if (FEAT_LOSS_TIME_EXIT && pnl < 0) {
+    // PR#20 — DETECTOR DE SLIPPAGE: si en los primeros 15s la pos ya está a
+    // -10% o peor del margen, eso es entrada mal timeada (gap o slippage
+    // masivo). Cancelar inmediato. Logs 7-may: SOL -29% margen y ADA -20% en
+    // hold=0min sumaron -$1.51 (60% de la pérdida del ciclo). Este corte
+    // habría salvado eso.
+    const pnlPctMarginNow = pnlPct * input.leverage;
+    if (ageSec < 15 && pnlPctMarginNow < -10) {
+      _pnlPeak[symbol] = 0;
+      return { action: "CLOSE", reason: `Slippage detector (${ageSec.toFixed(0)}s, ${pnlPctMarginNow.toFixed(1)}% margen, PnL $${pnl.toFixed(4)})` };
+    }
     if (ageSec > LOSS_TIME_EXIT_MIN * 60) {
       _pnlPeak[symbol] = 0;
       return { action: "CLOSE", reason: `Loss time exit (${Math.round(ageSec/60)}min en rojo, PnL $${pnl.toFixed(4)})` };
     }
     // Cap de magnitud — no esperes el timeout si ya sangra feo.
-    const pnlPctMargin = pnlPct * input.leverage;
-    if (pnlPctMargin < -LOSS_MAGNITUDE_PCT_MARGIN) {
+    if (pnlPctMarginNow < -LOSS_MAGNITUDE_PCT_MARGIN) {
       _pnlPeak[symbol] = 0;
-      return { action: "CLOSE", reason: `Loss magnitude cap (${pnlPctMargin.toFixed(1)}% del margen, PnL $${pnl.toFixed(4)})` };
+      return { action: "CLOSE", reason: `Loss magnitude cap (${pnlPctMarginNow.toFixed(1)}% del margen, PnL $${pnl.toFixed(4)})` };
     }
   }
 
@@ -2653,13 +2704,20 @@ function evaluatePosition(input: PositionEvalInput): { action: "HOLD" | "CLOSE";
     return { action: "HOLD", reason: `ATR×4 alcanzado — esperando confirmación debilitamiento (${dirScore})` };
   }
 
-  // ── 4. Pérdida acelerada — endurecido 6-may post-revisión ────────────
-  // ANTES: pnlPct<-3.0 && dirScore<50 (doble gate). Si score≥50 la perdedora
-  // corría 10min hasta loss-time-exit, generando -$0.14/-$0.18 vs win $0.04.
-  // AHORA: cap absoluto a -1.5% O cap blando -1.0% si score se debilitó (<60).
-  if (pnlPct < -1.5 || (pnlPct < -1.0 && dirScore < 60)) {
+  // ── 4. Pérdida acelerada — CUT LOSS ADAPTATIVO POR SCORE (PR#20) ──────
+  // Logs reales 7-may: cut loss del PR#18 (-1.5%) cerró trades con score=100
+  // a -$0.03/-$0.07 que podían recuperar. Adaptativo da más colchón a la
+  // convicción alta sin perdonar a la baja:
+  //   score < 60: cut a -1.0% (sin convicción → fuera ya)
+  //   score 60-80: cut a -1.5% (convicción media → cap normal)
+  //   score ≥ 80: cut a -2.0% (convicción alta → más espacio)
+  let cutLossThreshold: number;
+  if (dirScore < 60)       cutLossThreshold = -1.0;
+  else if (dirScore < 80)  cutLossThreshold = -1.5;
+  else                     cutLossThreshold = -2.0;
+  if (pnlPct < cutLossThreshold) {
     _pnlPeak[symbol] = 0;
-    return { action: "CLOSE", reason: `Cut loss ${pnlPct.toFixed(1)}% (score=${dirScore})` };
+    return { action: "CLOSE", reason: `Cut loss ${pnlPct.toFixed(1)}% (score=${dirScore.toFixed(0)}, thr=${cutLossThreshold}%)` };
   }
 
   // ── 5. Engulfing contra — solo cerrar si hay ganancia real o pérdida clara ─
