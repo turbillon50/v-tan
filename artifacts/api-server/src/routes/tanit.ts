@@ -255,6 +255,86 @@ router.get("/tanit/guardrail-events", async (req, res): Promise<void> => {
   }
 });
 
+// PR #26 — Diagnóstico de APIs externas. Tanit puede saber qué herramientas
+// tiene operativas (Perplexity, OpenAI, Anthropic, Gemini) y cuáles no.
+router.get("/tanit/api-diagnostics", async (_req, res): Promise<void> => {
+  const t0 = Date.now();
+  const results: Record<string, { configured: boolean; reachable: boolean; latency_ms?: number; error?: string }> = {};
+
+  // Gemini (proxy y/o directo)
+  const geminiKey = process.env.GEMINI_API_KEY;
+  const geminiProxyKey = process.env.AI_INTEGRATIONS_GEMINI_API_KEY;
+  results.gemini = { configured: !!(geminiKey || geminiProxyKey), reachable: false };
+  if (geminiKey) {
+    const start = Date.now();
+    try {
+      const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${geminiKey}`, { method: "GET", signal: AbortSignal.timeout(8000) });
+      results.gemini.reachable = r.ok;
+      results.gemini.latency_ms = Date.now() - start;
+      if (!r.ok) results.gemini.error = `HTTP ${r.status}`;
+    } catch (e: any) { results.gemini.error = String(e?.message ?? e); }
+  }
+
+  // OpenAI
+  const openaiKey = process.env.OPENAI_API_KEY;
+  results.openai = { configured: !!openaiKey, reachable: false };
+  if (openaiKey) {
+    const start = Date.now();
+    try {
+      const r = await fetch("https://api.openai.com/v1/models", {
+        headers: { Authorization: `Bearer ${openaiKey}` }, signal: AbortSignal.timeout(8000),
+      });
+      results.openai.reachable = r.ok;
+      results.openai.latency_ms = Date.now() - start;
+      if (!r.ok) results.openai.error = `HTTP ${r.status}`;
+    } catch (e: any) { results.openai.error = String(e?.message ?? e); }
+  }
+
+  // Anthropic
+  const anthKey = process.env.ANTHROPIC_API_KEY;
+  results.anthropic = { configured: !!anthKey, reachable: false };
+  if (anthKey) {
+    const start = Date.now();
+    try {
+      const r = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "x-api-key": anthKey, "anthropic-version": "2023-06-01", "Content-Type": "application/json" },
+        body: JSON.stringify({ model: "claude-haiku-4-5-20251001", max_tokens: 5, messages: [{ role: "user", content: "ping" }] }),
+        signal: AbortSignal.timeout(15000),
+      });
+      results.anthropic.reachable = r.ok;
+      results.anthropic.latency_ms = Date.now() - start;
+      if (!r.ok) {
+        const body = await r.text().catch(() => "");
+        results.anthropic.error = `HTTP ${r.status} ${body.slice(0,120)}`;
+      }
+    } catch (e: any) { results.anthropic.error = String(e?.message ?? e); }
+  }
+
+  // Perplexity
+  const pKey = process.env.PERPLEXITY_API_KEY;
+  results.perplexity = { configured: !!pKey, reachable: false };
+  if (pKey) {
+    const start = Date.now();
+    try {
+      const r = await fetch("https://api.perplexity.ai/chat/completions", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${pKey}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ model: "sonar-pro", max_tokens: 5, messages: [{ role: "user", content: "ping" }] }),
+        signal: AbortSignal.timeout(15000),
+      });
+      results.perplexity.reachable = r.ok;
+      results.perplexity.latency_ms = Date.now() - start;
+      if (!r.ok) {
+        const body = await r.text().catch(() => "");
+        results.perplexity.error = `HTTP ${r.status} ${body.slice(0,120)}`;
+      }
+    } catch (e: any) { results.perplexity.error = String(e?.message ?? e); }
+  }
+
+  res.json({ ok: true, total_ms: Date.now() - t0, apis: results });
+});
+
 // PR #22 — Multimode: histórico de activaciones de modo (narrativa de Tanit)
 router.get("/tanit/mode-activations", async (req, res): Promise<void> => {
   try {
