@@ -19,6 +19,7 @@ import {
   listApiKeys, setApiKey, setActive, exportAllDecrypted,
   type Provider,
 } from "../lib/api-keys-provider";
+import { listRecentDecisions } from "../lib/tanit-decision";
 
 // Tesis v4.1 / observabilidad — los campos balance + openPositions del estado
 // se pullean de Bybit en vivo (mismas fuentes que /api/portfolio/balance y
@@ -390,6 +391,17 @@ router.get("/tanit/admin/export-keys", async (req, res): Promise<void> => {
   try {
     const exported = await exportAllDecrypted();
     res.json({ ok: true, keys: exported });
+  } catch (err: any) {
+    res.status(500).json({ ok: false, error: String(err?.message ?? err) });
+  }
+});
+
+// PR #42 — Auditar las decisiones conscientes de Tanit (LLM-in-the-loop).
+router.get("/tanit/decisions", async (req, res): Promise<void> => {
+  try {
+    const limit = safeLimit(req.query.limit, 50);
+    const rows = await listRecentDecisions(limit);
+    res.json({ ok: true, count: rows.length, decisions: rows });
   } catch (err: any) {
     res.status(500).json({ ok: false, error: String(err?.message ?? err) });
   }

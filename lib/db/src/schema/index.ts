@@ -21,6 +21,7 @@ export * from "./conversations";
 export * from "./messages";
 export * from "./tanit-api-keys";
 export * from "./tanit-chat";
+export * from "./tanit-decisions";
 export * from "./tanit-memory";
 export * from "./tanit-runtime";
 export * from "./trading";

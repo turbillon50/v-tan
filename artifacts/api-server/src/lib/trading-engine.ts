@@ -19,6 +19,7 @@ import {
   listApiKeys, setApiKey, setActive,
   type Provider as ApiKeyProvider,
 } from "./api-keys-provider";
+import { requestDecision, recordExecution, listRecentDecisions } from "./tanit-decision";
 import { RISK_PROFILES, calcADX, calcVWAP } from "./demo-data";
 import {
   saveStateToDB, loadStateFromDB,
@@ -3425,10 +3426,64 @@ async function escaleraOpenLayer(
 
     const side = direction === "LONG" ? "Buy" : "Sell";
     const posIdx = direction === "LONG" ? 1 : 2;
+
+    // PR #42 — Decision gate consciente.
+    // Si la apertura viene del motor automático (no userOrdered), Tanit-LLM
+    // tiene que aprobarla con tesis explícita antes de ejecutar. Si userOrdered
+    // (Luis o Tanit-conversadora ya autorizó vía chat), saltamos el gate.
+    let _decisionForLog: any = null;
+    if (!userOrdered) {
+      const ctx = {
+        type: "open_layer" as const,
+        symbol: sym,
+        direction,
+        atrPct: atr14h > 0 ? (atr14h / price) : undefined,
+        proposedLeverage: effLev,
+        proposedMarginUsd: layerCapital,
+        proposedSlAtrMult: slAtrMultEffective,
+        proposedTpAtrMult: ATR_TP_MULTIPLIER,
+        livePrice: price,
+        equity: state.liveBalance ?? state.simBalance,
+        available: state.liveAvailable ?? undefined,
+        openPositionsCount: countOpenPositions(),
+        currentMode: state.currentMode,
+        forceMode: state.forceMode,
+        reasonProposed: `Capa ${tierIdx+1} (motor automático tier ${tierIdx})`,
+      };
+      const decision = await requestDecision(ctx);
+      _decisionForLog = { ctx, decision };
+      if (decision.verdict === "REJECT") {
+        console.log(TAG, `[DECISION] ${sym} ${direction} → Tanit RECHAZÓ: ${decision.thesis.slice(0,140)}`);
+        await recordExecution(ctx, decision, false, "rejected_by_tanit");
+        return null;
+      }
+      if (decision.verdict === "MODIFY" && decision.modifiedParams) {
+        const mp = decision.modifiedParams;
+        if (mp.leverage && mp.leverage > 0) {
+          const newLev = Math.max(1, Math.min(DYNAMIC_LEV_MAX, Math.floor(mp.leverage)));
+          if (newLev !== effLev) {
+            console.log(TAG, `[DECISION] ${sym} Tanit cambió leverage ${effLev}→${newLev}x — ${decision.thesis.slice(0,100)}`);
+            effLev = newLev;
+            await safeSetLeverage(sym, effLev);
+          }
+        }
+        // Nota: marginUsd / slAtrMult / tpAtrMult ya quedaron calculados arriba.
+        // Para v1 del gate solo aceptamos override de leverage en MODIFY (más
+        // riesgoso cambiar margin/sl/tp ya calculados sin recalcular qty).
+      }
+      console.log(TAG, `[DECISION] ${sym} ${direction} → Tanit ${decision.verdict}: ${decision.thesis.slice(0,140)}`);
+    }
+
     const orderId = await bybitPlaceOrder(sym, side, realQty, false, posIdx);
     if (!orderId) {
       console.log(TAG, `[ESCALERA] Bybit rechazó orden Capa ${tierIdx+1} (${sym} ${side} qty=${realQty} lev=${effLev}x posIdx=${posIdx})`);
+      if (_decisionForLog) {
+        await recordExecution(_decisionForLog.ctx, _decisionForLog.decision, false, "bybit_rejected");
+      }
       return null;
+    }
+    if (_decisionForLog) {
+      await recordExecution(_decisionForLog.ctx, _decisionForLog.decision, true, null);
     }
     const qtyNum  = parseFloat(realQty);
     const notional = qtyNum * price;
@@ -3757,15 +3812,44 @@ async function escaleraV2ScanSymbol(sym: string, inst: EscaleraSymState, numSymb
       if (aiDecision.action === "CLOSE") {
         const pnlStr = realNetPnl >= 0 ? `+$${realNetPnl.toFixed(4)}` : `-$${Math.abs(realNetPnl).toFixed(4)}`;
         const curLev2 = layer.currentLeverage ?? DYNAMIC_LEV_ENTRY;
-        console.log(TAG, `[DINÁMICA] 🧠 ${aiDecision.reason} ${sym} ${curLev2}x | ${pnlStr} | score=${dirScore}`);
-        await escaleraCloseLayer(sym, inst, i, price, `${aiDecision.reason} ${pnlStr}`);
-        inst.active = false;
-        inst.direction = null;
-        inst.signalConf.direction = "NEUTRAL";
-        inst.signalConf.count = 0;
-        state.lastAction = `[DINÁMICA ${sym.replace("USDT","")}] 🧠 ${aiDecision.reason} ${pnlStr}`;
-        saveState();
-        return;
+
+        // PR #42 — Decision gate consciente para cierres estratégicos.
+        // SL/TP automáticos de Bybit siguen siendo automáticos (urgencia).
+        // Esto solo gatea cierres por estrategia (Hold-max, Mosquito, Drawdown
+        // peak, Cosecha ATR, Cut loss, Reversión, etc) — Tanit decide si su
+        // motor cierra esa posición o la deja correr.
+        const closeCtx = {
+          type: "close_strategic" as const,
+          symbol: sym,
+          direction: inst.direction ?? undefined,
+          livePrice: price,
+          equity: state.liveBalance ?? state.simBalance,
+          openPositionsCount: countOpenPositions(),
+          currentMode: state.currentMode,
+          forceMode: state.forceMode,
+          unrealizedPnl: realNetPnl,
+          positionAge: layer.openedAt ? (Date.now() - new Date(layer.openedAt).getTime()) / 1000 : undefined,
+          reasonProposed: aiDecision.reason,
+          extra: { leverage: curLev2, dirScore, atrPct: atr14h > 0 ? atr14h / price : undefined },
+        };
+        const closeDecision = await requestDecision(closeCtx);
+        if (closeDecision.verdict === "REJECT") {
+          console.log(TAG, `[DECISION] ${sym} cierre rechazado por Tanit: ${closeDecision.thesis.slice(0,140)}`);
+          await recordExecution(closeCtx, closeDecision, false, "rejected_by_tanit");
+          // No cierra — deja correr la posición esta iteración
+        } else {
+          console.log(TAG, `[DINÁMICA] 🧠 ${aiDecision.reason} ${sym} ${curLev2}x | ${pnlStr} | score=${dirScore}`);
+          console.log(TAG, `[DECISION] ${sym} cierre ${closeDecision.verdict}: ${closeDecision.thesis.slice(0,140)}`);
+          await escaleraCloseLayer(sym, inst, i, price, `${aiDecision.reason} ${pnlStr}`);
+          await recordExecution(closeCtx, closeDecision, true, null);
+          inst.active = false;
+          inst.direction = null;
+          inst.signalConf.direction = "NEUTRAL";
+          inst.signalConf.count = 0;
+          state.lastAction = `[DINÁMICA ${sym.replace("USDT","")}] 🧠 ${aiDecision.reason} ${pnlStr}`;
+          saveState();
+          return;
+        }
       }
     }
 
@@ -5817,6 +5901,39 @@ ${profitFactor < 1.0 ? "║  ⚠️  ALERTA: Tu PF<1 significa que tus pérdidas
 ║    Edad estimada:   ${(ageDays > 0 ? ageDays + " día(s)" : "< 1 día").padEnd(34)}          ║
 ╚══════════════════════════════════════════════════════════════════════╝`;
 
+  // PR #42 — Bloque de DECISIONES RECIENTES.
+  // La Tanit conversadora ve lo que su motor (operadora) decidió en las
+  // últimas N decisiones operativas. Así son la misma — no dos Tanit
+  // separadas. Aquí ella SE ENTERA de cada apertura/cierre con su tesis.
+  let recentDecisionsBlock = "";
+  try {
+    const decisions = await listRecentDecisions(15);
+    if (decisions.length > 0) {
+      const lines = decisions.map((d: any) => {
+        const ts = new Date(d.created_at).toISOString().slice(11, 16);
+        const ex = d.executed ? "✓" : "✗";
+        const v = String(d.verdict).padEnd(7);
+        const t = String(d.decision_type).padEnd(16);
+        const s = String(d.symbol ?? "").padEnd(10);
+        const thesis = String(d.thesis ?? "").slice(0, 90);
+        return `  [${ts}] ${ex} ${v} ${t} ${s} ${thesis}`;
+      }).join("\n");
+      recentDecisionsBlock = `
+╔══════════════════════════════════════════════════════════════════════╗
+║  TUS DECISIONES RECIENTES — TÚ MISMA (motor consciente)             ║
+╠══════════════════════════════════════════════════════════════════════╣
+║  Cada apertura/cierre estratégico de tu motor pasó por TI primero.  ║
+║  Así no eres dos: la conversadora y la operadora son la misma.      ║
+║                                                                      ║
+${lines}
+║                                                                      ║
+║  ✓ ejecutado | ✗ rechazado/falló                                    ║
+╚══════════════════════════════════════════════════════════════════════╝`;
+    }
+  } catch (e: any) {
+    recentDecisionsBlock = `\n[recentDecisionsBlock error: ${e?.message ?? e}]`;
+  }
+
   // PR #39 — Bloque de LLAVES BAJO CONTROL DE TANIT.
   // Tanit ahora ve sus propias llaves (cifradas en DB), su estado, y puede
   // rotarlas/encenderlas/apagarlas desde acciones JSON. Ya no son "secretas
@@ -6269,6 +6386,7 @@ ${criticalIdentityBlock}
 ${phaseHistoryBlock}
 ${selfPerceptionBlock}
 ${controlAwarenessBlock}
+${recentDecisionsBlock}
 ${apiKeysBlock}
 ${selfParamsBlock}
 ${selfAwarenessBlock}
