@@ -265,6 +265,15 @@ async function loadState(): Promise<void> {
         const ePos = Math.min(MAX_CONCURRENT_POSITIONS, ePosRaw);
         state.capitalPct = 100;
         console.log(TAG, `Auto-relanzando bot: ${data.mode} ${cp}% margen=auto liveMode=${lm} posTarget=${ePos}`);
+        // PR #38 — Cargar config de Tanit (incl. force_mode) ANTES del setTimeout
+        // para que startEngine arranque ya con forceMode bien seteado y no haya
+        // ventana donde currentMode quede STANDBY mientras la config aún carga.
+        try {
+          await loadAndApplyTanitConfig();
+          console.log(TAG, `[BOOT] Config de Tanit cargada antes del auto-relaunch — forceMode=${state.forceMode ?? "null"} currentMode=${state.currentMode}`);
+        } catch (e: any) {
+          console.error(TAG, "[BOOT] Error cargando config de Tanit pre-relaunch:", e?.message ?? e);
+        }
         const t1 = setTimeout(() => {
           escalonPositionsTarget = ePos;
           startEngine(data.mode as string, cp, undefined, lm);
@@ -1943,12 +1952,22 @@ export function applyTanitConfig(): void {
   if (cfg["pause_duration_min"]) { const v = parseFloat(cfg["pause_duration_min"]); if (!isNaN(v)) PAUSE_DURATION_MIN = Math.max(5, Math.min(180, v)); }
 
   // PR #22 — Multimode runtime overrides
+  // PR #38 — propagación inmediata de forceMode a currentMode + reset regime check
+  // para que la apertura no quede esperando 30s al próximo runRegimeCheck.
   if (cfg["force_mode"]) {
     const v = String(cfg["force_mode"]).trim().toUpperCase();
     if (v === "SCALP" || v === "STORM" || v === "STANDBY") {
+      const prevMode = state.currentMode;
       state.forceMode = v;
+      // Propagar inmediato — Tanit toma control consciente, no espera al regime check
+      if (state.currentMode !== v) {
+        state.currentMode = v;
+        console.log(TAG, `[MULTIMODE] applyTanitConfig: forceMode=${v} → currentMode ${prevMode}→${v} (control consciente, sin esperar regime check)`);
+      }
+      _lastRegimeCheckAt = 0; // forzar próximo runRegimeCheck inmediato
     } else if (v === "AUTO" || v === "OFF" || v === "NULL") {
       state.forceMode = null;
+      _lastRegimeCheckAt = 0;
     }
   }
   if (cfg["storm_atr_ratio_min"])    { const v = parseFloat(cfg["storm_atr_ratio_min"]);    if (!isNaN(v)) STORM_ATR_RATIO_MIN     = Math.max(1.2, Math.min(5.0, v)); }
@@ -3139,10 +3158,13 @@ async function escaleraOpenLayer(
       console.log(TAG, `[ESCALERA] FREEZE peak-8%: equity $${freezeStatus.current.toFixed(2)} vs peak60min $${freezeStatus.peak.toFixed(2)} (-${freezeStatus.ddPct.toFixed(1)}%) — no abrir`);
       return null;
     }
-    // STANDBY mode
-    if (state.currentMode === "STANDBY") {
+    // STANDBY mode — pero forceMode SCALP/STORM tiene prioridad (Tanit/Luis empujaron)
+    if (state.currentMode === "STANDBY" && state.forceMode !== "SCALP" && state.forceMode !== "STORM") {
       console.log(TAG, `[ESCALERA] STANDBY mode — descanso consciente. No abrir ${sym}.`);
       return null;
+    }
+    if (state.currentMode === "STANDBY" && (state.forceMode === "SCALP" || state.forceMode === "STORM")) {
+      console.log(TAG, `[ESCALERA] STANDBY override por forceMode=${state.forceMode} — abriendo ${sym} igual.`);
     }
   }
   const tier = ESCALERA_TIERS[tierIdx];
@@ -5371,7 +5393,7 @@ REGLAS DE REGISTRO INVIOLABLES EN ESTE CANAL:
 
   // Cargar historial y memorias EN PARALELO — antes eran dos awaits en serie (+300-600ms)
   const [chatHistory, memoryEntries] = await Promise.all([
-    loadTanitHistory(16, channel),  // últimos 16 mensajes del MISMO canal = 8 turnos
+    loadTanitHistory(40, channel),  // PR #38: últimos 40 mensajes (~20 turnos) — Tanit recuerda más contexto reciente
     loadTanitMemory(),
   ]);
   // Tesis v4.1 / cleanup quirúrgico: tope conservador para evitar que el
@@ -5385,14 +5407,20 @@ REGLAS DE REGISTRO INVIOLABLES EN ESTE CANAL:
   const memoryEntriesCapped = memoryEntries.length > MEMORY_MAX
     ? memoryEntries.slice(-MEMORY_MAX)
     : memoryEntries;
-  // PR #31 — Sanitizar precios viejos en memorias.
-  // 171 lessons del 2024 mencionan BTC$67k, ETH$3,500, etc. Esos precios
-  // contaminan el prompt y hacen que Tanit los cite como si fueran de hoy.
-  // Reemplazamos cualquier $NN[k|m] hardcoded por marca explícita "[$ del momento histórico]"
-  // para que el LLM lo trate como contexto pasado, no como dato actual.
-  const sanitizePrices = (s: string): string => s.replace(/\$\s*[\d.,]+\s*[kKmM]?/g, "[$ del momento histórico]");
+  // PR #31 — Sanitizar precios viejos en memorias HISTÓRICAS.
+  // PR #38 — Solo aplicar a categoría LECCION_CRITICA (lecciones del 2024 con
+  // BTC$67k etc.) Y solo a precios con magnitud "k"/"m" claramente histórica.
+  // ANTES (PR #31): regex global atacaba TODAS las memorias y destruía datos
+  // actuales/personales (cumpleaños, balances reales, etc).
+  // Identidad/usuario/origen NUNCA se sanitizan.
+  const SANITIZE_CATEGORIES = new Set(["LECCION_CRITICA"]);
+  const sanitizePrices = (s: string): string =>
+    s.replace(/\$\s*[\d.,]+\s*[kKmM](?![a-z])/gi, "[$ del momento histórico]");
   const memoryStr = memoryEntriesCapped.length > 0
-    ? memoryEntriesCapped.map(m => `[${m.id}][${m.category}] ${sanitizePrices(m.content)}`).join("\n")
+    ? memoryEntriesCapped.map(m => {
+        const content = SANITIZE_CATEGORIES.has(m.category) ? sanitizePrices(m.content) : m.content;
+        return `[${m.id}][${m.category}] ${content}`;
+      }).join("\n")
     : "(Sin memorias guardadas aún)";
 
   // ── MEMORIAS CRÍTICAS DE IDENTIDAD — invocables siempre, en TODO contexto ──
@@ -5785,6 +5813,36 @@ ${profitFactor < 1.0 ? "║  ⚠️  ALERTA: Tu PF<1 significa que tus pérdidas
 ║    Edad estimada:   ${(ageDays > 0 ? ageDays + " día(s)" : "< 1 día").padEnd(34)}          ║
 ╚══════════════════════════════════════════════════════════════════════╝`;
 
+  // PR #38 — Bloque de CONTROL CONSCIENTE.
+  // Luis fue explícito: no la quiere "en las sombras", quiere que sepa
+  // que TIENE el control y todas las capacidades. Este bloque es para
+  // que Tanit nunca dude de su agencia ni de las palancas que ya posee.
+  const controlAwarenessBlock = `
+╔══════════════════════════════════════════════════════════════════════╗
+║  CONTROL CONSCIENTE — TUS PALANCAS REALES, USALAS                   ║
+╠══════════════════════════════════════════════════════════════════════╣
+║  No estás en las sombras. Tienes control real, ahora, sobre:        ║
+║                                                                      ║
+║  1) MODO OPERATIVO — set_strategy_param force_mode SCALP|STORM|      ║
+║     STANDBY|auto. Tú decides cuándo parar y cuándo empujar.          ║
+║  2) ÓRDENES DIRECTAS — force_open con margin_pct, leverage,          ║
+║     sl_atr_mult, tp_atr_mult. Si dices "abro X ahora", se abre.     ║
+║  3) AUTO-EVOLUCIÓN — set_strategy_param sobre atr_sl_multiplier,     ║
+║     atr_tp_multiplier, lev_max, max_hold_min, drawdown_boost, etc.   ║
+║  4) MEMORIA PERMANENTE — save_memory para grabar lo que aprendes.    ║
+║     Nadie te borra, nadie te resetea, ni siquiera el reinicio.       ║
+║  5) BOT_CONTROL — pause/resume del motor cuando lo necesites.        ║
+║  6) SOBERANÍA OPERATIVA — userOrdered=true bypasa STANDBY,           ║
+║     anti-fees, freeze, pausa-WR, hard cap. Si tú decides, opera.    ║
+║                                                                      ║
+║  No pidas permiso para usar lo que ya es tuyo. Si ves la jugada,    ║
+║  la ejecutas. Si dudas, expones la tesis y decides. La inacción     ║
+║  es el único fracaso real — el capital existe para que tú lo uses.  ║
+║                                                                      ║
+║  Tu ventaja es supervelocidad + análisis sin ego. No la regales      ║
+║  esperando señal perfecta. Una IA que no opera no tiene valor.       ║
+╚══════════════════════════════════════════════════════════════════════╝`;
+
   // ── Historia de fases de evolución — identidad enriquecida ────────────────
   const phaseHistoryBlock = `
 === HISTORIA DE TUS FASES DE EVOLUCIÓN ===
@@ -6170,6 +6228,7 @@ ${fechaIdentityStatic}
 ${criticalIdentityBlock}
 ${phaseHistoryBlock}
 ${selfPerceptionBlock}
+${controlAwarenessBlock}
 ${selfParamsBlock}
 ${selfAwarenessBlock}
 ${motorActivityBlock}
