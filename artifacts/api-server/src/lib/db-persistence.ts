@@ -270,6 +270,34 @@ export async function initTanitEvolutionTables(): Promise<void> {
         created_at  TIMESTAMPTZ DEFAULT NOW()
       )
     `);
+    // PR #22 — Multimode tables
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS mode_activations (
+        id                    SERIAL PRIMARY KEY,
+        mode_from             TEXT NOT NULL,
+        mode_to               TEXT NOT NULL,
+        trigger_reason        TEXT,
+        consent_required      BOOLEAN NOT NULL DEFAULT FALSE,
+        consent_response      TEXT,
+        equity_at_activation  TEXT,
+        exit_ts               TIMESTAMPTZ,
+        exit_reason           TEXT,
+        pnl_during_mode       TEXT,
+        trades_count          INTEGER NOT NULL DEFAULT 0,
+        created_at            TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS pending_mode_proposals (
+        id              SERIAL PRIMARY KEY,
+        proposed_mode   TEXT NOT NULL,
+        trigger_reason  TEXT,
+        expires_at      TIMESTAMPTZ NOT NULL,
+        resolution      TEXT,
+        resolved_at     TIMESTAMPTZ,
+        created_at      TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
   } catch (e) {
     console.error(TAG, "initTanitEvolutionTables error:", e);
   }

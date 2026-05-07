@@ -10,6 +10,7 @@ import {
   tradeHistory,
   balanceSnapshots,
   guardrailEvents,
+  modeActivations,
 } from "@workspace/db";
 import { desc, eq, sql, and } from "drizzle-orm";
 import { getBybitBalance } from "../lib/bybit-auth";
@@ -249,6 +250,17 @@ router.get("/tanit/guardrail-events", async (req, res): Promise<void> => {
     const limit = safeLimit(req.query.limit, 50);
     const list = await db.select().from(guardrailEvents).orderBy(desc(guardrailEvents.createdAt)).limit(limit);
     res.json({ ok: true, count: list.length, events: list });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+// PR #22 — Multimode: histórico de activaciones de modo (narrativa de Tanit)
+router.get("/tanit/mode-activations", async (req, res): Promise<void> => {
+  try {
+    const limit = safeLimit(req.query.limit, 50);
+    const list = await db.select().from(modeActivations).orderBy(desc(modeActivations.createdAt)).limit(limit);
+    res.json({ ok: true, count: list.length, activations: list });
   } catch (err) {
     res.status(500).json({ ok: false, error: String(err) });
   }

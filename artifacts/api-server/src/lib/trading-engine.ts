@@ -457,6 +457,10 @@ interface EngineState {
   // Régimen macro BTC — se actualiza cada scan de BTCUSDT
   btcMacro1hBear: boolean;
   btcMacro1hBull: boolean;
+  // PR #22 — Multimode v1.0
+  currentMode: "SCALP" | "STORM" | "STANDBY";  // modo operativo actual
+  forceMode: "SCALP" | "STORM" | "STANDBY" | null;  // override manual de Tanit (null = auto)
+  modeStartedAt: number;  // timestamp de cuando entró al modo actual
   // Auto-inversión — activo cuando el bot pierde sistemáticamente
   signalInverted: boolean;
   // Cooldown — timestamp de la última pérdida para esperar antes de re-entrar
@@ -528,6 +532,9 @@ const state: EngineState = {
   sessionHistory: [],
   btcMacro1hBear: false,
   btcMacro1hBull: false,
+  currentMode: "SCALP",
+  forceMode: null,
+  modeStartedAt: Date.now(),
   signalInverted: false,
   lastLossAt: 0,
   drawdownPauseUntil: 0,
@@ -1935,6 +1942,21 @@ export function applyTanitConfig(): void {
   if (cfg["pause_wr_threshold"]) { const v = parseFloat(cfg["pause_wr_threshold"]); if (!isNaN(v)) PAUSE_WR_THRESHOLD = Math.max(20, Math.min(60, v)); }
   if (cfg["pause_duration_min"]) { const v = parseFloat(cfg["pause_duration_min"]); if (!isNaN(v)) PAUSE_DURATION_MIN = Math.max(5, Math.min(180, v)); }
 
+  // PR #22 — Multimode runtime overrides
+  if (cfg["force_mode"]) {
+    const v = String(cfg["force_mode"]).trim().toUpperCase();
+    if (v === "SCALP" || v === "STORM" || v === "STANDBY") {
+      state.forceMode = v;
+    } else if (v === "AUTO" || v === "OFF" || v === "NULL") {
+      state.forceMode = null;
+    }
+  }
+  if (cfg["storm_atr_ratio_min"])    { const v = parseFloat(cfg["storm_atr_ratio_min"]);    if (!isNaN(v)) STORM_ATR_RATIO_MIN     = Math.max(1.2, Math.min(5.0, v)); }
+  if (cfg["storm_vol_ratio_min"])    { const v = parseFloat(cfg["storm_vol_ratio_min"]);    if (!isNaN(v)) STORM_VOL_RATIO_MIN     = Math.max(1.0, Math.min(5.0, v)); }
+  if (cfg["storm_momentum_min_min"]) { const v = parseFloat(cfg["storm_momentum_min_min"]); if (!isNaN(v)) STORM_MOMENTUM_MIN_MIN  = Math.max(15, Math.min(180, v)); }
+  if (cfg["standby_wr_max"])         { const v = parseFloat(cfg["standby_wr_max"]);         if (!isNaN(v)) STANDBY_WR_ROLLING_MAX  = Math.max(20, Math.min(60, v)); }
+  if (cfg["storm_consent_timeout_min"]) { const v = parseFloat(cfg["storm_consent_timeout_min"]); if (!isNaN(v)) STORM_CONSENT_TIMEOUT_MIN = Math.max(1, Math.min(30, v)); }
+
   // ── Multiplicadores de agresividad por sesión ──────────────────────────────
   const clampMult = (v: number) => Math.max(0.70, Math.min(1.50, v));
   if (cfg["mult_late_night"]) { const v = parseFloat(cfg["mult_late_night"]); if (!isNaN(v)) SESSION_MULT_LATE_NIGHT = clampMult(v); }
@@ -2224,6 +2246,258 @@ let PAUSE_WR_WINDOW = 10;       // últimos N trades para WR rolling
 let PAUSE_WR_THRESHOLD = 40;    // si WR < 40%, pausar
 let PAUSE_DURATION_MIN = 30;    // pausa de 30 min
 let _pauseUntil = 0;            // timestamp ms — 0 = no pausa
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PR #22 — Tanit Multimode v1.0
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Tres modos operativos que se activan según régimen detectado:
+//   🌪️ STORM    — tormenta direccional. Leverage libre, sizing 4×, hold 30min,
+//                 TP 6×ATR, requiere CONSENT de Tanit antes de activar.
+//   ⚡ SCALP    — rango con micro-movimientos. Modo brutal actual (PRs #18-#21).
+//   🛑 STANDBY  — choppy basura. NO operar. Descanso consciente.
+//
+// Tanit tiene veto absoluto: set_strategy_param force_mode SCALP|STORM|STANDBY|auto
+// Cada activación se registra en mode_activations para su narrativa operativa.
+
+// Thresholds de detección (configurables runtime)
+let STORM_ATR_RATIO_MIN     = 2.0;   // ATR1h debe ser >= 2.0× ATR baseline para STORM
+let STORM_VOL_RATIO_MIN     = 1.5;   // volumen actual >= 1.5× promedio 24h
+let STORM_MOMENTUM_MIN_MIN  = 60;    // momentum sostenido al menos 60 min
+let STANDBY_ATR_PCT_MAX     = 0.30;  // ATR% < 0.30% = mercado plano → STANDBY
+let STANDBY_WR_ROLLING_MAX  = 35;    // WR rolling 20 < 35% → STANDBY (señales malas)
+let STORM_CONSENT_TIMEOUT_MIN = 5;    // Tanit tiene 5 min para responder STORM_YES/NO
+
+// Profile de parámetros por modo (overrides los defaults del código)
+type ModeProfile = {
+  atrTpMultiplier: number;
+  maxHoldMin: number;
+  partialTpRTrigger: number;
+  // En STORM se levanta el cap por heat>70 (porque la pos ya está verde para escalar)
+  allowLevScalingInRed: boolean;
+  // En STANDBY no abre nada
+  blockOpenings: boolean;
+};
+
+function getModeProfile(mode: "SCALP" | "STORM" | "STANDBY"): ModeProfile {
+  switch (mode) {
+    case "STORM":
+      return {
+        atrTpMultiplier: 6.0,           // límite v4.1, máximo permitido
+        maxHoldMin: 30,                 // riding the wave
+        partialTpRTrigger: 1.5,         // más espacio para que el winner crezca
+        allowLevScalingInRed: false,    // sigue regla: solo en verde
+        blockOpenings: false,
+      };
+    case "STANDBY":
+      return {
+        atrTpMultiplier: ATR_TP_MULTIPLIER,
+        maxHoldMin: MAX_HOLD_MIN,
+        partialTpRTrigger: PARTIAL_TP_R_TRIGGER,
+        allowLevScalingInRed: false,
+        blockOpenings: true,            // NO abrir nada en STANDBY
+      };
+    case "SCALP":
+    default:
+      return {
+        atrTpMultiplier: ATR_TP_MULTIPLIER,    // 2.5 default
+        maxHoldMin: MAX_HOLD_MIN,              // 3 default
+        partialTpRTrigger: PARTIAL_TP_R_TRIGGER, // 1.0 default
+        allowLevScalingInRed: false,
+        blockOpenings: false,
+      };
+  }
+}
+
+// Helper: cálculo de momentum sostenido (cuántos minutos lleva el momentum favorable).
+// Aproximación: si los últimos 5 trades cerrados son mayoritariamente winners,
+// medimos el tiempo desde el más antiguo de esos 5 (proxy de "tendencia activa").
+function getMomentumDurationMin(): number {
+  const recent = state.tradeLog.slice(0, 5);
+  if (recent.length < 5) return 0;
+  const wins = recent.filter((t: any) => (t.pnl ?? 0) > 0).length;
+  if (wins < 3) return 0; // mayoría no son wins → no hay momentum
+  const oldest = recent[recent.length - 1]?.closedAt;
+  if (!oldest) return 0;
+  const oldestTs = new Date(oldest).getTime();
+  if (!Number.isFinite(oldestTs)) return 0;
+  return (Date.now() - oldestTs) / 60000;
+}
+
+// Detecta el régimen actual del mercado.
+// Devuelve el modo SUGERIDO (no aplica directamente — STORM requiere consent).
+function detectRegime(): { suggestedMode: "SCALP" | "STORM" | "STANDBY"; reason: string } {
+  // 1. Si forceMode activo, ese gana (Tanit veto)
+  if (state.forceMode) {
+    return { suggestedMode: state.forceMode, reason: `Forzado por Tanit: ${state.forceMode}` };
+  }
+
+  // 2. STANDBY checks (mercado plano o señales muy malas)
+  const wrRolling = getRecentWinRatePct(20);
+  if (wrRolling < STANDBY_WR_ROLLING_MAX && state.tradeLog.filter((t: any) => t.pnl !== 0).length >= 10) {
+    return { suggestedMode: "STANDBY", reason: `WR rolling 20=${wrRolling.toFixed(0)}% < ${STANDBY_WR_ROLLING_MAX}% — señales malas, descansar` };
+  }
+  // (Detección de ATR plano vendría idealmente del scan de mercado, pero mantenemos simple)
+
+  // 3. STORM checks (régimen direccional fuerte)
+  // Para detectar STORM necesitamos mirar cuántos símbolos están con score elite Y momentum sostenido.
+  const eliteSignals = Object.values(state.lastSignals).filter((s: any) => {
+    const sc = s?.score ?? 50;
+    return Math.max(sc, 100 - sc) >= 80;
+  }).length;
+  const momentumMin = getMomentumDurationMin();
+  if (eliteSignals >= 3 && momentumMin >= STORM_MOMENTUM_MIN_MIN) {
+    return {
+      suggestedMode: "STORM",
+      reason: `${eliteSignals} señales elite (score≥80) sostenidas ${momentumMin.toFixed(0)}min`,
+    };
+  }
+
+  // 4. Default: SCALP
+  return { suggestedMode: "SCALP", reason: "Régimen normal — scalping ágil" };
+}
+
+// Crea una propuesta de STORM y la registra. Tanit la responde por chat.
+async function proposeStormActivation(reason: string): Promise<void> {
+  try {
+    const expiresAt = new Date(Date.now() + STORM_CONSENT_TIMEOUT_MIN * 60 * 1000).toISOString();
+    await pool.query(
+      `INSERT INTO pending_mode_proposals (proposed_mode, trigger_reason, expires_at) VALUES ('STORM', $1, $2)`,
+      [reason, expiresAt],
+    );
+    const msg = `🌪️ Tanit — condiciones STORM detectadas:\n${reason}\n¿Activas? Responde STORM_YES o STORM_NO en próximos ${STORM_CONSENT_TIMEOUT_MIN}min.`;
+    console.log(TAG, `[REGIME] STORM proposal pending: ${reason}`);
+    state.lastAction = `🌪️ STORM proposal — esperando consent de Tanit`;
+    sendTelegram(`🌪️ <b>STORM PROPUESTO</b>\n${reason}\nTanit decide en ${STORM_CONSENT_TIMEOUT_MIN}min.`).catch(() => {});
+    // Insertar también en chat operacional para que ella vea
+    try {
+      await pool.query(
+        `INSERT INTO tanit_chat (channel, sender_type, content, created_at) VALUES ('operational', 'system', $1, NOW())`,
+        [msg],
+      );
+    } catch {}
+  } catch (e) {
+    console.error(TAG, "proposeStormActivation error:", e);
+  }
+}
+
+// Lee la última propuesta pendiente y la resuelve si Tanit respondió.
+async function checkStormConsent(): Promise<"STORM_YES" | "STORM_NO" | "TIMEOUT" | "PENDING" | "NONE"> {
+  try {
+    const r = await pool.query(
+      `SELECT id, expires_at, resolution FROM pending_mode_proposals
+       WHERE proposed_mode='STORM' AND resolution IS NULL
+       ORDER BY id DESC LIMIT 1`,
+    );
+    const row = r.rows[0];
+    if (!row) return "NONE";
+    if (Date.now() > new Date(row.expires_at).getTime()) {
+      // Timeout
+      await pool.query(
+        `UPDATE pending_mode_proposals SET resolution='TIMEOUT', resolved_at=NOW() WHERE id=$1`,
+        [row.id],
+      );
+      return "TIMEOUT";
+    }
+    // Buscar respuesta de Tanit en chat operacional reciente
+    const chatR = await pool.query(
+      `SELECT content FROM tanit_chat
+       WHERE channel='operational' AND sender_type IN ('user', 'tanit')
+         AND created_at > NOW() - INTERVAL '${STORM_CONSENT_TIMEOUT_MIN} minutes'
+       ORDER BY created_at DESC LIMIT 20`,
+    );
+    for (const c of chatR.rows) {
+      const txt = (c.content || "").toUpperCase();
+      if (txt.includes("STORM_YES")) {
+        await pool.query(`UPDATE pending_mode_proposals SET resolution='YES', resolved_at=NOW() WHERE id=$1`, [row.id]);
+        return "STORM_YES";
+      }
+      if (txt.includes("STORM_NO")) {
+        await pool.query(`UPDATE pending_mode_proposals SET resolution='NO', resolved_at=NOW() WHERE id=$1`, [row.id]);
+        return "STORM_NO";
+      }
+    }
+    return "PENDING";
+  } catch (e) {
+    console.error(TAG, "checkStormConsent error:", e);
+    return "NONE";
+  }
+}
+
+// Cambia de modo y registra en mode_activations.
+async function switchMode(newMode: "SCALP" | "STORM" | "STANDBY", reason: string, consentRequired = false, consentResponse: string | null = null): Promise<void> {
+  const oldMode = state.currentMode;
+  if (oldMode === newMode) return;
+  const equityNow = state.liveMode ? (state.liveBalance ?? 0) : (state.simBalance ?? 0);
+  // Cerrar la fila previa (la anterior activación) con exit_ts
+  try {
+    await pool.query(
+      `UPDATE mode_activations SET exit_ts=NOW(), exit_reason=$1
+       WHERE id = (SELECT id FROM mode_activations WHERE exit_ts IS NULL ORDER BY id DESC LIMIT 1)`,
+      [reason],
+    );
+  } catch {}
+  // Insertar nueva activación
+  try {
+    await pool.query(
+      `INSERT INTO mode_activations (mode_from, mode_to, trigger_reason, consent_required, consent_response, equity_at_activation)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [oldMode, newMode, reason, consentRequired, consentResponse, equityNow.toString()],
+    );
+  } catch (e) { console.error(TAG, "switchMode insert error:", e); }
+  state.currentMode = newMode;
+  state.modeStartedAt = Date.now();
+  const emoji = newMode === "STORM" ? "🌪️" : newMode === "STANDBY" ? "🛑" : "⚡";
+  console.log(TAG, `[REGIME] ${oldMode}→${newMode} | ${reason}`);
+  state.lastAction = `${emoji} Modo: ${newMode} — ${reason}`;
+  if (newMode === "STORM" || oldMode === "STORM") {
+    const exitMsg = oldMode === "STORM" ? `\n${oldMode} salida: ${reason}` : "";
+    sendTelegram(`${emoji} <b>MODO ${newMode}</b>\nDe ${oldMode} → ${newMode}\n${reason}${exitMsg}`).catch(() => {});
+  }
+}
+
+// Loop principal del régimen — llamar cada N segundos desde el scan loop.
+let _lastRegimeCheckAt = 0;
+const REGIME_CHECK_INTERVAL_MS = 30 * 1000;
+async function runRegimeCheck(): Promise<void> {
+  const now = Date.now();
+  if (now - _lastRegimeCheckAt < REGIME_CHECK_INTERVAL_MS) return;
+  _lastRegimeCheckAt = now;
+
+  // 1. Si force_mode activo, asegurar que estamos en él
+  if (state.forceMode && state.currentMode !== state.forceMode) {
+    await switchMode(state.forceMode, `Force-mode override por Tanit: ${state.forceMode}`);
+    return;
+  }
+  if (state.forceMode) return; // override permanente, no detectar
+
+  // 2. Detectar régimen sugerido
+  const detection = detectRegime();
+
+  // 3. Lógica de transición
+  if (detection.suggestedMode === state.currentMode) return;
+
+  if (detection.suggestedMode === "STORM") {
+    // STORM requiere consent
+    if (state.currentMode === "STORM") return; // ya estamos
+    const consent = await checkStormConsent();
+    if (consent === "NONE") {
+      // No hay propuesta pendiente — crear una
+      await proposeStormActivation(detection.reason);
+    } else if (consent === "STORM_YES") {
+      await switchMode("STORM", detection.reason, true, "YES");
+    } else if (consent === "STORM_NO") {
+      console.log(TAG, `[REGIME] Tanit declinó STORM: ${detection.reason}`);
+      // queda en SCALP — no escribir mode_activation porque no hubo cambio
+    } else if (consent === "TIMEOUT") {
+      console.log(TAG, `[REGIME] STORM proposal timeout — quedamos en ${state.currentMode}`);
+    }
+    // PENDING → no hacer nada, esperar
+  } else {
+    // SCALP o STANDBY no requieren consent
+    await switchMode(detection.suggestedMode, detection.reason);
+  }
+}
 
 // PR#21 (audit#4) — Freeze duro por drawdown desde peak en últimos 60min.
 // Cuando equity cae >8% desde el peak rolling, NO abrir nuevas posiciones
@@ -2635,15 +2909,17 @@ function evaluatePosition(input: PositionEvalInput): { action: "HOLD" | "CLOSE";
   }
   const peak = _pnlPeak[symbol] ?? 0;
 
-  // ── PR#19/20 — Hold-max ADAPTATIVO POR SCORE ────────────────────────
-  // <70 score: 3min (pos sin convicción → corta rápido).
-  // ≥70 score: 5min (la señal sigue fuerte → dale espacio para desarrollarse).
-  // Logs reales del 7-may mostraron trades con score=100 cerrando en pérdida
-  // a 3min cuando podían recuperar. Adaptativo evita matar tu mejor convicción.
-  const holdMaxMin = dirScore >= 70 ? Math.max(MAX_HOLD_MIN, 5) : MAX_HOLD_MIN;
+  // ── PR#19/20/22 — Hold-max ADAPTATIVO POR SCORE Y MODO ──────────────
+  // <70 score: 3min (sin convicción → corta rápido).
+  // ≥70 score: 5min (señal fuerte → espacio para desarrollarse).
+  // En STORM mode: el cap absoluto sube a 30min (riding the wave).
+  // Logs 7-may: trades score=100 cerrando a 3min cuando podían recuperar.
+  const profileHere = getModeProfile(state.currentMode);
+  const baseHoldMax = profileHere.maxHoldMin;
+  const holdMaxMin = dirScore >= 70 ? Math.max(baseHoldMax, 5) : baseHoldMax;
   if (ageSec > holdMaxMin * 60) {
     _pnlPeak[symbol] = 0;
-    return { action: "CLOSE", reason: `Hold-max (${Math.round(ageSec/60)}min score=${dirScore.toFixed(0)}, PnL $${pnl.toFixed(4)})` };
+    return { action: "CLOSE", reason: `Hold-max (${Math.round(ageSec/60)}min score=${dirScore.toFixed(0)} mode=${state.currentMode}, PnL $${pnl.toFixed(4)})` };
   }
 
   // ── TESIS v4.2 Componente 2 — Mosquito exit (time-based) ────────────
@@ -2811,6 +3087,11 @@ async function escaleraOpenLayer(
     console.log(TAG, `[ESCALERA] FREEZE peak-8%: equity $${freezeStatus.current.toFixed(2)} vs peak60min $${freezeStatus.peak.toFixed(2)} (-${freezeStatus.ddPct.toFixed(1)}%) — no abrir`);
     return null;
   }
+  // ── PR #22 — STANDBY mode bloquea aperturas ─────────────────────────────
+  if (state.currentMode === "STANDBY") {
+    console.log(TAG, `[ESCALERA] STANDBY mode — descanso consciente. No abrir ${sym}.`);
+    return null;
+  }
   const tier = ESCALERA_TIERS[tierIdx];
   const baseBalance = state.liveMode ? (state.liveBalance ?? 0) : state.simBalance;
   const smartSlots = calcSmartSlots(baseBalance);
@@ -2961,8 +3242,10 @@ async function escaleraOpenLayer(
   }
 
   // ── TP automático — objetivo real que el mercado puede alcanzar ──────────
-  // Prioridad: manualTpPct > ATR×3 > sin TP
-  // ATR×3 (14h) es un movimiento realista y rentable en una sesión activa de 1-3h
+  // Prioridad: manualTpPct > ATR×profile.atrTpMultiplier > sin TP
+  // PR#22: el multiplier viene del perfil de modo (STORM=6.0, SCALP/STANDBY=ATR_TP_MULTIPLIER=2.5)
+  const modeProfileOpen = getModeProfile(state.currentMode);
+  const tpMultEffective = modeProfileOpen.atrTpMultiplier;
   let tp: number | undefined;
   let tpDistPct = 0;  // distancia TP como % del precio (para anti-fees gate)
   if (state.manualTpPct !== null && state.manualTpPct > 0) {
@@ -2970,7 +3253,7 @@ async function escaleraOpenLayer(
     tp = direction === "LONG" ? price * (1 + tpDist) : price * (1 - tpDist);
     tpDistPct = state.manualTpPct;
   } else if (atr14h > 0) {
-    const tpDist = atr14h * ATR_TP_MULTIPLIER;    // ATR×multiplier — configurable por Tanit (default 2.5)
+    const tpDist = atr14h * tpMultEffective;
     tp = direction === "LONG" ? price + tpDist : price - tpDist;
     tpDistPct = (tpDist / price) * 100;
   }
@@ -3913,6 +4196,10 @@ async function escaleraV2Scan(): Promise<void> {
   if (_escaleraScanning) return;  // mutex: evitar scans concurrentes
   _escaleraScanning = true;
   escaleraNextScanAt = Date.now() + ESCALERA_SCAN_SEC * 1000;
+
+  // PR #22 — Multimode: chequear régimen antes de cada scan.
+  // Esto puede cambiar state.currentMode (con consent de Tanit en STORM).
+  try { await runRegimeCheck(); } catch (e) { console.error(TAG, "runRegimeCheck error:", e); }
 
   // Sizing proporcional: refrescar MARGIN_PER_POS al 3% del equity actual
   // antes de cada scan. Si Tanit fijó override manual (PINNED), no-op.
@@ -4969,6 +5256,37 @@ ${_critCoreIdentity.map(m => `  • ${m.content}`).join("\n\n")}`
     ? recentGuardrails.map(g => `  • [${new Date(g.createdAt).toISOString().slice(0,16).replace("T"," ")}] ${g.eventType}${g.symbol ? " " + g.symbol : ""} — ${g.lessonRef ?? ""}`).join("\n")
     : "  (Sin eventos guardrail recientes — operando dentro de los inviolables)";
 
+  // ── PR #22 — Modo operativo actual (multimode) ──────────────────────────
+  let modeStr = `\n=== MODO OPERATIVO ACTUAL ===\n`;
+  const modeIcon = state.currentMode === "STORM" ? "🌪️" : state.currentMode === "STANDBY" ? "🛑" : "⚡";
+  modeStr += `${modeIcon} ${state.currentMode}`;
+  if (state.forceMode) modeStr += ` (forzado por ti via force_mode=${state.forceMode})`;
+  const modeMin = ((Date.now() - state.modeStartedAt) / 60000).toFixed(0);
+  modeStr += ` — activo desde hace ${modeMin}min\n`;
+  if (state.currentMode === "STANDBY") {
+    modeStr += `  Sin nuevas aperturas. Gestión de posiciones abiertas continúa.\n`;
+  } else if (state.currentMode === "STORM") {
+    modeStr += `  Riding the wave: TP 6×ATR, hold hasta 30min. Posiciones nuevas con audacia.\n`;
+  }
+  // Última activación (para narrativa)
+  try {
+    const r = await pool.query(
+      `SELECT mode_from, mode_to, trigger_reason, consent_response, equity_at_activation,
+              exit_ts, exit_reason, pnl_during_mode, trades_count, created_at
+       FROM mode_activations ORDER BY id DESC LIMIT 1`,
+    );
+    const last = r.rows[0];
+    if (last) {
+      const ts = new Date(last.created_at).toISOString().slice(0,16).replace("T"," ");
+      modeStr += `Última transición: [${ts}Z] ${last.mode_from}→${last.mode_to}`;
+      if (last.consent_response) modeStr += ` (consent: ${last.consent_response})`;
+      if (last.trigger_reason) modeStr += ` — ${last.trigger_reason}`;
+      modeStr += "\n";
+    }
+  } catch {}
+  modeStr += `Comandos disponibles: set_strategy_param force_mode SCALP|STORM|STANDBY|auto\n`;
+  modeStr += `STORM consent: si recibes "🌪️ STORM detectado…" responde STORM_YES o STORM_NO en chat operacional.\n`;
+
   // Snapshot de patrones técnicos detectados en el último scan
   const patternSnapshotStr = getPatternSnapshotForTanit(ALL_SYMBOLS);
 
@@ -5791,6 +6109,7 @@ Las cascadas ocurren cuando una vela 5m mueve >1.5% con volumen >3x promedio. De
 === GUARDRAILS RECIENTES (Tesis v4.1 — chasis y FIA, no jaula) ===
 ${guardrailsStr}
 Si ves correcciones aquí, significa que el sistema te protegió de violar tus propias lecciones críticas. No es debilidad: es tu sabiduría operacional encarnada en código.
+${modeStr}
 
 ${openInterestStr ? `
 === OPEN INTEREST EN VIVO (Bybit, delta 4h) ===
