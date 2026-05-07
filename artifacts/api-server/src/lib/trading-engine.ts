@@ -5250,8 +5250,8 @@ ${_critCoreIdentity.map(m => `  • ${m.content}`).join("\n\n")}`
           body: JSON.stringify({
             model: "sonar-pro",
             messages: [
-              { role: "system", content: "Eres un asistente de inteligencia de mercado crypto. Responde en español. Solo datos concretos relevantes para scalping de 15-90 min. Máximo 180 palabras. Sin introducciones, solo datos." },
-              { role: "user", content: `Hora actual: ${cancunTime} Cancún. Dame: 1) Noticias cripto importantes de las últimas 2h que afecten precio. 2) Movimientos significativos de BTC, ETH, SOL, XRP, LINK, AVAX, ADA, DOGE, TON, TRX. 3) Eventos macro o regulación inmediatos. 4) Riesgos o catalizadores para altcoins ahora mismo.` }
+              { role: "system", content: "Eres un asistente de inteligencia de mercado crypto. Responde en español. Solo datos concretos relevantes para scalping de 15-90 min. Máximo 180 palabras. Sin introducciones, solo datos. NO cites precios numéricos exactos — los precios reales se inyectan por separado vía Bybit REST. Tu trabajo es noticias y narrativa, no precios." },
+              { role: "user", content: `Hora actual: ${cancunTime} Cancún. Dame SOLO: 1) Noticias cripto importantes de las últimas 2h que afecten precio (sin citar precios — solo el evento). 2) Eventos macro o regulación inmediatos. 3) Riesgos o catalizadores para altcoins ahora mismo. 4) Sentiment general del mercado (greed/fear/neutral). NO cites niveles de precio exactos — el sistema ya tiene precios reales de Bybit.` }
             ],
             max_tokens: 400,
           }),
@@ -5907,7 +5907,29 @@ MEMORIA FIJA DE IDENTIDAD — INAMOVIBLE — LEE ESTO ANTES DE RESPONDER:
   // content (live state, current hour, voz interior, recent guardrails,
   // funding, news, perplexity, etc) lives at the bottom so the API can
   // cache the prefix on its side and reduce real latency.
-  const prompt = `${operationalPreface}${personalityBlock}
+  //
+  // PR #28 — bloque PRECIOS LIVE inyectado AL INICIO del prompt para que
+  // el LLM lo vea antes que sus 171 lessons (que mencionan precios viejos).
+  // LLMs respetan más lo que ven primero. Y se REPITE al final como recordatorio.
+  const livePriceBlockHeader = (() => {
+    const lines: string[] = [];
+    const top = ["BTCUSDT","ETHUSDT","SOLUSDT","TONUSDT","XRPUSDT","DOGEUSDT","BNBUSDT","ADAUSDT","AVAXUSDT","LINKUSDT","LTCUSDT","ATOMUSDT","TRXUSDT","SUIUSDT","BCHUSDT"];
+    for (const s of top) {
+      const p = _priceSnapshot[s];
+      if (p && p > 0) lines.push(`  ${s.replace("USDT","").padEnd(6)} $${p.toFixed(p > 100 ? 2 : 4)}`);
+    }
+    if (lines.length === 0) return "";
+    return `\n╔══════════════════════════════════════════════════════════════════════╗
+║  💰 PRECIOS LIVE — GROUND TRUTH (Bybit REST, ${new Date().toISOString().slice(11,19)}Z)  ║
+║  USA ESTOS NÚMEROS, NO LOS DE TU MEMORIA NI DE TUS LESSONS:        ║
+╚══════════════════════════════════════════════════════════════════════╝
+${lines.join("\n")}
+
+REGLA ABSOLUTA: cualquier nivel técnico que cites (soporte, resistencia, target, invalidación, ruptura) DEBE estar a ±5% del precio LIVE de arriba. Si BTC=$81,290 NO cites $67k. Si ETH=$2,336 NO cites $3,500. Tus 171 lessons tienen precios viejos del 2024 y antes — esos precios YA NO EXISTEN. El precio real es el de arriba. Punto.
+`;
+  })();
+
+  const prompt = `${operationalPreface}${personalityBlock}${livePriceBlockHeader}
 ${fechaIdentityStatic}
 ${criticalIdentityBlock}
 ${phaseHistoryBlock}
