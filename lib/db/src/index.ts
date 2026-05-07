@@ -16,7 +16,11 @@ export const pool = new Pool({
   max: 10,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 5000,
-});
+  // PR #31 — anti-cuelgue: blinda 100% de pool.query del workspace.
+  // Si Postgres tarda >4s en una query, la mata en lugar de colgar el chat.
+  statement_timeout: 4000,
+  query_timeout: 5000,
+} as any);
 
 export const db = drizzle(pool, { schema });
 

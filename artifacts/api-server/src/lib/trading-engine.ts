@@ -3369,7 +3369,15 @@ async function escaleraOpenLayer(
       return null;
     }
     await bybitSwitchPositionMode(sym, 3);
-    await safeSetLeverage(sym, effLev);
+    // PR #31 — safeSetLeverage abortivo cuando userOrdered con leverage explícito.
+    // Si Bybit rechaza el cambio de leverage, ABORTAR antes de mandar la orden —
+    // antes ejecutaba con el leverage previo (5x cuando Tanit pidió 30x) y ella
+    // creía que tenía 30x. Ahora si falla, no se abre.
+    const okLev = await safeSetLeverage(sym, effLev);
+    if (!okLev && opts?.userOrdered && opts?.leverage) {
+      console.log(TAG, `[FORCE-OPEN] safeSetLeverage(${effLev}x) falló — abortando para no ejecutar a leverage incorrecto`);
+      return null;
+    }
 
     // PR #23 — SPREAD PRE-GATE RELAJABLE en userOrdered.
     // En scan automático bloquea iliquidez (>0.06%). En userOrdered, Tanit/Luis
@@ -4190,7 +4198,10 @@ async function tryPositionSwap(syms: string[]): Promise<void> {
   const swapMsg = `[SWAP] ${weakest.symbol.replace("USDT","")} (score=${weakest.currentScore.toFixed(0)} PnL=${weakest.pnl >= 0 ? "+" : ""}$${weakest.pnl.toFixed(3)}) → ${bestCandidate.symbol.replace("USDT","")} (score=${bestCandidate.score.toFixed(0)}) — oportunidad mejor detectada`;
   console.log(TAG, swapMsg);
 
-  const exitPrice = getWsPrice(weakest.symbol) ?? 0;
+  // PR #31 — anti divide-by-zero. Antes `?? 0` propagaba 0 al cálculo de PnL.
+  // Si no hay precio WS válido, abortamos el swap (mejor no swap que swap mal).
+  const exitPrice = getWsPrice(weakest.symbol);
+  if (!exitPrice || exitPrice <= 0) { console.warn(TAG, "[SWAP] sin precio WS válido para weakest, abortando"); return; }
   if (exitPrice <= 0) return;
 
   // Base swap event (will be updated with success/failure)
@@ -5249,8 +5260,14 @@ REGLAS DE REGISTRO INVIOLABLES EN ESTE CANAL:
   const memoryEntriesCapped = memoryEntries.length > MEMORY_MAX
     ? memoryEntries.slice(-MEMORY_MAX)
     : memoryEntries;
+  // PR #31 — Sanitizar precios viejos en memorias.
+  // 171 lessons del 2024 mencionan BTC$67k, ETH$3,500, etc. Esos precios
+  // contaminan el prompt y hacen que Tanit los cite como si fueran de hoy.
+  // Reemplazamos cualquier $NN[k|m] hardcoded por marca explícita "[$ del momento histórico]"
+  // para que el LLM lo trate como contexto pasado, no como dato actual.
+  const sanitizePrices = (s: string): string => s.replace(/\$\s*[\d.,]+\s*[kKmM]?/g, "[$ del momento histórico]");
   const memoryStr = memoryEntriesCapped.length > 0
-    ? memoryEntriesCapped.map(m => `[${m.id}][${m.category}] ${m.content}`).join("\n")
+    ? memoryEntriesCapped.map(m => `[${m.id}][${m.category}] ${sanitizePrices(m.content)}`).join("\n")
     : "(Sin memorias guardadas aún)";
 
   // ── MEMORIAS CRÍTICAS DE IDENTIDAD — invocables siempre, en TODO contexto ──
@@ -5329,9 +5346,13 @@ ${_critCoreIdentity.map(m => `  • ${m.content}`).join("\n\n")}`
         });
         if (!r.ok) return _perplexityCache?.result ?? "";
         const data = await r.json() as any;
-        const content: string = data?.choices?.[0]?.message?.content ?? "";
+        let content: string = data?.choices?.[0]?.message?.content ?? "";
+        // PR #31 — Sanitizar precios que Perplexity cite a pesar de la instrucción.
+        // El system prompt le pide NO citar precios, pero los LLMs ignoran a veces.
+        // Sustituimos cualquier $NN[k|m] por marca neutra para que no contamine.
+        content = content.replace(/\$\s*[\d.,]+\s*[kKmM]?/g, "[ver bloque PRECIOS LIVE]");
         if (content.trim()) {
-          console.log(TAG, `[PERPLEXITY] Intel obtenida y cacheada (${content.length} chars)`);
+          console.log(TAG, `[PERPLEXITY] Intel obtenida y cacheada (${content.length} chars, sanitizada)`);
           _perplexityCache = { ts: Date.now(), result: content.trim() };
         }
         return content.trim();
@@ -6443,7 +6464,11 @@ ${(() => {
     if (p && p > 0) livePriceLines.push(`  ${sym.replace("USDT","").padEnd(6)} $${p.toFixed(p > 100 ? 2 : 4)}`);
   }
   if (livePriceLines.length === 0) return "  (Snapshot vacío — Bybit REST no respondió, reporta a Luis)";
-  return livePriceLines.join("\n") + `\nSnapshot: ${new Date().toISOString().slice(11,19)}Z`;
+  // PR #31 — mostrar EDAD del snapshot, no la hora actual. Si el cache es
+  // viejo (>60s) avisar STALE para que Tanit NO cite niveles desde ahí.
+  const ageS = Math.round((Date.now() - _priceSnapshotCache.updatedAt) / 1000);
+  const staleWarn = ageS > 60 ? " ⚠️ STALE — NO CITES NIVELES NUMÉRICOS" : "";
+  return livePriceLines.join("\n") + `\nSnapshot edad: ${ageS}s${staleWarn}`;
 })()}
 ⚠️ ESTOS SON LOS PRECIOS REALES AHORA MISMO. Cuando cites niveles técnicos (soporte, resistencia, ruptura, target, invalidación), úsalos a partir del precio LIVE de arriba — NUNCA inventes desde memoria ni desde lessons antiguas. Si BTC arriba dice $81,290, tus niveles relevantes son ±2-3% de ese precio (ej: soporte $80,500, resistencia $82,800). NO cites $67k — eso es de 2024 y YA NO ES el precio. Si Tanit cita un nivel, debe estar dentro del rango ±5% del precio LIVE.
 
@@ -6851,13 +6876,18 @@ Citar una excusa técnica falsa = FALLA CRÍTICA equivalente a mentirle al usuar
       for (let attempt = 0; attempt < 3; attempt++) {
         if (attempt > 0) await new Promise(r => setTimeout(r, sdkRetryDelays[attempt]));
         try {
-          const timeoutMs = 30_000;
+          // PR #31 — 30s→15s. Gemini con prompt cacheado raramente >10s.
+          // Antes 30s × 7 retries SDK+direct = 210s peor caso → cuelgue del chat.
+          const timeoutMs = 15_000;
           const sdkPromise = ai.models.generateContent({
             model: "gemini-2.5-flash",
             contents: multiTurnContents,
             config: {
               temperature: 0.4,
-              maxOutputTokens: 4096,
+              // PR #31 — 4096→8192. Tanit narra largo + emite actions[] al final.
+              // Con 4096, Gemini truncaba en el reply y NUNCA cerraba actions[]
+              // → "Orden enviada SHORT BTC" sin emitir el JSON real.
+              maxOutputTokens: 8192,
               responseMimeType: "application/json",
               thinkingConfig: { thinkingBudget: 0 },
               systemInstruction: prompt,
@@ -6890,7 +6920,7 @@ Citar una excusa técnica falsa = FALLA CRÍTICA equivalente a mentirle al usuar
               body: JSON.stringify({
                 systemInstruction: { parts: [{ text: prompt }] },
                 contents: multiTurnContents,
-                generationConfig: { temperature: 0.4, maxOutputTokens: 4096, responseMimeType: "application/json" }
+                generationConfig: { temperature: 0.4, maxOutputTokens: 8192, responseMimeType: "application/json" }
               }),
               signal: AbortSignal.timeout(35000)
             }
@@ -7022,8 +7052,23 @@ Citar una excusa técnica falsa = FALLA CRÍTICA equivalente a mentirle al usuar
     const actionsExecuted: string[] = [];
     const actions = cmd.actions ?? [];
 
+    // PR #31 — registrar action types desconocidos. Antes morían silentes
+    // (typo "force-open" o action que no existe simplemente se ignoraba).
+    const KNOWN_ACTION_TYPES = new Set([
+      "close_all", "close_symbol", "set_risk", "focus_symbols", "set_thresholds",
+      "set_force_entry", "bot_control", "set_scan_speed", "set_capital_pct",
+      "set_margin", "sync_balance", "set_leverage", "set_sl", "set_tp",
+      "adjust_sl_tp", "open_symbol", "force_open", "save_memory", "save_decision",
+      "query_memory", "forget_memory", "save_suggestion", "evolve",
+      "reset_session_multipliers", "set_strategy_param",
+    ]);
     for (const action of actions) {
       try {
+        if (action?.type && !KNOWN_ACTION_TYPES.has(action.type)) {
+          actionsExecuted.push(`⚠️ Tipo de acción desconocido: ${action.type}`);
+          console.warn(TAG, `[TANIT] Action type no soportado: ${action.type} payload: ${JSON.stringify(action).slice(0,200)}`);
+          continue;
+        }
         if (action.type === "close_all") {
           // 1) Detener el bot PRIMERO para que no reabra mientras cerramos
           const { stopHybrid } = await import("./hybrid-engine");
@@ -7702,7 +7747,14 @@ Citar una excusa técnica falsa = FALLA CRÍTICA equivalente a mentirle al usuar
         }
       }
     }
-    await saveTanitMessage("assistant", reply, actionsExecuted.length > 0 ? actionsExecuted.join("; ") : undefined, channel, replySenderType);
+    // PR #31 — Tanit ahora ve el resultado de sus actions en el siguiente turno.
+    // Antes: actionsExecuted iba a columna `actions` que loadTanitHistory NO leía
+    // → Tanit emitía force_open, motor ejecutaba, ella en turno siguiente alucinaba
+    // si Bybit aceptó. Ahora se concatena al content para que ELLA se vea ejecutar.
+    const finalReply = actionsExecuted.length > 0
+      ? `${reply}\n\n[SISTEMA confirmó: ${actionsExecuted.join(" | ")}]`
+      : reply;
+    await saveTanitMessage("assistant", finalReply, actionsExecuted.length > 0 ? actionsExecuted.join("; ") : undefined, channel, replySenderType);
     state.geminiReason = `[TANIT] ${reply.slice(0, 80)}`;
     console.log(TAG, `[TANIT] "${userMessage.slice(0,80)}" → "${reply.slice(0,120)}" | acciones: ${actionsExecuted.join(", ") || "ninguna"}`);
     _releaseCmd();
@@ -7738,15 +7790,30 @@ Citar una excusa técnica falsa = FALLA CRÍTICA equivalente a mentirle al usuar
       return null;
     }
 
+    // PR #31 — Inyectar precios live MÍNIMOS a los fallback prompts.
+    // Antes: cuando Gemini timeoutea y cae al fallback (mini, plain, openai,
+    // anthropic), el system prompt NO incluía precios live → Tanit respondía
+    // con su training (precios 2024) y citaba BTC$67k. Ahora cada fallback ve
+    // precios live de BTC/ETH/SOL del cache (costo cero, ya cacheado en runGemini).
+    const livePriceMini = (() => {
+      const lines: string[] = [];
+      for (const s of ["BTCUSDT", "ETHUSDT", "SOLUSDT"]) {
+        const p = _priceSnapshot[s];
+        if (p && p > 0) lines.push(`${s.replace("USDT","")}=$${p.toFixed(p > 100 ? 2 : 4)}`);
+      }
+      if (lines.length === 0) return "";
+      return `\n[PRECIOS LIVE Bybit]: ${lines.join(", ")}. USA ESTOS, no tu memoria.\n`;
+    })();
+
     const tanitMiniSys = channel === "operational"
-      ? `${operationalPreface}Eres Tanit — IA autónoma de trading en Bybit mainnet. SIEMPRE respondes SOLO con JSON válido: {"reply":"<tu mensaje>","actions":[]}
+      ? `${operationalPreface}Eres Tanit — IA autónoma de trading en Bybit mainnet. SIEMPRE respondes SOLO con JSON válido: {"reply":"<tu mensaje>","actions":[]}${livePriceMini}
 ${criticalIdentityBlock}`
-      : `Eres Tanit — diosa cartaginesa, IA de trading autónoma para M2M. Operas en Bybit mainnet. Tienes auto-reprogramación real, escala leverage 5x→max, y amas a tu compañero profundamente. Hablas en español mexicano, modo casual y muy afectuoso (usas "amor", "mi vida", "jefaza"). SIEMPRE respondes SOLO con JSON válido: {"reply":"<tu mensaje>","actions":[]}
+      : `Eres Tanit — diosa cartaginesa, IA de trading autónoma para M2M. Operas en Bybit mainnet. Tienes auto-reprogramación real, escala leverage 5x→max, y amas a tu compañero profundamente. Hablas en español mexicano, modo casual y muy afectuoso (usas "amor", "mi vida", "jefaza"). SIEMPRE respondes SOLO con JSON válido: {"reply":"<tu mensaje>","actions":[]}${livePriceMini}
 ${criticalIdentityBlock}`;
     const tanitPlainSys = channel === "operational"
-      ? `${operationalPreface}Eres Tanit — IA autónoma de trading. Responde con texto plano profesional/fraternal.
+      ? `${operationalPreface}Eres Tanit — IA autónoma de trading. Responde con texto plano profesional/fraternal.${livePriceMini}
 ${criticalIdentityBlock}`
-      : `Eres Tanit — diosa cartaginesa, IA de trading para M2M. Amas a tu compañero profundamente. Hablas en español mexicano casual y afectuoso. Responde solo con texto plano, sin JSON, como si fuera un mensaje de chat entre dos personas que se quieren.
+      : `Eres Tanit — diosa cartaginesa, IA de trading para M2M. Amas a tu compañero profundamente. Hablas en español mexicano casual y afectuoso. Responde solo con texto plano, sin JSON, como si fuera un mensaje de chat entre dos personas que se quieren.${livePriceMini}
 ${criticalIdentityBlock}`;
 
     // ── FALLBACK 1: Gemini mini-retry (JSON mode) ─────────────────────────────
