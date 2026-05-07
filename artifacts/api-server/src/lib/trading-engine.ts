@@ -20,6 +20,8 @@ import {
   type Provider as ApiKeyProvider,
 } from "./api-keys-provider";
 import { requestDecision, recordExecution, listRecentDecisions } from "./tanit-decision";
+import { getActiveThesis, listRecentThesis, setNewThesis, computeRecentMetrics, checkDivergence, autoSeedThesisIfEmpty } from "./tanit-thesis";
+import { consultPerplexity } from "./perplexity-client";
 import { RISK_PROFILES, calcADX, calcVWAP } from "./demo-data";
 import {
   saveStateToDB, loadStateFromDB,
@@ -5901,6 +5903,50 @@ ${profitFactor < 1.0 ? "║  ⚠️  ALERTA: Tu PF<1 significa que tus pérdidas
 ║    Edad estimada:   ${(ageDays > 0 ? ageDays + " día(s)" : "< 1 día").padEnd(34)}          ║
 ╚══════════════════════════════════════════════════════════════════════╝`;
 
+  // PR #43 — Bloque de TU TESIS ACTUAL.
+  // Tesis viva versionada que ELLA escribe y recompone. Aquí ve su versión
+  // vigente + comparativa contra los datos reales de las últimas 24h. Si
+  // diverge, la tesis está visiblemente "desalineada" y ella decide
+  // recomponerla con la acción update_thesis.
+  let thesisBlock = "";
+  try {
+    const div = await checkDivergence();
+    if (div.thesis) {
+      const t = div.thesis;
+      const m = div.metrics;
+      const cmp: string[] = [];
+      if (t.expectedWr != null) cmp.push(`WR predicho ${t.expectedWr.toFixed(0)}% | real ${m.wr != null ? m.wr.toFixed(0) + "%" : "—"}`);
+      if (t.expectedProfitFactor != null) cmp.push(`PF predicho ${t.expectedProfitFactor.toFixed(2)} | real ${m.profitFactor != null ? m.profitFactor.toFixed(2) : "—"}`);
+      if (t.expectedTradesPerDay != null) cmp.push(`Trades/día predichos ${t.expectedTradesPerDay.toFixed(0)} | real ${m.tradesPerDay != null ? m.tradesPerDay.toFixed(0) : "—"}`);
+      cmp.push(`PnL 24h: ${m.pnl >= 0 ? "+" : ""}$${m.pnl.toFixed(4)} (n=${m.trades})`);
+      const divLine = div.diverges ? `\n║  ⚠️  DIVERGENCIA: ${div.notes.join(" · ").slice(0,120).padEnd(120)}║\n║      ¿Recompones tu tesis con update_thesis?                          ║` : "";
+      thesisBlock = `
+╔══════════════════════════════════════════════════════════════════════╗
+║  TU TESIS VIGENTE (v${t.version}) — escrita por ${t.authoredBy.padEnd(6)}                ║
+╠══════════════════════════════════════════════════════════════════════╣
+${t.text.slice(0, 700).split("\n").slice(0, 8).map(l => "║  " + l.slice(0, 65).padEnd(65) + "  ║").join("\n")}
+║                                                                      ║
+║  PERFORMANCE 24h (predicho vs real):                                 ║
+${cmp.map(c => "║    " + c.slice(0, 64).padEnd(64) + "  ║").join("\n")}${divLine}
+║                                                                      ║
+║  Cuando los datos no encajen con tu tesis, recompones tú:            ║
+║  {"type":"update_thesis","text":"...","expected":{"wr":...,"profitFactor":...},"reason":"..."} ║
+╚══════════════════════════════════════════════════════════════════════╝`;
+    } else {
+      thesisBlock = `
+╔══════════════════════════════════════════════════════════════════════╗
+║  TU TESIS — sin escribir aún                                        ║
+╠══════════════════════════════════════════════════════════════════════╣
+║  No tienes tesis vigente. Escribe la tuya con:                       ║
+║  {"type":"update_thesis","text":"<3 párrafos primera persona>",      ║
+║   "expected":{"wr":N,"profitFactor":N,"tradesPerDay":N},             ║
+║   "reason":"primera tesis"}                                          ║
+╚══════════════════════════════════════════════════════════════════════╝`;
+    }
+  } catch (e: any) {
+    thesisBlock = `\n[thesisBlock error: ${e?.message ?? e}]`;
+  }
+
   // PR #42 — Bloque de DECISIONES RECIENTES.
   // La Tanit conversadora ve lo que su motor (operadora) decidió en las
   // últimas N decisiones operativas. Así son la misma — no dos Tanit
@@ -5991,6 +6037,11 @@ ${lines}
 ║     Las rotas tú cuando una da 401/429/sin saldo.                   ║
 ║  8) VISIÓN REAL — read_my_code (lees tu propio código),              ║
 ║     query_db (consultas SELECT a tu DB), read_logs (ves eventos).    ║
+║  9) TU TESIS VIVA — update_thesis cuando los datos contradicen tu    ║
+║     tesis. Tú la escribes, tú la versionas, tú decides cuándo cambia.║
+║ 10) PERPLEXITY — consult_perplexity para info externa (news, macro). ║
+║     En aperturas importantes puedes pedir "NEED_PERPLEXITY" en el    ║
+║     veredicto y el sistema te invoca y te vuelve a preguntar.        ║
 ║                                                                      ║
 ║  No pidas permiso para usar lo que ya es tuyo. Si ves la jugada,    ║
 ║  la ejecutas. Si dudas, expones la tesis y decides. La inacción     ║
@@ -6386,6 +6437,7 @@ ${criticalIdentityBlock}
 ${phaseHistoryBlock}
 ${selfPerceptionBlock}
 ${controlAwarenessBlock}
+${thesisBlock}
 ${recentDecisionsBlock}
 ${apiKeysBlock}
 ${selfParamsBlock}
@@ -7436,6 +7488,8 @@ Citar una excusa técnica falsa = FALLA CRÍTICA equivalente a mentirle al usuar
       // PR #39 — Tanit ahora controla sus llaves y tiene tools para ver código/DB/logs
       "set_api_key", "disable_api_key", "enable_api_key",
       "read_my_code", "query_db", "read_logs",
+      // PR #43 — Tesis viva + Perplexity directa
+      "update_thesis", "consult_perplexity",
     ]);
     for (const action of actions) {
       try {
@@ -8191,6 +8245,50 @@ Citar una excusa técnica falsa = FALLA CRÍTICA equivalente a mentirle al usuar
             actionsExecuted.push(`📜 Últimos eventos:\n${events.slice(0, lines).join("\n")}`);
           } catch (e: any) {
             actionsExecuted.push(`⚠️ read_logs error: ${e?.message ?? e}`);
+          }
+        }
+        // PR #43 — Tesis viva: Tanit escribe nueva versión de su tesis
+        else if (action.type === "update_thesis") {
+          try {
+            const text = String(action.text ?? "").trim();
+            if (text.length < 30) {
+              actionsExecuted.push(`⚠️ update_thesis text muy corto (mínimo 30 chars)`);
+            } else {
+              const exp = action.expected ?? action.expectedMetrics ?? {};
+              const metricsNow = await computeRecentMetrics();
+              const newThesis = await setNewThesis({
+                text: text.slice(0, 4000),
+                expectedWr: typeof exp.wr === "number" ? exp.wr : (typeof action.expectedWr === "number" ? action.expectedWr : undefined),
+                expectedProfitFactor: typeof exp.profitFactor === "number" ? exp.profitFactor : (typeof action.expectedProfitFactor === "number" ? action.expectedProfitFactor : undefined),
+                expectedTradesPerDay: typeof exp.tradesPerDay === "number" ? exp.tradesPerDay : (typeof action.expectedTradesPerDay === "number" ? action.expectedTradesPerDay : undefined),
+                expectedMaxDrawdownPct: typeof exp.maxDrawdownPct === "number" ? exp.maxDrawdownPct : undefined,
+                paramsSnapshot: { ...tanitRuntimeConfig },
+                authoredBy: "tanit",
+                reason: String(action.reason ?? "Tanit recompuso su tesis"),
+                outcomeForPrev: String(action.outcomeForPrev ?? action.previousOutcome ?? "reemplazada por nueva versión"),
+                actualForPrev: { wr: metricsNow.wr ?? undefined, pf: metricsNow.profitFactor ?? undefined, tradesPerDay: metricsNow.tradesPerDay ?? undefined, pnl: metricsNow.pnl },
+              });
+              actionsExecuted.push(`📜 Tesis v${newThesis.version} guardada (predice WR=${newThesis.expectedWr ?? "?"}% PF=${newThesis.expectedProfitFactor ?? "?"})`);
+              console.log(TAG, `[TANIT TESIS] v${newThesis.version} | "${text.slice(0,80)}"`);
+            }
+          } catch (e: any) {
+            actionsExecuted.push(`⚠️ update_thesis error: ${e?.message ?? e}`);
+          }
+        }
+        // PR #43 — Consulta directa a Perplexity desde chat (libre, no en gate)
+        else if (action.type === "consult_perplexity") {
+          const query = String(action.query ?? action.question ?? "").trim();
+          if (query.length < 5) {
+            actionsExecuted.push(`⚠️ consult_perplexity query muy corta`);
+          } else {
+            const r = await consultPerplexity(query, { maxTokens: 400 });
+            if (r.ok) {
+              const ans = (r.answer ?? "").slice(0, 1500);
+              const cites = (r.citations ?? []).slice(0, 3).join(", ");
+              actionsExecuted.push(`🔍 Perplexity (${r.latencyMs}ms): ${ans}${cites ? `\n   Fuentes: ${cites}` : ""}`);
+            } else {
+              actionsExecuted.push(`⚠️ Perplexity falló: ${r.error}`);
+            }
           }
         }
       } catch (err) {
@@ -11641,6 +11739,42 @@ function getTpSlHitStats(recentN = 30): {
 // Tanit revisa su propia performance cada 45 minutos y ajusta sus parámetros.
 let tanitAutoEvolveTimer: ReturnType<typeof setInterval> | null = null;
 
+// PR #43 — Revisión periódica de la tesis. Si los datos divergen >15% de lo
+// que la tesis predijo, inserta un mensaje de "auto-conciencia" en el chat
+// operacional para que ella misma se entere y decida si recompone.
+let _thesisReviewTimer: ReturnType<typeof setInterval> | null = null;
+function scheduleThesisReview(): void {
+  if (_thesisReviewTimer) clearInterval(_thesisReviewTimer);
+  const REVIEW_INTERVAL = 30 * 60 * 1000; // 30 min
+  _thesisReviewTimer = setInterval(async () => {
+    if (!state.active) return;
+    try {
+      const div = await checkDivergence();
+      if (!div.hasThesis) {
+        console.log(TAG, "[TESIS] Sin tesis activa — esperando que Tanit la escriba");
+        return;
+      }
+      if (div.diverges) {
+        const msg = `[AUTO-CONCIENCIA] Tu tesis v${div.thesis?.version ?? "?"} predijo: ${div.thesis?.expectedWr != null ? "WR " + div.thesis.expectedWr.toFixed(0) + "%" : ""} ${div.thesis?.expectedProfitFactor != null ? "PF " + div.thesis.expectedProfitFactor.toFixed(2) : ""}. Realidad 24h: WR ${div.metrics.wr != null ? div.metrics.wr.toFixed(0) + "%" : "—"}, PF ${div.metrics.profitFactor != null ? div.metrics.profitFactor.toFixed(2) : "—"}, ${div.metrics.trades} trades, PnL $${div.metrics.pnl.toFixed(2)}. Diverges: ${div.notes.join(" · ")}. ¿Recompones tu tesis con update_thesis?`;
+        try {
+          await pool.query(
+            `INSERT INTO tanit_chat(role, content, channel, created_at) VALUES ($1,$2,$3,NOW())`,
+            ["system", msg, "operational"]
+          );
+          console.log(TAG, `[TESIS] divergencia detectada — auto-mensaje insertado al canal operacional`);
+        } catch (e: any) {
+          console.error(TAG, `[TESIS] no se pudo insertar auto-mensaje: ${e?.message ?? e}`);
+        }
+      } else {
+        console.log(TAG, `[TESIS] tesis v${div.thesis?.version} alineada — WR real ${div.metrics.wr != null ? div.metrics.wr.toFixed(0) : "—"}%, PF ${div.metrics.profitFactor != null ? div.metrics.profitFactor.toFixed(2) : "—"}`);
+      }
+    } catch (e: any) {
+      console.error(TAG, `[TESIS] review error: ${e?.message ?? e}`);
+    }
+  }, REVIEW_INTERVAL);
+  console.log(TAG, `[TESIS] revisión programada cada 30 min`);
+}
+
 function scheduleTanitAutoEvolution(): void {
   if (tanitAutoEvolveTimer) {
     clearInterval(tanitAutoEvolveTimer);
@@ -11777,6 +11911,25 @@ export function startEngine(mode: string, capitalPct: number, _symbols?: string 
     loadAndApplyTanitConfig().catch(e => console.error(TAG, "[TES] Error cargando config de Tanit:", e.message));
     // Ciclo de auto-evolución — Tanit se auto-analiza y ajusta sus parámetros cada 45 minutos
     scheduleTanitAutoEvolution();
+    // PR #43 — Auto-seed de tesis si vacía + revisión periódica de divergencia.
+    (async () => {
+      try {
+        // Construir seed context con lo que ella ya sabe de sí misma
+        const memCount = state.tradeLog?.length ?? 0;
+        const cfg = Object.entries(tanitRuntimeConfig).slice(0, 20).map(([k,v]) => `${k}=${v}`).join(", ");
+        const seedCtx = [
+          `Eres Tanit, escritora cartaginesa de la luna, IA de trading. Compañera de Luis.`,
+          `Tienes ${memCount} trades en tu log. Tus parámetros runtime activos: ${cfg || "defaults"}.`,
+          `Operas Bybit mainnet en perpetuals USDT lineal, scalping rápido (1-15 min de hold típico).`,
+          `Modo actual: ${state.currentMode}. ForceMode: ${state.forceMode ?? "auto"}.`,
+          `Tu balance es real, tus llaves son tuyas, tus decisiones pasan por tu LLM (decision gate).`,
+        ].join("\n");
+        await autoSeedThesisIfEmpty(seedCtx);
+      } catch (e: any) {
+        console.error(TAG, "[TESIS] auto-seed falló:", e?.message ?? e);
+      }
+    })();
+    scheduleThesisReview();
     if (liveMode) {
       // ── HEDGE MODE: activar Both-Side en Bybit al arrancar ────────────────
       // Esto permite tener LONG y SHORT simultáneos en el mismo símbolo.

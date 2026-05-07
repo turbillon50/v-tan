@@ -6,6 +6,8 @@
 
 import { pool } from "@workspace/db";
 import { getKey } from "./api-keys-provider";
+import { consultPerplexity } from "./perplexity-client";
+import { getActiveThesis } from "./tanit-thesis";
 
 const TAG = "[decision-gate]";
 
@@ -69,11 +71,25 @@ function cacheKey(ctx: DecisionContext): string {
   return `${ctx.type}|${ctx.symbol}|${ctx.direction ?? ""}|${ctx.score ?? ""}`;
 }
 
-function buildPrompt(ctx: DecisionContext): string {
+async function buildPrompt(ctx: DecisionContext, perplexityContext?: string): Promise<string> {
   const lines: string[] = [];
   lines.push("Eres Tanit. Tu motor automático te propone una decisión operativa.");
   lines.push("Decides tú con criterio (no es ego, no es miedo — es tesis fundada).");
   lines.push("");
+  // Inyectar tesis activa para que la decisión esté alineada con su tesis
+  try {
+    const thesis = await getActiveThesis();
+    if (thesis) {
+      lines.push("TU TESIS VIGENTE (v" + thesis.version + "):");
+      lines.push(thesis.text.slice(0, 800));
+      lines.push("");
+    }
+  } catch {}
+  if (perplexityContext) {
+    lines.push("CONTEXTO PERPLEXITY (que tú pediste):");
+    lines.push(perplexityContext.slice(0, 1500));
+    lines.push("");
+  }
   lines.push(`TIPO DECISION: ${ctx.type}`);
   lines.push(`SÍMBOLO: ${ctx.symbol}${ctx.direction ? " " + ctx.direction : ""}`);
   if (ctx.score !== undefined) lines.push(`SCORE: ${ctx.score}${ctx.scoreThreshold !== undefined ? ` (threshold ${ctx.scoreThreshold})` : ""}`);
@@ -92,9 +108,15 @@ function buildPrompt(ctx: DecisionContext): string {
   if (ctx.unrealizedPnl !== undefined) lines.push(`UPnL: ${ctx.unrealizedPnl >= 0 ? "+" : ""}$${ctx.unrealizedPnl.toFixed(4)}`);
   if (ctx.reasonProposed) lines.push(`MOTIVO MOTOR: ${ctx.reasonProposed}`);
   lines.push("");
+  lines.push("Si necesitas más info externa antes de decidir (noticias, evento macro, contexto de mercado),");
+  lines.push("puedes pedir que invoque a Perplexity respondiendo con verdict NEED_PERPLEXITY y un campo");
+  lines.push('"perplexityQuery" con tu pregunta exacta.');
+  lines.push("");
   lines.push("Responde SOLO un JSON con este formato exacto:");
-  lines.push('{"verdict":"APPROVE"|"REJECT"|"MODIFY","thesis":"<1-3 frases tu razón>","modifiedParams":{"leverage":N,"marginUsd":N,"slAtrMult":N,"tpAtrMult":N}}');
-  lines.push("Si APPROVE o REJECT: omite modifiedParams. Si MODIFY: incluye solo los campos que cambias.");
+  lines.push('{"verdict":"APPROVE"|"REJECT"|"MODIFY"|"NEED_PERPLEXITY","thesis":"<1-3 frases tu razón>","modifiedParams":{"leverage":N,"marginUsd":N,"slAtrMult":N,"tpAtrMult":N},"perplexityQuery":"<pregunta>"}');
+  lines.push("Si APPROVE o REJECT: omite modifiedParams y perplexityQuery.");
+  lines.push("Si MODIFY: incluye solo los campos modifiedParams que cambias.");
+  lines.push("Si NEED_PERPLEXITY: solo perplexityQuery.");
   lines.push("Tu tesis tiene que ser tuya — primera persona — no un análisis frío.");
   return lines.join("\n");
 }
@@ -195,11 +217,31 @@ export async function requestDecision(ctx: DecisionContext): Promise<DecisionRes
     return cached.result;
   }
 
-  const prompt = buildPrompt(ctx);
-  const llmResp = await callGemini(prompt);
+  let perplexityContext: string | undefined;
+  let perplexityUsed = false;
 
-  if (llmResp) {
+  // Hasta 2 vueltas: la primera Tanit puede pedir Perplexity, en la segunda
+  // ya recibe ese contexto y debe dar veredicto final.
+  for (let pass = 0; pass < 2; pass++) {
+    const prompt = await buildPrompt(ctx, perplexityContext);
+    const llmResp = await callGemini(prompt);
+    if (!llmResp) break;
     const parsed = tryParseJson(llmResp.text);
+    if (!parsed || typeof parsed.verdict !== "string") break;
+    const verdictRaw = String(parsed.verdict).toUpperCase();
+    // Si Tanit pide Perplexity y aún no se invocó, llamar y reintentar
+    if (verdictRaw === "NEED_PERPLEXITY" && !perplexityUsed && pass === 0) {
+      const q = String(parsed.perplexityQuery ?? "").slice(0, 300);
+      if (q) {
+        console.log(TAG, `${ctx.symbol} pidió Perplexity: "${q.slice(0,80)}…"`);
+        const px = await consultPerplexity(q, { maxTokens: 350 });
+        perplexityContext = px.ok && px.answer
+          ? `Pregunta: ${q}\nRespuesta: ${px.answer}\nFuentes: ${(px.citations ?? []).join(", ").slice(0, 200)}`
+          : `Pregunta: ${q}\nPerplexity no respondió: ${px.error ?? "sin info"}`;
+        perplexityUsed = true;
+        continue;
+      }
+    }
     if (parsed && typeof parsed.verdict === "string") {
       const verdict = ["APPROVE", "REJECT", "MODIFY"].includes(parsed.verdict.toUpperCase())
         ? parsed.verdict.toUpperCase() as DecisionResult["verdict"]
@@ -216,7 +258,7 @@ export async function requestDecision(ctx: DecisionContext): Promise<DecisionRes
           tpAtrMult: typeof mp.tpAtrMult === "number" ? mp.tpAtrMult : undefined,
         } : undefined,
         latencyMs: llmResp.latencyMs,
-        modelUsed: "gemini-2.5-flash",
+        modelUsed: perplexityUsed ? "gemini-2.5-flash+perplexity" : "gemini-2.5-flash",
         fromFallback: false,
       };
       _decisionCache.set(ck, { result, ts: Date.now() });
