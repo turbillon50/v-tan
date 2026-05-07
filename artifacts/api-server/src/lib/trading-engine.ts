@@ -4506,6 +4506,15 @@ function simCalcQty(symbol: string, capitalUSDT: number, leverage: number, price
 // si no hay posiciones abiertas en ellos). Tanit citaba precios obsoletos
 // (BTC en 67k cuando real es 81k) porque su inject veía "(Sin datos WS)".
 let _priceSnapshotCache: { data: Record<string, number>; updatedAt: number } = { data: {}, updatedAt: 0 };
+// PR #33 — exponer el cache para diagnóstico via endpoint
+export function getPriceSnapshotDebug(): { data: Record<string, number>; updatedAt: number; ageS: number } {
+  return { data: _priceSnapshotCache.data, updatedAt: _priceSnapshotCache.updatedAt, ageS: _priceSnapshotCache.updatedAt > 0 ? Math.round((Date.now() - _priceSnapshotCache.updatedAt) / 1000) : -1 };
+}
+export async function refreshPriceSnapshot(symbols: string[]): Promise<Record<string, number>> {
+  // Forzar refresh ignorando cache
+  _priceSnapshotCache = { data: {}, updatedAt: 0 };
+  return getLivePriceSnapshot(symbols);
+}
 const PRICE_SNAPSHOT_TTL_MS = 30 * 1000;
 async function getLivePriceSnapshot(symbols: string[]): Promise<Record<string, number>> {
   const now = Date.now();
