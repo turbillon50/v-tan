@@ -255,6 +255,35 @@ router.get("/tanit/guardrail-events", async (req, res): Promise<void> => {
   }
 });
 
+// PR #37 — Endpoint admin para forzar set_strategy_param sin pasar por chat.
+// Útil cuando el chat falla en parsear actions y necesitamos empujar Tanit.
+// SOLO permite parámetros whitelisted para no abusar (lev_max, force_mode, etc).
+router.post("/tanit/admin/set-strategy-param", async (req, res): Promise<void> => {
+  try {
+    const { tanitApplyEvolution } = await import("../lib/trading-engine");
+    const { applyTanitConfig } = await import("../lib/trading-engine");
+    const { param, value, reason } = req.body ?? {};
+    const ALLOWED = new Set([
+      "force_mode", "atr_sl_multiplier", "atr_tp_multiplier", "max_positions",
+      "lev_max", "max_hold_min", "min_tp_price_pct", "manual_margin_pct",
+      "pause_wr_threshold", "standby_wr_max", "drawdown_boost", "fr_long_block",
+    ]);
+    if (!param || !ALLOWED.has(String(param))) {
+      res.status(400).json({ ok: false, error: `param debe ser uno de: ${Array.from(ALLOWED).join(", ")}` });
+      return;
+    }
+    if (value === undefined || value === null || String(value).length === 0) {
+      res.status(400).json({ ok: false, error: "value requerido" });
+      return;
+    }
+    const result = await tanitApplyEvolution(String(param), String(value), String(reason ?? "Admin override"));
+    applyTanitConfig();
+    res.json({ ok: true, param, value: String(value), result });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
 // PR #26 — Diagnóstico de APIs externas. Tanit puede saber qué herramientas
 // tiene operativas (Perplexity, OpenAI, Anthropic, Gemini) y cuáles no.
 router.get("/tanit/api-diagnostics", async (_req, res): Promise<void> => {
