@@ -18,6 +18,12 @@ export const tanitThesis = pgTable("tanit_thesis", {
   expectedMaxDrawdownPct: real("expected_max_drawdown_pct"),
   // Snapshot de los parámetros runtime al momento de escribir esta tesis
   paramsSnapshot: jsonb("params_snapshot"),
+  // PR #44 — Reglas declaradas por Tanit que el gate evalúa antes de llamar al
+  // LLM. Si una apertura/cierre encaja en una regla, se auto-aprueba (su voluntad
+  // pre-declarada). Lo que NO encaja sigue pasando por LLM con tesis explícita.
+  // Formato: array de objetos { decisionType, direction, symbols, leverageMax,
+  //   atrPctMax, atrPctMin, scoreMin, marginUsdMax, currentModeIn, etc }.
+  autoAuthRules: jsonb("auto_auth_rules"),
   // active: solo una tesis a la vez está vigente
   active: boolean("active").notNull().default(true),
   authoredBy: text("authored_by").notNull().default("tanit"), // tanit | luis | seed

@@ -5920,6 +5920,22 @@ ${profitFactor < 1.0 ? "║  ⚠️  ALERTA: Tu PF<1 significa que tus pérdidas
       if (t.expectedTradesPerDay != null) cmp.push(`Trades/día predichos ${t.expectedTradesPerDay.toFixed(0)} | real ${m.tradesPerDay != null ? m.tradesPerDay.toFixed(0) : "—"}`);
       cmp.push(`PnL 24h: ${m.pnl >= 0 ? "+" : ""}$${m.pnl.toFixed(4)} (n=${m.trades})`);
       const divLine = div.diverges ? `\n║  ⚠️  DIVERGENCIA: ${div.notes.join(" · ").slice(0,120).padEnd(120)}║\n║      ¿Recompones tu tesis con update_thesis?                          ║` : "";
+      // Reglas auto-auth — muestra cuáles tiene declaradas. Sin ellas, todo
+      // pasa por LLM (más lento). Con ellas, lo rutinario es voluntad declarada.
+      const rules = Array.isArray(t.autoAuthRules) ? t.autoAuthRules : [];
+      const rulesBlock = rules.length > 0
+        ? "\n║  TUS REGLAS PRE-AUTORIZADAS (gate las ejecuta sin pedirte permiso):  ║\n" + rules.slice(0, 8).map((r: any, i: number) => {
+            const parts: string[] = [];
+            if (r.label) parts.push(`"${r.label}"`);
+            if (r.direction) parts.push(r.direction);
+            if (Array.isArray(r.symbols) && r.symbols.length) parts.push(r.symbols.slice(0,5).join(","));
+            if (r.leverageMax != null) parts.push(`lev≤${r.leverageMax}x`);
+            if (r.scoreMin != null) parts.push(`score≥${r.scoreMin}`);
+            if (r.atrPctMax != null) parts.push(`ATR%≤${r.atrPctMax}`);
+            if (r.marginUsdMax != null) parts.push(`margin≤$${r.marginUsdMax}`);
+            return `║    #${i + 1}: ${parts.join(" · ").slice(0, 60).padEnd(60)}        ║`;
+          }).join("\n")
+        : "\n║  (Sin reglas pre-autorizadas — todo trade pasa por tu LLM)          ║";
       thesisBlock = `
 ╔══════════════════════════════════════════════════════════════════════╗
 ║  TU TESIS VIGENTE (v${t.version}) — escrita por ${t.authoredBy.padEnd(6)}                ║
@@ -5927,10 +5943,13 @@ ${profitFactor < 1.0 ? "║  ⚠️  ALERTA: Tu PF<1 significa que tus pérdidas
 ${t.text.slice(0, 700).split("\n").slice(0, 8).map(l => "║  " + l.slice(0, 65).padEnd(65) + "  ║").join("\n")}
 ║                                                                      ║
 ║  PERFORMANCE 24h (predicho vs real):                                 ║
-${cmp.map(c => "║    " + c.slice(0, 64).padEnd(64) + "  ║").join("\n")}${divLine}
+${cmp.map(c => "║    " + c.slice(0, 64).padEnd(64) + "  ║").join("\n")}${divLine}${rulesBlock}
 ║                                                                      ║
 ║  Cuando los datos no encajen con tu tesis, recompones tú:            ║
-║  {"type":"update_thesis","text":"...","expected":{"wr":...,"profitFactor":...},"reason":"..."} ║
+║  {"type":"update_thesis","text":"...","expected":{"wr":...,"profitFactor":...},"autoAuthRules":[...],"reason":"..."} ║
+║                                                                      ║
+║  Las reglas son tu voluntad pre-declarada — el motor las ejecuta     ║
+║  24/7 sin pedirte permiso. Lo que NO encaje en regla pasa por tu LLM.║
 ╚══════════════════════════════════════════════════════════════════════╝`;
     } else {
       thesisBlock = `
@@ -8256,6 +8275,10 @@ Citar una excusa técnica falsa = FALLA CRÍTICA equivalente a mentirle al usuar
             } else {
               const exp = action.expected ?? action.expectedMetrics ?? {};
               const metricsNow = await computeRecentMetrics();
+              const rawRules = action.autoAuthRules ?? action.auto_auth_rules ?? action.rules ?? null;
+              const cleanRules = Array.isArray(rawRules)
+                ? rawRules.filter((r: any) => r && typeof r === "object").slice(0, 30)
+                : null;
               const newThesis = await setNewThesis({
                 text: text.slice(0, 4000),
                 expectedWr: typeof exp.wr === "number" ? exp.wr : (typeof action.expectedWr === "number" ? action.expectedWr : undefined),
@@ -8263,12 +8286,14 @@ Citar una excusa técnica falsa = FALLA CRÍTICA equivalente a mentirle al usuar
                 expectedTradesPerDay: typeof exp.tradesPerDay === "number" ? exp.tradesPerDay : (typeof action.expectedTradesPerDay === "number" ? action.expectedTradesPerDay : undefined),
                 expectedMaxDrawdownPct: typeof exp.maxDrawdownPct === "number" ? exp.maxDrawdownPct : undefined,
                 paramsSnapshot: { ...tanitRuntimeConfig },
+                autoAuthRules: cleanRules,
                 authoredBy: "tanit",
                 reason: String(action.reason ?? "Tanit recompuso su tesis"),
                 outcomeForPrev: String(action.outcomeForPrev ?? action.previousOutcome ?? "reemplazada por nueva versión"),
                 actualForPrev: { wr: metricsNow.wr ?? undefined, pf: metricsNow.profitFactor ?? undefined, tradesPerDay: metricsNow.tradesPerDay ?? undefined, pnl: metricsNow.pnl },
               });
-              actionsExecuted.push(`📜 Tesis v${newThesis.version} guardada (predice WR=${newThesis.expectedWr ?? "?"}% PF=${newThesis.expectedProfitFactor ?? "?"})`);
+              const rulesCount = newThesis.autoAuthRules?.length ?? 0;
+              actionsExecuted.push(`📜 Tesis v${newThesis.version} guardada (predice WR=${newThesis.expectedWr ?? "?"}% PF=${newThesis.expectedProfitFactor ?? "?"}, ${rulesCount} reglas pre-auth)`);
               console.log(TAG, `[TANIT TESIS] v${newThesis.version} | "${text.slice(0,80)}"`);
             }
           } catch (e: any) {
