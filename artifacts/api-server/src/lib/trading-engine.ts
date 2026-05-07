@@ -1283,14 +1283,26 @@ async function _runSlTpFastLoopInner(): Promise<void> {
     // FIX 6-may-2026 — Salvavidas: cuando margin heat >70%, capamos los saltos
     // de leverage a +3 por ciclo. calcTargetLeverage puede saltar +7/+15 por
     // momentum, lo que disparaba heat 78% y luego losses gigantes (-$0.14/-$0.18).
-    // chooseProgressiveLeverage (open) ya solo sube +1x — esto extiende esa
-    // disciplina al fast-loop (running).
     if (targetLev > curLev) {
-      const heatNow = getCurrentMarginHeatPct();
-      if (heatNow > 70 && (targetLev - curLev) > 3) {
-        const capped = curLev + 3;
-        console.log(TAG, `[LEV-CAP] ${sym} heat=${heatNow.toFixed(1)}% → cap salto ${curLev}x→${targetLev}x a ${curLev}x→${capped}x`);
-        targetLev = capped;
+      // PR#19 brutal — Leverage por CONFIANZA (no momentum):
+      // solo permitir subir si la posición ya está EN VERDE (unrealizedPnl > 0).
+      // Si está en rojo, mantener leverage actual y dejar que el SL trabaje.
+      // Filosofía: leverage es recompensa de una entrada acertada, no acelerador
+      // de una entrada incierta.
+      const grossPnl = layer.notional > 0
+        ? (price - layer.entryPrice) / layer.entryPrice * layer.notional * (inst.direction === "LONG" ? 1 : -1)
+        : 0;
+      if (grossPnl <= 0) {
+        // En rojo o break-even: NO escalar. De-escalación se permite (rama else implícita).
+        targetLev = curLev;
+      } else {
+        // En verde: aplicar cap por heat (D3 PR#18).
+        const heatNow = getCurrentMarginHeatPct();
+        if (heatNow > 70 && (targetLev - curLev) > 3) {
+          const capped = curLev + 3;
+          console.log(TAG, `[LEV-CAP] ${sym} heat=${heatNow.toFixed(1)}% → cap salto ${curLev}x→${targetLev}x a ${curLev}x→${capped}x`);
+          targetLev = capped;
+        }
       }
     }
 
@@ -1543,7 +1555,10 @@ const ALL_SYMBOLS = [
   "JUPUSDT","INJUSDT","APTUSDT","SEIUSDT","LTCUSDT","BCHUSDT","TRXUSDT","ATOMUSDT"
 ];
 
-let MAX_CONCURRENT_POSITIONS = 24;
+// PR#19 brutal: bajado de 24→8. Con $158 USDT, 24 pos = $7/cada uno (anémico).
+// 8 pos = $19/cada uno. Más concentración en mejores señales → wins más grandes.
+// Tanit puede subirlo runtime con set_strategy_param max_positions <n> (1-24).
+let MAX_CONCURRENT_POSITIONS = 8;
 
 await loadState();
 
@@ -1904,6 +1919,12 @@ export function applyTanitConfig(): void {
   // PR #18 — params nuevos para que Tanit los pueda tunear runtime
   if (cfg["loss_magnitude_pct_margin"]) { const v = parseFloat(cfg["loss_magnitude_pct_margin"]); if (!isNaN(v)) LOSS_MAGNITUDE_PCT_MARGIN = Math.max(5, Math.min(50, v)); }
   if (cfg["symbol_loss_cooldown_min"]) { const v = parseFloat(cfg["symbol_loss_cooldown_min"]); if (!isNaN(v)) SYMBOL_LOSS_COOLDOWN_MS = Math.max(0, Math.min(60, v)) * 60 * 1000; }
+  // PR #19 — params del modo brutal
+  if (cfg["max_hold_min"]) { const v = parseFloat(cfg["max_hold_min"]); if (!isNaN(v)) MAX_HOLD_MIN = Math.max(1, Math.min(60, v)); }
+  if (cfg["min_tp_price_pct"]) { const v = parseFloat(cfg["min_tp_price_pct"]); if (!isNaN(v)) MIN_TP_PRICE_PCT = Math.max(0.05, Math.min(2.0, v)); }
+  if (cfg["pause_wr_window"]) { const v = parseFloat(cfg["pause_wr_window"]); if (!isNaN(v)) PAUSE_WR_WINDOW = Math.max(5, Math.min(50, v)); }
+  if (cfg["pause_wr_threshold"]) { const v = parseFloat(cfg["pause_wr_threshold"]); if (!isNaN(v)) PAUSE_WR_THRESHOLD = Math.max(20, Math.min(60, v)); }
+  if (cfg["pause_duration_min"]) { const v = parseFloat(cfg["pause_duration_min"]); if (!isNaN(v)) PAUSE_DURATION_MIN = Math.max(5, Math.min(180, v)); }
 
   // ── Multiplicadores de agresividad por sesión ──────────────────────────────
   const clampMult = (v: number) => Math.max(0.70, Math.min(1.50, v));
@@ -2042,7 +2063,7 @@ let FR_LONG_BLOCK_PCT = 0.15;
 // ── PARÁMETROS DE AUTO-REPROGRAMACIÓN — Tanit los controla directamente ────────
 // TP automático al abrir: entry ± (ATR14h × multiplier)
 // Tanit auto-tunes this from trade history: if >70% hit SL before TP → reduce, if >80% hit TP in <5min → increase
-let ATR_TP_MULTIPLIER        = 4.0;   // set_strategy_param: atr_tp_multiplier (1.0-10.0). Subido 6-may de 3.0→4.0: con 3.0 los winners cerraban temprano y avg_win quedaba en $0.026 (vs $0.064 baseline). 4.0 da más recorrido sin acercarse al límite v4.1 (≤6.0).
+let ATR_TP_MULTIPLIER        = 2.5;   // set_strategy_param: atr_tp_multiplier (1.0-10.0). PR#19 brutal: bajado de 4.0→2.5 — TP más cerca = winner cierra rápido (modo scalping ágil 1-5min). Sigue dentro del límite v4.1 inviolable (≤6.0).
 // Trailing SL escalonado: % del margen para cada etapa
 let TRAILING_SL_STAGE1_PCT   = 0.01;  // Breakeven cuando PnL ≥ 1% del margen  (set: trailing_sl_stage1, rango 0.005-0.10)
 let TRAILING_SL_STAGE2_PCT   = 0.03;  // Lock 33% cuando PnL ≥ 3%              (set: trailing_sl_stage2, rango 0.01-0.20)
@@ -2091,7 +2112,10 @@ let MOSQUITO_PNL_BAND_PCT      = 0.30;  // banda |%| dentro de la cual se consid
 //   Si abs(net delta longs vs shorts) > HEDGE_NET_DELTA_PCT del equity Y la tendencia
 //   1h va contra el sesgo, INYECTA aviso al prompt para que Tanit decida si abre hedge.
 //   No abre automáticamente — esa decisión queda con Tanit (más seguro).
-let FEAT_HEDGE_DETECTOR        = true;  // (set: feat_hedge_detector on|off)
+// PR#19 brutal: default false. Vimos AVAX Buy+Sell, SOL Buy+Sell pagando doble
+// fee por estar en neto cero. Confiamos en SL ajustado, no en hedges.
+// Tanit puede reactivarlo con set_strategy_param feat_hedge_detector on.
+let FEAT_HEDGE_DETECTOR        = false; // (set: feat_hedge_detector on|off)
 let HEDGE_NET_DELTA_PCT        = 30;    // umbral % equity para flag
 
 // Componente 4 — Leverage condicional inteligente
@@ -2158,6 +2182,24 @@ let LOSS_TIME_EXIT_MIN   = 5;
 // sin importar tiempo (no esperes los 5min completos si ya está sangrando feo).
 let LOSS_MAGNITUDE_PCT_MARGIN = 15;  // -15% del margen → cierre inmediato
 
+// PR#19 brutal — Hold máximo absoluto (modo scalping ágil)
+// Cualquier posición que viva más de MAX_HOLD_MIN minutos se cierra (toma lo
+// que haya). Filosofía: trades ágiles 1-5min, no swing trading.
+let MAX_HOLD_MIN = 3;
+
+// PR#19 brutal — Anti-fees gate
+// Bybit cobra 0.11% round-trip taker. Si el TP esperado no supera este % del
+// precio, no abrimos: matemáticamente expectancy negativo.
+let MIN_TP_PRICE_PCT = 0.20;  // 0.20% del precio mínimo
+
+// PR#19 brutal — Pausa por sesión perdedora
+// Si WR rolling de últimos N trades cae bajo umbral, pausamos aperturas N min.
+// Mejor parar que operar mal cuando una sesión está agria.
+let PAUSE_WR_WINDOW = 10;       // últimos N trades para WR rolling
+let PAUSE_WR_THRESHOLD = 40;    // si WR < 40%, pausar
+let PAUSE_DURATION_MIN = 30;    // pausa de 30 min
+let _pauseUntil = 0;            // timestamp ms — 0 = no pausa
+
 function getCurrentMarginHeatPct(): number {
   const equity = state.liveMode ? (state.liveBalance ?? 0) : (state.simBalance ?? 0);
   const available = state.liveAvailable ?? equity;
@@ -2178,6 +2220,31 @@ function getRecentWinRatePct(window = LEV_PROG_WINDOW): number {
   if (recent.length < 5) return 50; // sin datos suficientes — neutral
   const wins = recent.filter((t: any) => (t.pnl ?? 0) > 0).length;
   return (wins / recent.length) * 100;
+}
+
+// PR#19 brutal — Pausa por WR rolling
+// Si los últimos PAUSE_WR_WINDOW trades cerrados tienen WR < threshold,
+// activamos pausa de PAUSE_DURATION_MIN minutos. Bloquea NUEVAS aperturas;
+// la gestión de posiciones abiertas continúa.
+function maybeActivatePauseByWr(): boolean {
+  const now = Date.now();
+  if (now < _pauseUntil) return true;  // ya en pausa
+  const recent = state.tradeLog.filter((t: any) => (t.pnl ?? 0) !== 0).slice(0, PAUSE_WR_WINDOW);
+  if (recent.length < PAUSE_WR_WINDOW) return false;  // no hay suficientes trades
+  const wins = recent.filter((t: any) => (t.pnl ?? 0) > 0).length;
+  const wr = (wins / recent.length) * 100;
+  if (wr < PAUSE_WR_THRESHOLD) {
+    _pauseUntil = now + PAUSE_DURATION_MIN * 60 * 1000;
+    console.warn(TAG, `[PAUSE-WR] WR rolling últimos ${PAUSE_WR_WINDOW}=${wr.toFixed(0)}% < ${PAUSE_WR_THRESHOLD}% — pausa ${PAUSE_DURATION_MIN}min`);
+    state.lastAction = `🛑 Pausa ${PAUSE_DURATION_MIN}min — WR rolling ${wr.toFixed(0)}%`;
+    sendTelegram(`🛑 <b>PAUSA POR WR</b>\nWR últimos ${PAUSE_WR_WINDOW} trades: ${wr.toFixed(0)}% < ${PAUSE_WR_THRESHOLD}%\nPausa ${PAUSE_DURATION_MIN}min — gestión de abiertas continúa.`).catch(() => {});
+    return true;
+  }
+  return false;
+}
+
+function isPauseByWrActive(): boolean {
+  return Date.now() < _pauseUntil;
 }
 
 async function maybeDefensiveClose(): Promise<void> {
@@ -2505,6 +2572,14 @@ function evaluatePosition(input: PositionEvalInput): { action: "HOLD" | "CLOSE";
   }
   const peak = _pnlPeak[symbol] ?? 0;
 
+  // ── PR#19 brutal — Hold-max absoluto ────────────────────────────────
+  // Modo scalping puro: ningún trade vive más de MAX_HOLD_MIN minutos. Si llegó
+  // hasta aquí sin cerrar por TP/SL/microgain, cerrar ahora (toma lo que haya).
+  if (ageSec > MAX_HOLD_MIN * 60) {
+    _pnlPeak[symbol] = 0;
+    return { action: "CLOSE", reason: `Hold-max (${Math.round(ageSec/60)}min, PnL $${pnl.toFixed(4)})` };
+  }
+
   // ── TESIS v4.2 Componente 2 — Mosquito exit (time-based) ────────────
   // Si la posición lleva ≥ MOSQUITO_AGE_MIN minutos y el PnL% absoluto está
   // dentro de ±MOSQUITO_PNL_BAND_PCT, ciérrala. Capital parado en un trade
@@ -2640,6 +2715,12 @@ async function escaleraOpenLayer(
   if (heatGate.blocking) {
     console.log(TAG, `[ESCALERA] Apertura bloqueada: ${heatGate.reason}`);
     state.lastAction = `🛑 Margin heat ${heatGate.heat.toFixed(1)}% — no abrir ${sym}`;
+    return null;
+  }
+  // ── PR#19 brutal — Pausa por WR rolling ────────────────────────────────
+  if (isPauseByWrActive()) {
+    const remainingMin = Math.ceil((_pauseUntil - Date.now()) / 60000);
+    console.log(TAG, `[ESCALERA] Apertura bloqueada por pausa-WR — ${remainingMin}min restantes`);
     return null;
   }
   const tier = ESCALERA_TIERS[tierIdx];
@@ -2779,12 +2860,23 @@ async function escaleraOpenLayer(
   // Prioridad: manualTpPct > ATR×3 > sin TP
   // ATR×3 (14h) es un movimiento realista y rentable en una sesión activa de 1-3h
   let tp: number | undefined;
+  let tpDistPct = 0;  // distancia TP como % del precio (para anti-fees gate)
   if (state.manualTpPct !== null && state.manualTpPct > 0) {
     const tpDist = state.manualTpPct / 100;
     tp = direction === "LONG" ? price * (1 + tpDist) : price * (1 - tpDist);
+    tpDistPct = state.manualTpPct;
   } else if (atr14h > 0) {
-    const tpDist = atr14h * ATR_TP_MULTIPLIER;    // ATR×multiplier — configurable por Tanit (default 3.0)
+    const tpDist = atr14h * ATR_TP_MULTIPLIER;    // ATR×multiplier — configurable por Tanit (default 2.5)
     tp = direction === "LONG" ? price + tpDist : price - tpDist;
+    tpDistPct = (tpDist / price) * 100;
+  }
+
+  // ── PR#19 brutal — Anti-fees gate ────────────────────────────────────
+  // Bybit cobra 0.11% round-trip taker. Si el TP esperado no supera MIN_TP_PRICE_PCT,
+  // matemáticamente expectancy es negativo. No abrimos.
+  if (tp !== undefined && tpDistPct < MIN_TP_PRICE_PCT) {
+    console.log(TAG, `[ESCALERA] Anti-fees: TP a ${tpDistPct.toFixed(3)}% < ${MIN_TP_PRICE_PCT}% (mín fees+colchón) — no abrir ${sym}`);
+    return null;
   }
 
   if (state.liveMode) {
@@ -2934,6 +3026,9 @@ async function escaleraCloseLayer(sym: string, inst: EscaleraSymState, layerIdx:
   recordRealizedPnlV42(netPnl); // tesis v4.2 circuit breaker
   state.sessionTradesCurrent++;
   state.tradesExecuted++;
+
+  // PR#19 brutal — chequear pausa por WR rolling tras cada cierre
+  maybeActivatePauseByWr();
 
   if (netPnl < 0) {
     state.consecutiveLosses++;
@@ -8716,6 +8811,9 @@ async function closePosition(symbol: string, reason: string, exitPrice: number):
     updateSwapOutcomePnl(matchingSwap.ts, matchingSwap.openedSymbol, matchingSwap.outcomePnl).catch(() => {});
   }
 
+  // PR#19 brutal — chequear pausa por WR rolling tras cada cierre
+  maybeActivatePauseByWr();
+
   if (netPnl < 0) {
     state.consecutiveLosses++;
     state.sessionLosses++;
@@ -8922,7 +9020,9 @@ async function manageOpenPosition(symbol: string, price: number): Promise<void> 
   const roundTripFee = entryFeeEst + exitFeeEst;
   const grossPnlMP   = (priceDiff / pos.entryPrice) * notional;
   const realNetPnlMP = grossPnlMP - entryFeeEst - exitFeeEst;
-  const minProfitMP  = Math.max(roundTripFee * 1.5, notional * 0.0025);
+  // PR#19 brutal: minProfit bajado de 0.25%→0.15% notional. Cierra winners en
+  // cuanto pasen fees + colchón mínimo, modo scalping puro.
+  const minProfitMP  = Math.max(roundTripFee * 1.5, notional * 0.0015);
   if (realNetPnlMP >= minProfitMP) {
     console.log(TAG, `[MP] 💰 MICROGAIN ${symbol} ${pos.side} | neto +$${realNetPnlMP.toFixed(4)} > minProfit $${minProfitMP.toFixed(4)}`);
     await closePosition(symbol, `💰 Microgain +$${realNetPnlMP.toFixed(4)}`, price);
@@ -8930,7 +9030,8 @@ async function manageOpenPosition(symbol: string, price: number): Promise<void> 
   }
 
   const ageMs = Date.now() - (new Date((pos as any).openedAt ?? Date.now()).getTime());
-  const quickExitReady = ageMs >= 15 * 1000 && realNetPnlMP >= roundTripFee * 0.25;
+  // PR#19 brutal: quick exit a 8s (de 15s) — agilidad real.
+  const quickExitReady = ageMs >= 8 * 1000 && realNetPnlMP >= roundTripFee * 0.25;
   if (quickExitReady) {
     await closePosition(symbol, `⚡ Quick exit +$${realNetPnlMP.toFixed(4)}`, price);
     return;
