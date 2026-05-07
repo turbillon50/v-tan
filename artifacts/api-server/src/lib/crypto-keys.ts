@@ -12,19 +12,36 @@ const KEY_LEN = 32;
 const SALT = Buffer.from("tanit-master-salt-v1", "utf8"); // estática: scrypt + same input = same key
 
 let _derivedKey: Buffer | null = null;
+// PR #40 — Master key auto-derivada del entorno.
+// Prioridad: TANIT_MASTER_KEY explícita → DATABASE_URL (estable y secreto en
+// Railway/Neon) → POSTGRES_URL → fallback dev. No requiere setup manual:
+// si tienes DB configurada (que la tienes), la master key existe.
+// Si rotas DATABASE_URL, las llaves quedan ilegibles — vuelves a migrar
+// poniendo las env vars originales y el boot reescribe la tabla.
+function pickMaterial(): { source: string; value: string } {
+  const explicit = process.env.TANIT_MASTER_KEY;
+  if (explicit && explicit.length >= 16) return { source: "TANIT_MASTER_KEY", value: explicit };
+  const db = process.env.DATABASE_URL;
+  if (db && db.length >= 32) return { source: "DATABASE_URL-derived", value: db };
+  const pg = process.env.POSTGRES_URL;
+  if (pg && pg.length >= 32) return { source: "POSTGRES_URL-derived", value: pg };
+  const neon = process.env.NEON_DATABASE_URL;
+  if (neon && neon.length >= 32) return { source: "NEON_DATABASE_URL-derived", value: neon };
+  return { source: "DEV_FALLBACK", value: "tanit-dev-fallback-master-INSEGURO" };
+}
+
 function getMasterKey(): Buffer {
   if (_derivedKey) return _derivedKey;
-  const masterStr = process.env.TANIT_MASTER_KEY;
-  if (!masterStr || masterStr.length < 16) {
-    if (process.env.NODE_ENV === "production") {
-      throw new Error("TANIT_MASTER_KEY no configurada — requerida en producción para descifrar llaves");
-    }
-    // Fallback dev-only (no usar en producción)
-    console.warn("[crypto-keys] TANIT_MASTER_KEY ausente, usando fallback dev (INSEGURO)");
-    _derivedKey = scryptSync("tanit-dev-fallback-master", SALT, KEY_LEN);
-    return _derivedKey;
+  const { source, value } = pickMaterial();
+  if (source === "DEV_FALLBACK" && process.env.NODE_ENV === "production") {
+    throw new Error("Master key indisponible: ni TANIT_MASTER_KEY ni DATABASE_URL/POSTGRES_URL/NEON_DATABASE_URL configurados");
   }
-  _derivedKey = scryptSync(masterStr, SALT, KEY_LEN);
+  if (source === "DEV_FALLBACK") {
+    console.warn("[crypto-keys] Usando fallback dev (INSEGURO) — sin DATABASE_URL ni TANIT_MASTER_KEY");
+  } else {
+    console.log(`[crypto-keys] Master key derivada de ${source}`);
+  }
+  _derivedKey = scryptSync(value, SALT, KEY_LEN);
   return _derivedKey;
 }
 
