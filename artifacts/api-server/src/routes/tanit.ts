@@ -260,8 +260,8 @@ router.get("/tanit/guardrail-events", async (req, res): Promise<void> => {
 // SOLO permite parámetros whitelisted para no abusar (lev_max, force_mode, etc).
 router.post("/tanit/admin/set-strategy-param", async (req, res): Promise<void> => {
   try {
-    const { tanitApplyEvolution } = await import("../lib/trading-engine");
-    const { applyTanitConfig } = await import("../lib/trading-engine");
+    const engine = await import("../lib/trading-engine");
+    const { tanitApplyEvolution, applyTanitConfig, getEngineState, startEngine } = engine;
     const { param, value, reason } = req.body ?? {};
     const ALLOWED = new Set([
       "force_mode", "atr_sl_multiplier", "atr_tp_multiplier", "max_positions",
@@ -278,7 +278,31 @@ router.post("/tanit/admin/set-strategy-param", async (req, res): Promise<void> =
     }
     const result = await tanitApplyEvolution(String(param), String(value), String(reason ?? "Admin override"));
     applyTanitConfig();
-    res.json({ ok: true, param, value: String(value), result });
+
+    // PR #38 — si el motor está parado, arrancarlo. No tiene sentido empujar
+    // force_mode=SCALP si state.active=false: la apertura nunca se llama.
+    const st = getEngineState();
+    let engineStarted = false;
+    if (!st.active) {
+      try {
+        startEngine("escalon", 100, undefined, true);
+        engineStarted = true;
+        console.log("[ADMIN] Motor estaba detenido — arrancado tras admin override");
+      } catch (e) {
+        console.error("[ADMIN] Error arrancando motor:", e);
+      }
+    }
+
+    res.json({
+      ok: true,
+      param,
+      value: String(value),
+      result,
+      engine_active: getEngineState().active,
+      engine_started_now: engineStarted,
+      current_mode: getEngineState().currentMode,
+      force_mode: getEngineState().forceMode,
+    });
   } catch (err) {
     res.status(500).json({ ok: false, error: String(err) });
   }
