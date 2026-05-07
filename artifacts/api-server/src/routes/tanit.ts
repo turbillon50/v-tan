@@ -364,16 +364,26 @@ router.post("/tanit/admin/api-keys/:provider/active", async (req, res): Promise<
   }
 });
 
-// Recovery: descifra TODO con la master key actual. Para que Luis tenga
-// copia offline. Requiere header x-master-key que iguale TANIT_MASTER_KEY.
+// Recovery: descifra TODO. Auth via header x-master-key — acepta cualquiera de:
+// TANIT_MASTER_KEY, DATABASE_URL, POSTGRES_URL, NEON_DATABASE_URL
+// (todos son secretos del entorno que solo Luis tiene).
 router.get("/tanit/admin/export-keys", async (req, res): Promise<void> => {
   const provided = req.headers["x-master-key"];
-  const expected = process.env.TANIT_MASTER_KEY;
-  if (!expected) {
-    res.status(503).json({ ok: false, error: "TANIT_MASTER_KEY no configurada en env" });
+  if (typeof provided !== "string" || provided.length < 16) {
+    res.status(400).json({ ok: false, error: "x-master-key requerido (>=16 chars)" });
     return;
   }
-  if (typeof provided !== "string" || provided !== expected) {
+  const validSecrets = [
+    process.env.TANIT_MASTER_KEY,
+    process.env.DATABASE_URL,
+    process.env.POSTGRES_URL,
+    process.env.NEON_DATABASE_URL,
+  ].filter((s): s is string => !!s && s.length >= 16);
+  if (validSecrets.length === 0) {
+    res.status(503).json({ ok: false, error: "Ningún secreto de auth configurado en env" });
+    return;
+  }
+  if (!validSecrets.includes(provided)) {
     res.status(403).json({ ok: false, error: "x-master-key incorrecta" });
     return;
   }
