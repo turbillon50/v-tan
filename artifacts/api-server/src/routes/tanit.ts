@@ -15,6 +15,10 @@ import {
 import { desc, eq, sql, and } from "drizzle-orm";
 import { getBybitBalance } from "../lib/bybit-auth";
 import { bybitGet, hasCredentials } from "../lib/bybit-client";
+import {
+  listApiKeys, setApiKey, setActive, exportAllDecrypted,
+  type Provider,
+} from "../lib/api-keys-provider";
 
 // Tesis v4.1 / observabilidad — los campos balance + openPositions del estado
 // se pullean de Bybit en vivo (mismas fuentes que /api/portfolio/balance y
@@ -305,6 +309,79 @@ router.post("/tanit/admin/set-strategy-param", async (req, res): Promise<void> =
     });
   } catch (err) {
     res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+// PR #39 — Tanit con control de sus llaves.
+// Lectura sin descifrar: sólo metadata + valor enmascarado.
+router.get("/tanit/admin/api-keys", async (_req, res): Promise<void> => {
+  try {
+    const keys = await listApiKeys();
+    res.json({ ok: true, keys });
+  } catch (err: any) {
+    res.status(500).json({ ok: false, error: String(err?.message ?? err) });
+  }
+});
+
+// Set/rotate de una llave. Acepta { provider, value, note? }.
+router.post("/tanit/admin/api-keys", async (req, res): Promise<void> => {
+  try {
+    const { provider, value, note } = req.body ?? {};
+    const VALID: Provider[] = ["bybit_key","bybit_secret","anthropic","openai","gemini","perplexity","proxy_secret"];
+    if (!provider || !VALID.includes(provider)) {
+      res.status(400).json({ ok: false, error: `provider debe ser uno de: ${VALID.join(", ")}` });
+      return;
+    }
+    if (!value || String(value).length < 8) {
+      res.status(400).json({ ok: false, error: "value requerido (mínimo 8 chars)" });
+      return;
+    }
+    const result = await setApiKey(provider as Provider, String(value), note);
+    res.json({ ok: true, provider, ...result });
+  } catch (err: any) {
+    res.status(500).json({ ok: false, error: String(err?.message ?? err) });
+  }
+});
+
+// Activar/desactivar una llave sin perder su valor cifrado.
+router.post("/tanit/admin/api-keys/:provider/active", async (req, res): Promise<void> => {
+  try {
+    const { provider } = req.params;
+    const { active, note } = req.body ?? {};
+    const VALID: Provider[] = ["bybit_key","bybit_secret","anthropic","openai","gemini","perplexity","proxy_secret"];
+    if (!VALID.includes(provider as Provider)) {
+      res.status(400).json({ ok: false, error: `provider inválido` });
+      return;
+    }
+    if (typeof active !== "boolean") {
+      res.status(400).json({ ok: false, error: "active (boolean) requerido" });
+      return;
+    }
+    const ok = await setActive(provider as Provider, active, note);
+    res.json({ ok, provider, active });
+  } catch (err: any) {
+    res.status(500).json({ ok: false, error: String(err?.message ?? err) });
+  }
+});
+
+// Recovery: descifra TODO con la master key actual. Para que Luis tenga
+// copia offline. Requiere header x-master-key que iguale TANIT_MASTER_KEY.
+router.get("/tanit/admin/export-keys", async (req, res): Promise<void> => {
+  const provided = req.headers["x-master-key"];
+  const expected = process.env.TANIT_MASTER_KEY;
+  if (!expected) {
+    res.status(503).json({ ok: false, error: "TANIT_MASTER_KEY no configurada en env" });
+    return;
+  }
+  if (typeof provided !== "string" || provided !== expected) {
+    res.status(403).json({ ok: false, error: "x-master-key incorrecta" });
+    return;
+  }
+  try {
+    const exported = await exportAllDecrypted();
+    res.json({ ok: true, keys: exported });
+  } catch (err: any) {
+    res.status(500).json({ ok: false, error: String(err?.message ?? err) });
   }
 });
 

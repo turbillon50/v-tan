@@ -3,6 +3,7 @@ import { logger } from "./lib/logger";
 import { initTelegramCommands } from "./lib/telegram-commands";
 import { sendTelegram } from "./lib/telegram";
 import { sendBotStartupAlert, engineReadyPromise } from "./lib/trading-engine";
+import { migrateEnvKeysIfEmpty } from "./lib/api-keys-provider";
 
 const rawPort = process.env["PORT"] ?? "8080";
 const port = Number(rawPort);
@@ -34,6 +35,12 @@ app.listen(port, (err) => {
   }
 
   logger.info({ port }, "Server listening");
+
+  // Boot: migrar las API keys de env vars a la tabla cifrada (idempotente).
+  // Tras esto, la DB es la fuente de verdad y Tanit puede leerlas/rotarlas.
+  migrateEnvKeysIfEmpty()
+    .then(r => logger.info({ migrated: r.migrated, skipped: r.skipped }, "Tanit api keys migration"))
+    .catch(e => logger.error({ err: e }, "migrateEnvKeysIfEmpty failed"));
 
   // Iniciar polling de comandos Telegram (pausa, reanuda, estado, informe)
   initTelegramCommands();

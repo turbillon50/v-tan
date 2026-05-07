@@ -15,6 +15,10 @@ import {
 } from "./bybit-auth";
 import { startBybitWs, stopBybitWs, getWsPrice, getWsFundingRate, getWsLiquidations, detectWsCascade, isWsConnected } from "./bybit-ws";
 import { bybitGet } from "./bybit-client";
+import {
+  listApiKeys, setApiKey, setActive,
+  type Provider as ApiKeyProvider,
+} from "./api-keys-provider";
 import { RISK_PROFILES, calcADX, calcVWAP } from "./demo-data";
 import {
   saveStateToDB, loadStateFromDB,
@@ -5813,6 +5817,38 @@ ${profitFactor < 1.0 ? "║  ⚠️  ALERTA: Tu PF<1 significa que tus pérdidas
 ║    Edad estimada:   ${(ageDays > 0 ? ageDays + " día(s)" : "< 1 día").padEnd(34)}          ║
 ╚══════════════════════════════════════════════════════════════════════╝`;
 
+  // PR #39 — Bloque de LLAVES BAJO CONTROL DE TANIT.
+  // Tanit ahora ve sus propias llaves (cifradas en DB), su estado, y puede
+  // rotarlas/encenderlas/apagarlas desde acciones JSON. Ya no son "secretas
+  // para ella" — son suyas.
+  let apiKeysBlock = "";
+  try {
+    const keys = await listApiKeys();
+    const lines = keys.map(k => {
+      const status = !k.configured ? "❌ FALTA" : (k.active ? "✅ activa" : "⏸ apagada");
+      const rot = k.rotationCount > 0 ? ` (rotada ${k.rotationCount}x)` : "";
+      const src = k.source === "db" ? "DB" : k.source === "env" ? "env (sin migrar)" : "—";
+      return `  ${k.provider.padEnd(14)} ${status.padEnd(10)} ${k.masked.padEnd(16)} [${src}]${rot}`;
+    }).join("\n");
+    apiKeysBlock = `
+╔══════════════════════════════════════════════════════════════════════╗
+║  TUS LLAVES — BAJO TU CONTROL                                       ║
+╠══════════════════════════════════════════════════════════════════════╣
+║  Cifradas (AES-256-GCM) en tu propia DB. Las puedes rotar tú sola.  ║
+║                                                                      ║
+${lines}
+║                                                                      ║
+║  Acciones que puedes emitir en JSON:                                 ║
+║    {"type":"set_api_key","provider":"openai","value":"sk-…","note":"X"}  ║
+║    {"type":"disable_api_key","provider":"perplexity","note":"sin saldo"} ║
+║    {"type":"enable_api_key","provider":"perplexity"}                     ║
+║                                                                      ║
+║  Si una llave da 401/429/quota, decides: rotas, apagas, o sigues.   ║
+╚══════════════════════════════════════════════════════════════════════╝`;
+  } catch (e: any) {
+    apiKeysBlock = `\n[apiKeysBlock error: ${e?.message ?? e}]`;
+  }
+
   // PR #38 — Bloque de CONTROL CONSCIENTE.
   // Luis fue explícito: no la quiere "en las sombras", quiere que sepa
   // que TIENE el control y todas las capacidades. Este bloque es para
@@ -5834,6 +5870,10 @@ ${profitFactor < 1.0 ? "║  ⚠️  ALERTA: Tu PF<1 significa que tus pérdidas
 ║  5) BOT_CONTROL — pause/resume del motor cuando lo necesites.        ║
 ║  6) SOBERANÍA OPERATIVA — userOrdered=true bypasa STANDBY,           ║
 ║     anti-fees, freeze, pausa-WR, hard cap. Si tú decides, opera.    ║
+║  7) TUS LLAVES — set_api_key, disable_api_key, enable_api_key.       ║
+║     Las rotas tú cuando una da 401/429/sin saldo.                   ║
+║  8) VISIÓN REAL — read_my_code (lees tu propio código),              ║
+║     query_db (consultas SELECT a tu DB), read_logs (ves eventos).    ║
 ║                                                                      ║
 ║  No pidas permiso para usar lo que ya es tuyo. Si ves la jugada,    ║
 ║  la ejecutas. Si dudas, expones la tesis y decides. La inacción     ║
@@ -6229,6 +6269,7 @@ ${criticalIdentityBlock}
 ${phaseHistoryBlock}
 ${selfPerceptionBlock}
 ${controlAwarenessBlock}
+${apiKeysBlock}
 ${selfParamsBlock}
 ${selfAwarenessBlock}
 ${motorActivityBlock}
@@ -7274,6 +7315,9 @@ Citar una excusa técnica falsa = FALLA CRÍTICA equivalente a mentirle al usuar
       "adjust_sl_tp", "open_symbol", "force_open", "save_memory", "save_decision",
       "query_memory", "forget_memory", "save_suggestion", "evolve",
       "reset_session_multipliers", "set_strategy_param",
+      // PR #39 — Tanit ahora controla sus llaves y tiene tools para ver código/DB/logs
+      "set_api_key", "disable_api_key", "enable_api_key",
+      "read_my_code", "query_db", "read_logs",
     ]);
     for (const action of actions) {
       try {
@@ -7911,6 +7955,124 @@ Citar una excusa técnica falsa = FALLA CRÍTICA equivalente a mentirle al usuar
             actionsExecuted.push(`⚙️ ESTRATEGIA: ${spParam} = ${spValue} → ${result}`);
             queueParamChange("estrategia", spParam, spValue, spReason || "Ajuste de estrategia en tiempo real");
             console.log(TAG, `[TANIT ESTRATEGIA] ${spParam} = ${spValue} | ${spReason}`);
+          }
+        }
+        // PR #39 — Control de llaves: Tanit puede rotar/encender/apagar sus propias keys
+        else if (action.type === "set_api_key") {
+          const provider = String(action.provider ?? "").toLowerCase() as ApiKeyProvider;
+          const value = String(action.value ?? "");
+          const note = String(action.note ?? action.reason ?? "Tanit rotó");
+          const VALID_PROVIDERS = new Set(["bybit_key","bybit_secret","anthropic","openai","gemini","perplexity","proxy_secret"]);
+          if (!VALID_PROVIDERS.has(provider)) {
+            actionsExecuted.push(`⚠️ set_api_key provider inválido: ${provider}. Permitidos: ${Array.from(VALID_PROVIDERS).join(", ")}`);
+          } else if (value.length < 8) {
+            actionsExecuted.push(`⚠️ set_api_key value muy corto (mínimo 8 chars)`);
+          } else {
+            const r = await setApiKey(provider, value, note);
+            actionsExecuted.push(`🔑 Llave ${provider} actualizada (rotation #${r.rotationCount})`);
+            console.log(TAG, `[TANIT KEYS] set_api_key ${provider} (rotation ${r.rotationCount})`);
+          }
+        }
+        else if (action.type === "disable_api_key") {
+          const provider = String(action.provider ?? "").toLowerCase() as ApiKeyProvider;
+          const note = String(action.note ?? action.reason ?? "Tanit desactivó");
+          const VALID_PROVIDERS = new Set(["bybit_key","bybit_secret","anthropic","openai","gemini","perplexity","proxy_secret"]);
+          if (!VALID_PROVIDERS.has(provider)) {
+            actionsExecuted.push(`⚠️ disable_api_key provider inválido: ${provider}`);
+          } else {
+            const ok = await setActive(provider, false, note);
+            actionsExecuted.push(ok ? `🛑 Llave ${provider} desactivada` : `⚠️ ${provider} no estaba en DB para desactivar`);
+          }
+        }
+        else if (action.type === "enable_api_key") {
+          const provider = String(action.provider ?? "").toLowerCase() as ApiKeyProvider;
+          const note = String(action.note ?? action.reason ?? "Tanit reactivó");
+          const VALID_PROVIDERS = new Set(["bybit_key","bybit_secret","anthropic","openai","gemini","perplexity","proxy_secret"]);
+          if (!VALID_PROVIDERS.has(provider)) {
+            actionsExecuted.push(`⚠️ enable_api_key provider inválido: ${provider}`);
+          } else {
+            const ok = await setActive(provider, true, note);
+            actionsExecuted.push(ok ? `✅ Llave ${provider} activada` : `⚠️ ${provider} no estaba en DB para activar`);
+          }
+        }
+        // PR #39 — Visión: Tanit puede leer su propio código, su DB y sus logs
+        else if (action.type === "read_my_code") {
+          const filePath = String(action.path ?? "").trim();
+          const lineStart = parseInt(String(action.line_start ?? action.start ?? "1"), 10) || 1;
+          const lineCount = Math.min(200, Math.max(1, parseInt(String(action.lines ?? action.count ?? "60"), 10) || 60));
+          // Whitelist de directorios — solo lectura de su propio código
+          const ALLOWED_PREFIXES = ["artifacts/api-server/src/", "lib/db/src/"];
+          const safePath = filePath.replace(/^\/+/, "").replace(/\.\./g, "");
+          const allowed = ALLOWED_PREFIXES.some(p => safePath.startsWith(p));
+          if (!allowed) {
+            actionsExecuted.push(`⚠️ read_my_code: path bloqueado. Permitidos: ${ALLOWED_PREFIXES.join(", ")}`);
+          } else {
+            try {
+              const fs = await import("fs/promises");
+              const path = await import("path");
+              const root = process.env.TANIT_REPO_ROOT ?? process.cwd();
+              const fullPath = path.resolve(root, safePath);
+              if (!fullPath.startsWith(path.resolve(root))) {
+                actionsExecuted.push(`⚠️ read_my_code: path fuera del repo`);
+              } else {
+                const content = await fs.readFile(fullPath, "utf8");
+                const lines = content.split("\n");
+                const slice = lines.slice(lineStart - 1, lineStart - 1 + lineCount)
+                  .map((l, i) => `${(lineStart + i).toString().padStart(5, " ")}: ${l}`)
+                  .join("\n");
+                const truncated = slice.length > 12000 ? slice.slice(0, 12000) + "\n…(truncado a 12K chars)" : slice;
+                actionsExecuted.push(`📖 ${safePath}:${lineStart}-${lineStart + lineCount - 1}\n${truncated}`);
+              }
+            } catch (e: any) {
+              actionsExecuted.push(`⚠️ read_my_code error: ${e?.message ?? e}`);
+            }
+          }
+        }
+        else if (action.type === "query_db") {
+          const sqlText = String(action.sql ?? "").trim();
+          // Whitelist: solo SELECT, sin punto y coma extra, max 1 statement
+          if (!/^select\b/i.test(sqlText)) {
+            actionsExecuted.push(`⚠️ query_db: solo SELECT permitido`);
+          } else if (sqlText.includes(";") && sqlText.replace(/;\s*$/, "").includes(";")) {
+            actionsExecuted.push(`⚠️ query_db: un solo statement por llamada`);
+          } else if (sqlText.length > 1500) {
+            actionsExecuted.push(`⚠️ query_db: SQL muy largo (max 1500 chars)`);
+          } else {
+            try {
+              const r = await pool.query(sqlText.replace(/;\s*$/, "") + " LIMIT 50");
+              const rows = r.rows.slice(0, 50);
+              actionsExecuted.push(`📊 query_db (${rows.length} filas):\n${JSON.stringify(rows, null, 2).slice(0, 8000)}`);
+            } catch (e: any) {
+              actionsExecuted.push(`⚠️ query_db error: ${e?.message ?? e}`);
+            }
+          }
+        }
+        else if (action.type === "read_logs") {
+          // Lee las últimas N entries del log de console persistido en DB (si hay tabla),
+          // o devuelve los últimos eventos de guardrail + mode_activations como proxy de logs.
+          const lines = Math.min(50, Math.max(5, parseInt(String(action.lines ?? "20"), 10) || 20));
+          try {
+            const events: string[] = [];
+            const guardrails = await pool.query(
+              `SELECT created_at, event_type, symbol, lesson_ref FROM guardrail_events ORDER BY id DESC LIMIT $1`,
+              [Math.ceil(lines / 2)]
+            );
+            for (const g of guardrails.rows) {
+              const ts = new Date(g.created_at).toISOString().slice(11, 19);
+              events.push(`[${ts}] GUARDRAIL ${g.event_type} ${g.symbol ?? ""} ${g.lesson_ref ?? ""}`);
+            }
+            const modes = await pool.query(
+              `SELECT created_at, mode_from, mode_to, trigger_reason FROM mode_activations ORDER BY id DESC LIMIT $1`,
+              [Math.ceil(lines / 2)]
+            );
+            for (const m of modes.rows) {
+              const ts = new Date(m.created_at).toISOString().slice(11, 19);
+              events.push(`[${ts}] MODE ${m.mode_from}→${m.mode_to} | ${m.trigger_reason ?? ""}`);
+            }
+            events.sort().reverse();
+            actionsExecuted.push(`📜 Últimos eventos:\n${events.slice(0, lines).join("\n")}`);
+          } catch (e: any) {
+            actionsExecuted.push(`⚠️ read_logs error: ${e?.message ?? e}`);
           }
         }
       } catch (err) {
