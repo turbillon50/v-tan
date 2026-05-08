@@ -19,6 +19,9 @@ interface MastraChatBody {
   sender_type?: string;
   resourceId?: string;
   threadId?: string;
+  // Multimodal — si Luis manda fotos en el chat, las pasamos al agent como
+  // image parts. Gemini 2.5 Flash las procesa nativo.
+  images?: Array<{ base64: string; mimeType: string }>;
 }
 
 router.post("/bot/mastra-chat-stream", async (req, res): Promise<void> => {
@@ -79,15 +82,47 @@ router.post("/bot/mastra-chat-stream", async (req, res): Promise<void> => {
     //    histórico en este thread). Mastra inyecta automáticamente lastMessages
     //    desde mastra_messages cuando la memoria se hidrata.
     const recentTurns = await getRecentTurns();
+
+    // Si el cliente mandó imágenes, construimos el mensaje del usuario con
+    // multipart content (text + image_url parts). Gemini multimodal nativo.
+    type ContentPart =
+      | { type: "text"; text: string }
+      | { type: "image"; image: string; mimeType?: string };
+    type LooseUserMsg = {
+      role: "user";
+      content: string | ContentPart[];
+    };
+
+    let userMsg: LooseUserMsg;
+    if (Array.isArray(body.images) && body.images.length > 0) {
+      const parts: ContentPart[] = [{ type: "text", text: message }];
+      for (const img of body.images.slice(0, 4)) {
+        if (img && typeof img.base64 === "string" && img.base64.length > 0) {
+          parts.push({
+            type: "image",
+            image: `data:${img.mimeType || "image/jpeg"};base64,${img.base64}`,
+            mimeType: img.mimeType,
+          });
+        }
+      }
+      userMsg = { role: "user", content: parts };
+    } else {
+      userMsg = { role: "user", content: message };
+    }
+
     const messages = [
       ...recentTurns,
-      { role: "user" as const, content: message },
+      // Casteamos a any aquí porque el shape multimodal varía entre versiones
+      // de @ai-sdk; Mastra lo acepta vía wrapper interno.
+      userMsg as unknown as { role: "user"; content: string },
     ];
 
     send({ type: "thinking" });
 
     // 3) Stream con Mastra Memory persistente (mastra_messages, mastra_threads
     //    se crean al primer uso). Instructions dinámicas vía loadBootstrap.
+    //    Iteramos `fullStream` para emitir además de tokens los eventos
+    //    `tool_call` / `tool_result` que el frontend renderiza como inline cards.
     const stream = await tanitAgent.stream(messages, {
       memory: {
         resource: resourceId,
@@ -96,11 +131,41 @@ router.post("/bot/mastra-chat-stream", async (req, res): Promise<void> => {
     });
 
     let fullReply = "";
-    for await (const chunk of stream.textStream) {
-      if (chunk) {
-        fullReply += chunk;
-        send({ type: "token", content: chunk });
+    // fullStream emite: text-delta, tool-call, tool-result, finish, etc.
+    // Mantenemos el contrato existente (token/heartbeat/done/error) y agregamos
+    // tool_call y tool_result. Frontend viejo ignora los nuevos sin romper.
+    for await (const chunk of stream.fullStream as AsyncIterable<{
+      type: string;
+      payload?: Record<string, unknown>;
+    }>) {
+      if (!chunk || !chunk.type) continue;
+      const t = chunk.type;
+      const p = chunk.payload ?? {};
+
+      if (t === "text-delta") {
+        const text = (p as { text?: string; delta?: string }).text
+          ?? (p as { delta?: string }).delta
+          ?? "";
+        if (text) {
+          fullReply += text;
+          send({ type: "token", content: text });
+        }
+      } else if (t === "tool-call") {
+        send({
+          type: "tool_call",
+          toolCallId: (p as { toolCallId?: string }).toolCallId,
+          tool: (p as { toolName?: string }).toolName,
+          args: (p as { args?: unknown }).args,
+        });
+      } else if (t === "tool-result") {
+        send({
+          type: "tool_result",
+          toolCallId: (p as { toolCallId?: string }).toolCallId,
+          tool: (p as { toolName?: string }).toolName,
+          result: (p as { result?: unknown }).result,
+        });
       }
+      // ignoramos finish/start/etc — el done explícito lo emitimos abajo
     }
 
     // 5) Persistir reply de Tanit
