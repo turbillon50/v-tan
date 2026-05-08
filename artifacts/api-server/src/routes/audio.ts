@@ -460,4 +460,48 @@ router.post("/image/generate", async (req, res): Promise<void> => {
   }
 });
 
+// ─── GET /image/list-models ─────────────────────────────────────────────────
+// Debug: lista modelos disponibles para esta API key. Útil para confirmar
+// si el GEMINI_API_KEY tiene acceso a imagen (requiere proyecto GCP con
+// billing en algunos casos).
+router.get("/image/list-models", async (_req, res): Promise<void> => {
+  if (!GEMINI_API_KEY) {
+    res.status(500).json({ ok: false, error: "GEMINI_API_KEY no configurada" });
+    return;
+  }
+  try {
+    const r = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models?key=${GEMINI_API_KEY}&pageSize=200`,
+    );
+    if (!r.ok) {
+      const txt = await r.text().catch(() => "");
+      res.status(502).json({ ok: false, error: `Gemini ${r.status}`, body: txt.slice(0, 500) });
+      return;
+    }
+    const j = (await r.json()) as {
+      models?: Array<{
+        name?: string;
+        supportedGenerationMethods?: string[];
+      }>;
+    };
+    const all = j.models ?? [];
+    const imageCapable = all.filter(
+      (m) =>
+        (m.name?.includes("image") || m.name?.includes("imagen")) &&
+        Array.isArray(m.supportedGenerationMethods),
+    );
+    res.json({
+      ok: true,
+      total: all.length,
+      imageCapable: imageCapable.map((m) => ({
+        name: m.name,
+        methods: m.supportedGenerationMethods,
+      })),
+      allNames: all.map((m) => m.name).slice(0, 100),
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
 export default router;
