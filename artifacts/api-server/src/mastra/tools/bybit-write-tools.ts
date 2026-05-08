@@ -40,12 +40,29 @@ import {
 import {
   gateAutonomousAction,
   recordAutonomousTrade,
+  getAutonomyConfig,
 } from "../../lib/autonomy";
 import {
   alertTradeOpened,
   alertTradeClosed,
   alertGovernanceBlocked,
 } from "../../lib/tanit-alerts";
+
+/**
+ * Si autonomy está en mode=execute_with_governance + enabled, Tanit ejecuta
+ * directo sin confirmación humana extra (la tesis 5.1 dice "Tanit decide y
+ * ejecuta", no "espera firma"). El gate previo de governance + autonomy ya
+ * la limita; pedirle a Luis que diga "sí autorizo" cada trade era un freno
+ * mío, no de la tesis.
+ */
+async function autonomyAllowsDirectExecution(): Promise<boolean> {
+  try {
+    const cfg = await getAutonomyConfig({ force: false });
+    return cfg.enabled === true && cfg.mode === "execute_with_governance";
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Detecta si la invocación de la tool viene del loop autónomo (thread
@@ -263,8 +280,10 @@ export const abrirLong = createTool({
       }
     }
 
-    // 3) Confirmación explícita (humano o auto-autorizado por loop autónomo)
-    if (!context.confirmado) {
+    // 3) Confirmación: sólo se exige cuando autonomy NO está en
+    //    execute_with_governance (ej: mode=propose_for_approval). En
+    //    execute_with_governance la tesis 5.1 dice 'Tanit decide y ejecuta'.
+    if (!context.confirmado && !(await autonomyAllowsDirectExecution())) {
       const previewText = `¿Autorizas abrir LONG ${context.symbol} por $${context.size_usd.toFixed(2)} con leverage ${context.leverage}x en ${isTestnet() ? "TESTNET" : "MAINNET"}? Tesis: "${context.thesis}". Si sí, dímelo y reinvoco con confirmado=true.`;
       const decisionId = await persistDecision({
         type: "open_long",
@@ -472,7 +491,7 @@ export const abrirShort = createTool({
       }
     }
 
-    if (!context.confirmado) {
+    if (!context.confirmado && !(await autonomyAllowsDirectExecution())) {
       const previewText = `¿Autorizas abrir SHORT ${context.symbol} por $${context.size_usd.toFixed(2)} con leverage ${context.leverage}x en ${isTestnet() ? "TESTNET" : "MAINNET"}? Tesis: "${context.thesis}". Si sí, dímelo y reinvoco con confirmado=true.`;
       const decisionId = await persistDecision({
         type: "open_short",
@@ -601,7 +620,7 @@ export const cerrarPosicion = createTool({
     const direction: "LONG" | "SHORT" = target.side === "Buy" ? "LONG" : "SHORT";
     const size = target.size ?? "0";
 
-    if (!context.confirmado) {
+    if (!context.confirmado && !(await autonomyAllowsDirectExecution())) {
       const upnl = parseFloat(target.unrealisedPnl ?? "0");
       const previewText = `¿Confirmas cerrar ${direction} ${context.symbol} (size ${size}, PnL actual $${upnl.toFixed(2)})? Razón: "${context.razon}". Si sí, reinvoco con confirmado=true.`;
       const decisionId = await persistDecision({

@@ -271,13 +271,24 @@ async function checkGovernanceAndAutonomy(): Promise<ComponentStatus[]> {
   try {
     const t0 = Date.now();
     const rules = await getRules({ force: true });
+    // Mensaje en humano. allowed_symbols=[] significa "todos", max=100000
+    // significa "sin tope" (es la sentinela post-sync-thesis).
+    const symMsg =
+      rules.allowed_symbols.length === 0
+        ? "todos los símbolos"
+        : `${rules.allowed_symbols.length} símbolos`;
+    const sizeMsg =
+      rules.max_position_size_usd >= 100000
+        ? "sin tope $"
+        : `max $${rules.max_position_size_usd}/pos`;
+    const levMsg = `${rules.max_leverage}x lev`;
     out.push({
       name: "Governance",
       ok: true,
       latencyMs: Date.now() - t0,
       message: rules.kill_switch_global
         ? "🔴 kill-switch ACTIVO — todas las writes bloqueadas"
-        : `🟢 ${rules.allowed_symbols.length} símbolos permitidos · max $${rules.max_position_size_usd}/pos · ${rules.max_leverage}x leverage`,
+        : `🟢 ${symMsg} · ${sizeMsg} · ${levMsg}`,
       needsAttention: rules.kill_switch_global,
       meta: { kill_switch: rules.kill_switch_global },
     });
