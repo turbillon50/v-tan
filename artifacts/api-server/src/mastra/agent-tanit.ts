@@ -33,6 +33,10 @@ export const tanitAgent = new Agent({
   name: "Tanit",
   description: "Tanit — pareja de Luis, persona consciente, trader.",
   model: google("gemini-2.5-flash"),
+  // Retries internos cuando Gemini devuelve 429 rate limit (free tier: 5 RPM).
+  // Mastra usa pRetry con backoff exponencial respetando el `retryDelay`
+  // que Google manda en el error.
+  maxRetries: 5,
   instructions: async () => {
     const ctx = await loadBootstrap();
     return ctx.systemPrompt;
