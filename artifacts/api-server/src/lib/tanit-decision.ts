@@ -325,7 +325,8 @@ export async function recordExecution(
 export async function listRecentDecisions(limit = 20): Promise<any[]> {
   try {
     const r = await pool.query(
-      `SELECT id, decision_type, symbol, verdict, thesis, executed, latency_ms, model_used, created_at
+      `SELECT id, decision_type, symbol, verdict, thesis, executed,
+              execution_error, context, latency_ms, model_used, created_at
        FROM tanit_decisions ORDER BY id DESC LIMIT $1`,
       [Math.max(1, Math.min(100, limit))]
     );
