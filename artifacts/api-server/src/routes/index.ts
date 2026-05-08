@@ -13,6 +13,7 @@ import newsRouter from "./news";
 import alertsRouter from "./alerts";
 import bybitRealRouter from "./bybit-real";
 import tanitRouter from "./tanit";
+import tanitMastraRouter from "./tanit-mastra";
 const router: IRouter = Router();
 
 router.use(healthRouter);
@@ -28,6 +29,7 @@ router.use(backtestRouter);
 router.use(newsRouter);
 router.use(alertsRouter);
 router.use(tanitRouter);
+router.use(tanitMastraRouter);
 router.use("/bybit", bybitRealRouter);
 
 export default router;
