@@ -53,11 +53,14 @@ server.listen(port, () => {
     .then(r => logger.info({ migrated: r.migrated, skipped: r.skipped }, "Tanit api keys migration"))
     .catch(e => logger.error({ err: e }, "migrateEnvKeysIfEmpty failed"));
 
-  // Iniciar polling de comandos Telegram (pausa, reanuda, estado, informe)
-  initTelegramCommands();
-
-  // Aviso de arranque — espera a que el engine esté verdaderamente listo antes de anunciar
-  engineReadyPromise.then(() => sendBotStartupAlert()).catch(() => {});
+  // Polling de comandos Telegram + aviso de arranque solo si TELEGRAM_ENABLED=true.
+  // Por default Telegram queda apagado — la app tanit.work cubre todo.
+  if (process.env["TELEGRAM_ENABLED"] === "true") {
+    initTelegramCommands();
+    engineReadyPromise.then(() => sendBotStartupAlert()).catch(() => {});
+  } else {
+    logger.info("[telegram] desactivado (TELEGRAM_ENABLED != 'true')");
+  }
 
   // Loop autónomo de observación (Fase D). Solo arranca si el flag está
   // explícitamente en true. Las write tools requieren confirmado=true que
@@ -70,9 +73,12 @@ server.listen(port, () => {
     logger.info("[autonomous-loop] desactivado (ENABLE_AUTONOMOUS_LOOP != 'true')");
   }
 
-  // Reporte diario por Telegram (Fase H). Idempotente. Primer reporte 6h
-  // después del start; luego cada 24h. Solo si hay TELEGRAM_CHAT_ID.
-  if (process.env["TELEGRAM_BOT_TOKEN"] && process.env["TELEGRAM_CHAT_ID"]) {
+  // Reporte diario por Telegram solo si TELEGRAM_ENABLED=true (default off).
+  if (
+    process.env["TELEGRAM_ENABLED"] === "true" &&
+    process.env["TELEGRAM_BOT_TOKEN"] &&
+    process.env["TELEGRAM_CHAT_ID"]
+  ) {
     startDailyReports();
   }
 

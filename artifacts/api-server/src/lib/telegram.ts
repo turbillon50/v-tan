@@ -56,6 +56,10 @@ export function queueParamChange(
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function sendTelegram(msg: string): Promise<void> {
+  // Telegram desactivado: Luis ya tiene la app web (tanit.work) que cubre
+  // todo. No necesita spam de aperturas/cierres en el bot. Para reactivar,
+  // setear env TELEGRAM_ENABLED=true.
+  if (process.env.TELEGRAM_ENABLED !== "true") return;
   const token  = process.env.TELEGRAM_BOT_TOKEN;
   const chatId = process.env.TELEGRAM_CHAT_ID;
   if (!token || !chatId) return;

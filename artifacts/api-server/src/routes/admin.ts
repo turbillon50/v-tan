@@ -13,15 +13,25 @@ import { logger } from "../lib/logger";
 const router = Router();
 
 const ADMIN_SECRET = process.env["ADMIN_SECRET"];
-const TELEGRAM_CHAT_ID = process.env["TELEGRAM_CHAT_ID"]; // fallback: Luis ya lo tiene
+const TELEGRAM_CHAT_ID = process.env["TELEGRAM_CHAT_ID"];
+// Orígenes permitidos sin secret (la app de Luis). Cualquier otro origen
+// requiere ADMIN_SECRET o TELEGRAM_CHAT_ID.
+const TRUSTED_ORIGINS = new Set([
+  "https://tanit.work",
+  "https://www.tanit.work",
+  "http://localhost:3000",
+]);
 
-function requireAdmin(secret: unknown): string | null {
-  if (typeof secret !== "string" || secret.length === 0) return "secret requerido";
-  if (ADMIN_SECRET && secret === ADMIN_SECRET) return null;
-  // Fallback: aceptar el TELEGRAM_CHAT_ID. Luis ya lo tiene, solo Railway lo
-  // conoce. Esto evita configurar una env var extra para la primera activación.
-  if (TELEGRAM_CHAT_ID && secret === TELEGRAM_CHAT_ID) return null;
-  return "secret inválido";
+function requireAdmin(secret: unknown, origin: string | undefined): string | null {
+  // 1) Mismo-origen confiable (la app web de Luis)
+  if (origin && TRUSTED_ORIGINS.has(origin)) return null;
+  // 2) Secret explícito
+  if (typeof secret === "string" && secret.length > 0) {
+    if (ADMIN_SECRET && secret === ADMIN_SECRET) return null;
+    if (TELEGRAM_CHAT_ID && secret === TELEGRAM_CHAT_ID) return null;
+    return "secret inválido";
+  }
+  return "secret requerido (o llamada desde tanit.work)";
 }
 
 /**
@@ -41,7 +51,7 @@ router.post("/admin/autonomy/enable", async (req, res): Promise<void> => {
     max_daily_trades?: number;
     reason?: string;
   };
-  const guard = requireAdmin(body.secret);
+  const guard = requireAdmin(body.secret, req.headers.origin);
   if (guard) {
     res.status(403).json({ ok: false, error: guard });
     return;
@@ -129,7 +139,7 @@ router.post("/admin/autonomy/enable", async (req, res): Promise<void> => {
  */
 router.post("/admin/autonomy/disable", async (req, res): Promise<void> => {
   const body = (req.body ?? {}) as { secret?: unknown; reason?: string };
-  const guard = requireAdmin(body.secret);
+  const guard = requireAdmin(body.secret, req.headers.origin);
   if (guard) {
     res.status(403).json({ ok: false, error: guard });
     return;
@@ -160,7 +170,7 @@ router.post("/admin/autonomy/disable", async (req, res): Promise<void> => {
  * Lectura del estado actual.
  */
 router.get("/admin/autonomy", async (req, res): Promise<void> => {
-  const guard = requireAdmin(req.query.secret);
+  const guard = requireAdmin(req.query.secret, req.headers.origin);
   if (guard) {
     res.status(403).json({ ok: false, error: guard });
     return;
