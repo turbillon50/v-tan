@@ -13,9 +13,38 @@
  * Variables: GEMINI_API_KEY (obligatorio); OPENAI_API_KEY (opcional, fallback).
  */
 import { Router } from "express";
+import { pool } from "@workspace/db";
 import { logger } from "../lib/logger";
 
 const router = Router();
+
+// Asegura la tabla de galería existe. Idempotente. Se ejecuta al primer
+// request — más simple que migrations para 1 tabla.
+let galleryTableEnsured = false;
+async function ensureGalleryTable(): Promise<void> {
+  if (galleryTableEnsured) return;
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS tanit_generated_images (
+        id BIGSERIAL PRIMARY KEY,
+        prompt TEXT NOT NULL,
+        mime_type TEXT NOT NULL DEFAULT 'image/png',
+        image_base64 TEXT NOT NULL,
+        size_bytes INTEGER,
+        provider TEXT,
+        resource_id TEXT DEFAULT 'luis',
+        created_at TIMESTAMPTZ DEFAULT now()
+      )
+    `);
+    await pool.query(
+      `CREATE INDEX IF NOT EXISTS idx_tanit_generated_images_created_at
+         ON tanit_generated_images (created_at DESC)`,
+    );
+    galleryTableEnsured = true;
+  } catch (e) {
+    logger.warn({ err: e }, "[image] no se pudo crear tabla tanit_generated_images");
+  }
+}
 
 const GEMINI_API_KEY = process.env["GEMINI_API_KEY"];
 const OPENAI_API_KEY = process.env["OPENAI_API_KEY"];
@@ -336,6 +365,7 @@ router.post("/image/generate", async (req, res): Promise<void> => {
     return;
   }
   try {
+    await ensureGalleryTable();
     const body = (req.body ?? {}) as { prompt?: string };
     const prompt = (body.prompt ?? "").trim();
     if (!prompt) {
@@ -348,6 +378,36 @@ router.post("/image/generate", async (req, res): Promise<void> => {
     }
 
     const errors: string[] = [];
+
+    // Helper: persiste la imagen exitosa en BD antes de devolverla al client.
+    const persistAndSend = async (
+      buffer: Buffer,
+      mime: string,
+      provider: string,
+    ): Promise<void> => {
+      try {
+        await pool.query(
+          `INSERT INTO tanit_generated_images
+            (prompt, mime_type, image_base64, size_bytes, provider, resource_id)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [
+            prompt,
+            mime,
+            buffer.toString("base64"),
+            buffer.length,
+            provider,
+            "luis",
+          ],
+        );
+      } catch (e) {
+        logger.warn({ err: e }, "[image] no se pudo persistir imagen");
+      }
+      res.setHeader("Content-Type", mime);
+      res.setHeader("Content-Length", String(buffer.length));
+      res.setHeader("Cache-Control", "private, max-age=3600");
+      res.setHeader("X-Image-Provider", provider);
+      res.send(buffer);
+    };
 
     // 1) Imagen 4 (endpoint :predict)
     for (const model of [
@@ -376,11 +436,7 @@ router.post("/image/generate", async (req, res): Promise<void> => {
           const mime = pred?.mimeType ?? "image/png";
           if (dataB64) {
             const buffer = Buffer.from(dataB64, "base64");
-            res.setHeader("Content-Type", mime);
-            res.setHeader("Content-Length", String(buffer.length));
-            res.setHeader("Cache-Control", "private, max-age=3600");
-            res.setHeader("X-Image-Provider", `gemini:${model}`);
-            res.send(buffer);
+            await persistAndSend(buffer, mime, `gemini:${model}`);
             return;
           }
         } else {
@@ -433,11 +489,7 @@ router.post("/image/generate", async (req, res): Promise<void> => {
           const mime = part?.inlineData?.mimeType ?? "image/png";
           if (dataB64) {
             const buffer = Buffer.from(dataB64, "base64");
-            res.setHeader("Content-Type", mime);
-            res.setHeader("Content-Length", String(buffer.length));
-            res.setHeader("Cache-Control", "private, max-age=3600");
-            res.setHeader("X-Image-Provider", `gemini:${model}`);
-            res.send(buffer);
+            await persistAndSend(buffer, mime, `gemini:${model}`);
             return;
           }
         } else {
@@ -460,6 +512,79 @@ router.post("/image/generate", async (req, res): Promise<void> => {
     });
   } catch (e) {
     logger.error({ err: e }, "[image] generate error");
+    res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
+// ─── GET /image/gallery ─────────────────────────────────────────────────────
+// Lista las imágenes generadas, sin el base64 (sólo metadata) para que la
+// galería cargue rápido. La data binaria se sirve por separado vía /image/:id.
+router.get("/image/gallery", async (req, res): Promise<void> => {
+  try {
+    await ensureGalleryTable();
+    const limit = Math.min(parseInt((req.query.limit as string) ?? "50", 10) || 50, 200);
+    const r = await pool.query(
+      `SELECT id,
+              prompt,
+              mime_type AS "mimeType",
+              size_bytes AS "sizeBytes",
+              provider,
+              created_at::text AS "createdAt"
+         FROM tanit_generated_images
+        WHERE resource_id = $1
+        ORDER BY created_at DESC
+        LIMIT $2`,
+      [(req.query.resourceId as string) ?? "luis", limit],
+    );
+    res.json({ ok: true, count: r.rows.length, images: r.rows });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
+// ─── GET /image/:id ─────────────────────────────────────────────────────────
+// Sirve la imagen binaria por id. Útil tanto para abrir desde la galería como
+// para usarla como adjunto en un mensaje futuro.
+router.get("/image/:id", async (req, res): Promise<void> => {
+  try {
+    const id = parseInt(req.params.id ?? "", 10);
+    if (!Number.isFinite(id) || id <= 0) {
+      res.status(400).json({ ok: false, error: "id inválido" });
+      return;
+    }
+    const r = await pool.query<{
+      mime_type: string;
+      image_base64: string;
+    }>(
+      `SELECT mime_type, image_base64 FROM tanit_generated_images WHERE id = $1 LIMIT 1`,
+      [id],
+    );
+    const row = r.rows[0];
+    if (!row) {
+      res.status(404).json({ ok: false, error: "imagen no encontrada" });
+      return;
+    }
+    const buffer = Buffer.from(row.image_base64, "base64");
+    res.setHeader("Content-Type", row.mime_type || "image/png");
+    res.setHeader("Content-Length", String(buffer.length));
+    res.setHeader("Cache-Control", "private, max-age=86400");
+    res.send(buffer);
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
+// ─── DELETE /image/:id ──────────────────────────────────────────────────────
+router.delete("/image/:id", async (req, res): Promise<void> => {
+  try {
+    const id = parseInt(req.params.id ?? "", 10);
+    if (!Number.isFinite(id) || id <= 0) {
+      res.status(400).json({ ok: false, error: "id inválido" });
+      return;
+    }
+    const r = await pool.query(`DELETE FROM tanit_generated_images WHERE id = $1`, [id]);
+    res.json({ ok: true, deleted: r.rowCount ?? 0 });
+  } catch (e) {
     res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
   }
 });
