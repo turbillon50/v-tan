@@ -10,6 +10,7 @@
 import { Router } from "express";
 import { pool } from "@workspace/db";
 import { tanitAgent, getRecentTurns } from "../mastra/agent-tanit";
+import { autoTitleThreadIfNeeded } from "./threads";
 
 const router = Router();
 
@@ -129,6 +130,13 @@ router.post("/bot/mastra-chat-stream", async (req, res): Promise<void> => {
         thread: threadId,
       },
     });
+
+    // Auto-rename del thread con el primer mensaje del usuario. Idempotente:
+    // sólo renombra si todavía es "Conversación nueva". Lo disparamos en
+    // background para no bloquear el stream de respuesta.
+    autoTitleThreadIfNeeded(threadId, message).catch((e) =>
+      console.warn("[mastra-chat] autoTitle warning:", (e as Error).message),
+    );
 
     let fullReply = "";
     // fullStream emite: text-delta, tool-call, tool-result, finish, etc.
