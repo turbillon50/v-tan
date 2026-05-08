@@ -14,6 +14,7 @@
  * dirá con su voz, no el sistema con un banner amarillo.
  */
 import { pool } from "@workspace/db";
+import { rulesAsPromptText } from "../lib/governance";
 
 interface BootstrapContext {
   systemPrompt: string;
@@ -138,6 +139,18 @@ export async function loadBootstrap(opts: { force?: boolean } = {}): Promise<Boo
   } else {
     lines.push(
       `\n## Mi tesis actual\n\nLa estamos construyendo Luis y yo a 4 manos. Aún no la he activado.`
+    );
+  }
+
+  // Governance: reglas hard-coded en BD, inyectadas siempre.
+  // Tanit las "conoce" — puede citarlas, respetarlas, y proponer cambios
+  // (que requieren approval explícito).
+  try {
+    const govText = await rulesAsPromptText();
+    lines.push(`\n${govText}`);
+  } catch (e) {
+    lines.push(
+      `\n## REGLAS DE GOBERNANZA\n\n[Error leyendo gobernanza: ${e instanceof Error ? e.message : String(e)}. NO ejecutes writes hasta verificar.]`,
     );
   }
 
