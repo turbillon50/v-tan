@@ -6,6 +6,8 @@ import { sendBotStartupAlert, engineReadyPromise } from "./lib/trading-engine";
 import { migrateEnvKeysIfEmpty } from "./lib/api-keys-provider";
 import { startAutonomousLoop } from "./mastra/autonomous-loop";
 import { startDailyReports } from "./lib/tanit-alerts";
+import { startBybitWs } from "./lib/bybit-ws";
+import { getRules } from "./lib/governance";
 
 const rawPort = process.env["PORT"] ?? "8080";
 const port = Number(rawPort);
@@ -66,4 +68,23 @@ app.listen(port, (err) => {
   if (process.env["TELEGRAM_BOT_TOKEN"] && process.env["TELEGRAM_CHAT_ID"]) {
     startDailyReports();
   }
+
+  // ── Bybit WebSocket: precios live para que las tools de Mastra y el frontend
+  // tengan datos sin polling REST. Antes esto solo arrancaba dentro de
+  // startEngine() del trading-engine viejo, que ya no llamamos. Aquí lo
+  // disparamos directo con los allowed_symbols de governance.
+  // Sin esto, Tanit reporta wsConnected=false y opera a ciegas.
+  getRules()
+    .then((rules) => {
+      if (rules.allowed_symbols.length > 0) {
+        startBybitWs(rules.allowed_symbols);
+        logger.info(
+          { symbols: rules.allowed_symbols },
+          "[bybit-ws] arrancado al boot con governance.allowed_symbols",
+        );
+      } else {
+        logger.warn("[bybit-ws] sin símbolos en governance, WS no arrancado");
+      }
+    })
+    .catch((e) => logger.error({ err: e }, "[bybit-ws] no pude leer governance"));
 });
