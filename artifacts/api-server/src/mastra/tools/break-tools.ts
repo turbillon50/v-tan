@@ -27,7 +27,10 @@ export const consultarBreak = createTool({
     respuesta: z.string(),
     error: z.string().nullable(),
   }),
-  execute: async ({ context }) => {
+  execute: async (rawInput: unknown) => {
+    const context = (rawInput && typeof rawInput === "object" && "context" in rawInput && rawInput.context && typeof rawInput.context === "object")
+      ? (rawInput as { context: Record<string, unknown> }).context
+      : (rawInput as Record<string, unknown>);
     const url = `${BREAK_API}/api/break/chat-stream`;
     try {
       const res = await fetch(url, {

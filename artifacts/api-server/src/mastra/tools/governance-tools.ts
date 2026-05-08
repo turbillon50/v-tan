@@ -80,7 +80,10 @@ export const ajustarGovernance = createTool({
     new_value: z.any(),
   }),
   // requireApproval: true → Mastra le pide a Luis confirmar antes de ejecutar
-  execute: async ({ context }) => {
+  execute: async (rawInput: unknown) => {
+    const context = (rawInput && typeof rawInput === "object" && "context" in rawInput && rawInput.context && typeof rawInput.context === "object")
+      ? (rawInput as { context: Record<string, unknown> }).context
+      : (rawInput as Record<string, unknown>);
     const result = await updateRule({
       field: context.field as keyof GovernanceRules,
       newValue: context.new_value as number | string | string[] | boolean,
@@ -111,7 +114,10 @@ export const accionarKillSwitch = createTool({
     ok: z.boolean(),
     state: z.string(),
   }),
-  execute: async ({ context }) => {
+  execute: async (rawInput: unknown) => {
+    const context = (rawInput && typeof rawInput === "object" && "context" in rawInput && rawInput.context && typeof rawInput.context === "object")
+      ? (rawInput as { context: Record<string, unknown> }).context
+      : (rawInput as Record<string, unknown>);
     await setKillSwitch({
       on: context.on,
       actor: context.on ? "luis" : "tanit-or-luis",

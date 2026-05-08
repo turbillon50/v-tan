@@ -152,7 +152,10 @@ export const consultarUltimaEjecucion = createTool({
     found: z.boolean(),
     error: z.string().optional(),
   }),
-  execute: async ({ context }) => {
+  execute: async (rawInput: unknown) => {
+    const context = (rawInput && typeof rawInput === "object" && "context" in rawInput && rawInput.context && typeof rawInput.context === "object")
+      ? (rawInput as { context: Record<string, unknown> }).context
+      : (rawInput as Record<string, unknown>);
     const symbol = context.symbol;
     try {
       const r = await getRecentExecution(symbol);
@@ -194,7 +197,10 @@ export const consultarPrecioMercado = createTool({
     volume24h: z.number().nullable(),
     error: z.string().optional(),
   }),
-  execute: async ({ context }) => {
+  execute: async (rawInput: unknown) => {
+    const context = (rawInput && typeof rawInput === "object" && "context" in rawInput && rawInput.context && typeof rawInput.context === "object")
+      ? (rawInput as { context: Record<string, unknown> }).context
+      : (rawInput as Record<string, unknown>);
     const symbol = context.symbol;
     try {
       // Primero intentamos WebSocket cache (sub-millisecond, sin rate limit)

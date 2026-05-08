@@ -142,7 +142,10 @@ export const abrirLong = createTool({
     decisionId: z.number().nullable(),
     needs_confirmation_text: z.string().optional(),
   }),
-  execute: async ({ context }) => {
+  execute: async (rawInput: unknown) => {
+    const context = (rawInput && typeof rawInput === "object" && "context" in rawInput && rawInput.context && typeof rawInput.context === "object")
+      ? (rawInput as { context: Record<string, unknown> }).context
+      : (rawInput as Record<string, unknown>);
     const t0 = Date.now();
     const ctx: DecisionContext = {
       input: { ...context },
@@ -317,7 +320,10 @@ export const abrirShort = createTool({
     decisionId: z.number().nullable(),
     needs_confirmation_text: z.string().optional(),
   }),
-  execute: async ({ context }) => {
+  execute: async (rawInput: unknown) => {
+    const context = (rawInput && typeof rawInput === "object" && "context" in rawInput && rawInput.context && typeof rawInput.context === "object")
+      ? (rawInput as { context: Record<string, unknown> }).context
+      : (rawInput as Record<string, unknown>);
     const t0 = Date.now();
     const ctx: DecisionContext = {
       input: { ...context },
@@ -459,7 +465,10 @@ export const cerrarPosicion = createTool({
     decisionId: z.number().nullable(),
     needs_confirmation_text: z.string().optional(),
   }),
-  execute: async ({ context }) => {
+  execute: async (rawInput: unknown) => {
+    const context = (rawInput && typeof rawInput === "object" && "context" in rawInput && rawInput.context && typeof rawInput.context === "object")
+      ? (rawInput as { context: Record<string, unknown> }).context
+      : (rawInput as Record<string, unknown>);
     const t0 = Date.now();
     const positions = await getOpenPositions();
     const target = positions.find((p) => p.symbol === context.symbol && parseFloat(p.size ?? "0") > 0);
@@ -541,7 +550,10 @@ export const moverStops = createTool({
     decisionId: z.number().nullable(),
     needs_confirmation_text: z.string().optional(),
   }),
-  execute: async ({ context }) => {
+  execute: async (rawInput: unknown) => {
+    const context = (rawInput && typeof rawInput === "object" && "context" in rawInput && rawInput.context && typeof rawInput.context === "object")
+      ? (rawInput as { context: Record<string, unknown> }).context
+      : (rawInput as Record<string, unknown>);
     const t0 = Date.now();
     if (context.stop_loss === null && context.take_profit === null) {
       return { ok: false, verdict: "rejected", reason: "Pasa al menos stop_loss o take_profit.", decisionId: null };
@@ -600,7 +612,10 @@ export const cancelarTodasOrdenes = createTool({
     decisionId: z.number().nullable(),
     needs_confirmation_text: z.string().optional(),
   }),
-  execute: async ({ context }) => {
+  execute: async (rawInput: unknown) => {
+    const context = (rawInput && typeof rawInput === "object" && "context" in rawInput && rawInput.context && typeof rawInput.context === "object")
+      ? (rawInput as { context: Record<string, unknown> }).context
+      : (rawInput as Record<string, unknown>);
     const t0 = Date.now();
     if (!context.confirmado) {
       const previewText = `¿Confirmas cancelar TODAS las órdenes pendientes en USDT? Razón: "${context.razon}". Si sí, reinvoco con confirmado=true.`;
