@@ -83,21 +83,32 @@ server.listen(port, () => {
   }
 
   // ── Bybit WebSocket: precios live para que las tools de Mastra y el frontend
-  // tengan datos sin polling REST. Antes esto solo arrancaba dentro de
-  // startEngine() del trading-engine viejo, que ya no llamamos. Aquí lo
-  // disparamos directo con los allowed_symbols de governance.
-  // Sin esto, Tanit reporta wsConnected=false y opera a ciegas.
+  // tengan datos sin polling REST. Si governance tiene allowed_symbols=[]
+  // (significa "todos los símbolos permitidos") arrancamos con un set core
+  // de blue-chips para tener feeds vivos sin saturar; Tanit puede pedir
+  // más feeds via tools cuando los necesite.
+  const CORE_SYMBOLS = [
+    "BTCUSDT",
+    "ETHUSDT",
+    "SOLUSDT",
+    "BNBUSDT",
+    "XRPUSDT",
+    "DOGEUSDT",
+    "AVAXUSDT",
+    "LINKUSDT",
+  ];
   getRules()
     .then((rules) => {
-      if (rules.allowed_symbols.length > 0) {
-        startBybitWs(rules.allowed_symbols);
-        logger.info(
-          { symbols: rules.allowed_symbols },
-          "[bybit-ws] arrancado al boot con governance.allowed_symbols",
-        );
-      } else {
-        logger.warn("[bybit-ws] sin símbolos en governance, WS no arrancado");
-      }
+      const symbols =
+        rules.allowed_symbols.length > 0 ? rules.allowed_symbols : CORE_SYMBOLS;
+      startBybitWs(symbols);
+      logger.info(
+        { symbols, source: rules.allowed_symbols.length > 0 ? "governance" : "core-default" },
+        "[bybit-ws] arrancado al boot",
+      );
     })
-    .catch((e) => logger.error({ err: e }, "[bybit-ws] no pude leer governance"));
+    .catch((e) => {
+      logger.error({ err: e }, "[bybit-ws] no pude leer governance, arrancando con core");
+      startBybitWs(CORE_SYMBOLS);
+    });
 });
