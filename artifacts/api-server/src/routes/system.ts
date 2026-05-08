@@ -18,8 +18,52 @@ import { isTestnet } from "../lib/bybit-auth";
 import { hasCredentials } from "../lib/bybit-client";
 import { getRules } from "../lib/governance";
 import { getAutonomyConfig } from "../lib/autonomy";
+import { bybitReadTools } from "../mastra/tools/bybit-tools";
+import { bybitWriteTools } from "../mastra/tools/bybit-write-tools";
+import { governanceTools } from "../mastra/tools/governance-tools";
+import { autonomyTools } from "../mastra/tools/autonomy-tools";
+import { breakTools } from "../mastra/tools/break-tools";
 
 const router = Router();
+
+/**
+ * GET /api/tanit/tools-registered
+ * Lista todas las tools que TIENE el agente Tanit corriendo en este deploy.
+ * Útil para verificar que las nuevas tools (leer_velas, backtest_*) sí están
+ * disponibles para ella, y no quedaron solo en el commit local.
+ */
+router.get("/tanit/tools-registered", (_req, res): void => {
+  const buckets: Record<string, string[]> = {
+    read: Object.entries(bybitReadTools).map(([_, t]) =>
+      typeof t === "object" && t && "id" in t ? String((t as any).id) : "?",
+    ),
+    write: Object.entries(bybitWriteTools).map(([_, t]) =>
+      typeof t === "object" && t && "id" in t ? String((t as any).id) : "?",
+    ),
+    governance: Object.entries(governanceTools).map(([_, t]) =>
+      typeof t === "object" && t && "id" in t ? String((t as any).id) : "?",
+    ),
+    autonomy: Object.entries(autonomyTools).map(([_, t]) =>
+      typeof t === "object" && t && "id" in t ? String((t as any).id) : "?",
+    ),
+    break_: Object.entries(breakTools).map(([_, t]) =>
+      typeof t === "object" && t && "id" in t ? String((t as any).id) : "?",
+    ),
+  };
+  const all: string[] = Object.values(buckets).flat();
+  res.json({
+    ok: true,
+    total: all.length,
+    by_bucket: buckets,
+    all_tools: all.sort(),
+    deploy_check: {
+      has_leer_velas: all.includes("leer_velas"),
+      has_leer_estructura_tecnica: all.includes("leer_estructura_tecnica"),
+      has_backtest_tesis: all.includes("backtest_tesis"),
+      has_backtest_inteligente: all.includes("backtest_inteligente"),
+    },
+  });
+});
 
 interface ComponentStatus {
   name: string;
