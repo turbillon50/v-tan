@@ -208,14 +208,17 @@ router.post("/admin/sync-thesis", async (req, res): Promise<void> => {
     const govBefore = await getRules({ force: true });
     const autoBefore = await getAutonomyConfig({ force: true });
 
-    // Governance — valores fieles a la tesis 5.1
+    // Governance — valores fieles a la tesis 5.1.
+    // Único freno real: kill_switch_global (el botón de pánico). El resto
+    // son sentinelas para que la tabla acepte valores ('sin tope' real-real
+    // sería NULL en BD pero el schema espera number > 0).
     const govTargets: Array<[keyof typeof govBefore, number | string[] | string]> = [
       ["max_leverage", 100], // techo absoluto que la tesis menciona
-      ["max_position_size_usd", 100000], // efectivo "sin tope $", la tesis usa % capital
-      ["max_daily_loss_usd", 100000], // circuit breaker se maneja por % no $
-      ["max_concurrent_positions", 6], // 6 motores → permite múltiples narrativas
-      ["allowed_symbols", []], // [] = sin restricción de símbolos
-      ["require_approval_above_usd", 100000], // efectivo: nunca pide aprobación
+      ["max_position_size_usd", 1000000], // efectivo sin tope $
+      ["max_daily_loss_usd", 1000000], // circuit breaker -10% lo maneja la tesis, no $
+      ["max_concurrent_positions", 50], // sin freno efectivo
+      ["allowed_symbols", []], // [] = todos los símbolos permitidos
+      ["require_approval_above_usd", 1000000], // nunca pide aprobación
     ];
     for (const [field, value] of govTargets) {
       const prev = (govBefore as unknown as Record<string, unknown>)[field as string];

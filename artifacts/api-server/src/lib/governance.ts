@@ -106,8 +106,10 @@ export async function validateOrder(args: {
     };
   }
 
-  // 2) Símbolo permitido
-  if (!r.allowed_symbols.includes(args.symbol)) {
+  // 2) Símbolo permitido — convención: allowed_symbols=[] significa "sin
+  //    restricción de símbolo" (la tesis 5.1 dice "mosquito surfea donde
+  //    haya ola"). Si la lista trae elementos, sí filtramos contra ella.
+  if (r.allowed_symbols.length > 0 && !r.allowed_symbols.includes(args.symbol)) {
     return {
       allowed: false,
       reason: `Símbolo '${args.symbol}' no está en allowed_symbols (${r.allowed_symbols.join(", ")}).`,
