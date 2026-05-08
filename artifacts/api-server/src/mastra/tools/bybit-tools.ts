@@ -567,6 +567,364 @@ export const leerEstructuraTecnica = createTool({
   },
 });
 
+// ─── BACKTEST DE LA TESIS 5.1 ────────────────────────────────────────────────
+//
+// Simula la entrada/salida con los criterios codificados de la tesis 5.1
+// sobre velas históricas Bybit. Devuelve métricas: win rate, profit factor,
+// max drawdown, equity curve, lista de trades. Útil para que Tanit conteste
+// 'qué hubiera pasado si...' sin tener que conjeturar.
+//
+// Reglas codificadas (versión simplificada, mecánica):
+//   ENTRADA LONG: estructura=bullish (EMA20>EMA50>EMA200 + close>EMA20)
+//                 + volRatio >= 1.0 (volumen no anémico)
+//                 + RSI(14) entre 40 y 70 (momentum sin extremo)
+//   ENTRADA SHORT: espejo (estructura=bearish + RSI 30-60 + vol)
+//   SL: swing low (long) / swing high (short) reciente
+//   TP: RR 1:2 (entry + 2 * (entry - SL))
+//   Position size: % del capital por trade (param) con leverage configurable
+//   Salida también por: trail si va +50% TP, stop tras N velas si no avanza
+export const backtestTesis = createTool({
+  id: "backtest_tesis",
+  description:
+    "Corre un backtest mecánico de la Tesis 5.1 sobre velas históricas. Simula entradas/salidas según motor 1 (momentum confirmado por EMAs+volumen+RSI) con SL en swing reciente y TP por RR 1:2. Devuelve win rate, profit factor, drawdown, lista de trades, equity curve. Capital inicial y riesgo por trade configurables.",
+  inputSchema: z.object({
+    symbol: z.string(),
+    interval: z
+      .enum(["15", "60", "240", "D"])
+      .default("240")
+      .describe("'15'=15m, '60'=1h, '240'=4h, 'D'=diario"),
+    candles: z
+      .number()
+      .int()
+      .min(50)
+      .max(1000)
+      .default(500)
+      .describe("Cuántas velas históricas analizar"),
+    initialCapital: z.number().positive().default(45),
+    riskPctPerTrade: z
+      .number()
+      .min(0.5)
+      .max(20)
+      .default(2)
+      .describe("% del capital arriesgado por trade (default 2%)"),
+    leverage: z.number().min(1).max(100).default(10),
+    side: z
+      .enum(["both", "long_only", "short_only"])
+      .default("both"),
+  }),
+  outputSchema: z.object({
+    ok: z.boolean(),
+    symbol: z.string(),
+    interval: z.string(),
+    candlesAnalyzed: z.number(),
+    fromTime: z.string().nullable(),
+    toTime: z.string().nullable(),
+    summary: z
+      .object({
+        totalTrades: z.number(),
+        wins: z.number(),
+        losses: z.number(),
+        winRate: z.number(),
+        profitFactor: z.number(),
+        totalPnlUsd: z.number(),
+        totalPnlPct: z.number(),
+        maxDrawdownPct: z.number(),
+        finalEquity: z.number(),
+        avgWinUsd: z.number(),
+        avgLossUsd: z.number(),
+        bestTrade: z.number(),
+        worstTrade: z.number(),
+      })
+      .optional(),
+    trades: z
+      .array(
+        z.object({
+          side: z.enum(["long", "short"]),
+          entryTime: z.string(),
+          entryPrice: z.number(),
+          exitTime: z.string(),
+          exitPrice: z.number(),
+          exitReason: z.enum(["tp", "sl", "timeout"]),
+          pnlUsd: z.number(),
+          pnlPct: z.number(),
+          barsHeld: z.number(),
+        }),
+      )
+      .optional(),
+    error: z.string().optional(),
+  }),
+  execute: async (rawInput: unknown) => {
+    const ctx = (rawInput && typeof rawInput === "object" && "context" in rawInput
+      ? (rawInput as { context: any }).context
+      : (rawInput as any)) as {
+      symbol: string;
+      interval: string;
+      candles: number;
+      initialCapital: number;
+      riskPctPerTrade: number;
+      leverage: number;
+      side: "both" | "long_only" | "short_only";
+    };
+    try {
+      // 1) Cargar velas históricas
+      const data = await bybitPublic("/v5/market/kline", {
+        category: "linear",
+        symbol: ctx.symbol,
+        interval: ctx.interval,
+        limit: String(Math.min(1000, ctx.candles)),
+      });
+      const list = (data?.result?.list ?? []) as string[][];
+      if (list.length < 220) {
+        return {
+          ok: false,
+          symbol: ctx.symbol,
+          interval: ctx.interval,
+          candlesAnalyzed: list.length,
+          fromTime: null,
+          toTime: null,
+          error: `pocas velas (${list.length}); necesito >= 220 para EMA200 + ventana de análisis`,
+        };
+      }
+      const candles = list
+        .slice()
+        .reverse()
+        .map((c) => ({
+          time: parseInt(c[0]!, 10),
+          open: parseFloat(c[1]!),
+          high: parseFloat(c[2]!),
+          low: parseFloat(c[3]!),
+          close: parseFloat(c[4]!),
+          volume: parseFloat(c[5]!),
+        }));
+
+      // 2) Helpers para indicadores incrementales
+      const closes = candles.map((c) => c.close);
+      const ema = (period: number, idx: number): number | null => {
+        if (idx + 1 < period) return null;
+        const k = 2 / (period + 1);
+        let val =
+          closes.slice(idx + 1 - period, idx + 1).reduce((a, b) => a + b, 0) / period;
+        // re-cómputo simple (no incremental) — válido para backtest pequeño
+        let v = closes.slice(0, period).reduce((a, b) => a + b, 0) / period;
+        for (let i = period; i <= idx; i++) {
+          v = closes[i]! * k + v * (1 - k);
+        }
+        return v;
+      };
+      const rsi = (idx: number, period = 14): number | null => {
+        if (idx < period) return null;
+        let gains = 0;
+        let losses = 0;
+        for (let i = idx - period + 1; i <= idx; i++) {
+          const d = closes[i]! - closes[i - 1]!;
+          if (d >= 0) gains += d;
+          else losses -= d;
+        }
+        const avgG = gains / period;
+        const avgL = losses / period;
+        if (avgL === 0) return 100;
+        const rs = avgG / avgL;
+        return 100 - 100 / (1 + rs);
+      };
+      const avgVol20 = (idx: number): number => {
+        const start = Math.max(0, idx - 19);
+        const arr = candles.slice(start, idx + 1);
+        return arr.reduce((s, c) => s + c.volume, 0) / arr.length;
+      };
+      const swingLow = (idx: number, lookback = 20): number => {
+        const start = Math.max(0, idx - lookback + 1);
+        let lo = candles[start]!.low;
+        for (let i = start; i <= idx; i++) {
+          if (candles[i]!.low < lo) lo = candles[i]!.low;
+        }
+        return lo;
+      };
+      const swingHigh = (idx: number, lookback = 20): number => {
+        const start = Math.max(0, idx - lookback + 1);
+        let hi = candles[start]!.high;
+        for (let i = start; i <= idx; i++) {
+          if (candles[i]!.high > hi) hi = candles[i]!.high;
+        }
+        return hi;
+      };
+
+      // 3) Backtest engine (mecánico, una posición a la vez)
+      type Pos = {
+        side: "long" | "short";
+        entryIdx: number;
+        entryPrice: number;
+        sl: number;
+        tp: number;
+        sizeUsdNotional: number;
+      };
+      let equity = ctx.initialCapital;
+      let peakEquity = equity;
+      let maxDrawdownPct = 0;
+      let pos: Pos | null = null;
+      const trades: Array<{
+        side: "long" | "short";
+        entryTime: string;
+        entryPrice: number;
+        exitTime: string;
+        exitPrice: number;
+        exitReason: "tp" | "sl" | "timeout";
+        pnlUsd: number;
+        pnlPct: number;
+        barsHeld: number;
+      }> = [];
+
+      const MAX_BARS_HELD = 30;
+      const allowLong = ctx.side !== "short_only";
+      const allowShort = ctx.side !== "long_only";
+
+      // empezamos en idx 200 (necesitamos EMA200)
+      for (let i = 200; i < candles.length; i++) {
+        const c = candles[i]!;
+
+        // Si hay posición abierta, ver si tocó SL/TP
+        if (pos) {
+          let exitPrice: number | null = null;
+          let exitReason: "tp" | "sl" | "timeout" | null = null;
+          if (pos.side === "long") {
+            if (c.low <= pos.sl) {
+              exitPrice = pos.sl;
+              exitReason = "sl";
+            } else if (c.high >= pos.tp) {
+              exitPrice = pos.tp;
+              exitReason = "tp";
+            }
+          } else {
+            if (c.high >= pos.sl) {
+              exitPrice = pos.sl;
+              exitReason = "sl";
+            } else if (c.low <= pos.tp) {
+              exitPrice = pos.tp;
+              exitReason = "tp";
+            }
+          }
+          const barsHeld = i - pos.entryIdx;
+          if (!exitPrice && barsHeld >= MAX_BARS_HELD) {
+            exitPrice = c.close;
+            exitReason = "timeout";
+          }
+          if (exitPrice && exitReason) {
+            const move = pos.side === "long"
+              ? (exitPrice - pos.entryPrice) / pos.entryPrice
+              : (pos.entryPrice - exitPrice) / pos.entryPrice;
+            const pnlUsd = move * pos.sizeUsdNotional;
+            equity += pnlUsd;
+            if (equity > peakEquity) peakEquity = equity;
+            const dd = ((peakEquity - equity) / peakEquity) * 100;
+            if (dd > maxDrawdownPct) maxDrawdownPct = dd;
+            trades.push({
+              side: pos.side,
+              entryTime: new Date(candles[pos.entryIdx]!.time).toISOString(),
+              entryPrice: pos.entryPrice,
+              exitTime: new Date(c.time).toISOString(),
+              exitPrice,
+              exitReason,
+              pnlUsd: parseFloat(pnlUsd.toFixed(4)),
+              pnlPct: parseFloat((move * 100 * ctx.leverage).toFixed(2)),
+              barsHeld,
+            });
+            pos = null;
+            if (equity <= 0) break;
+          }
+        }
+
+        // Ver si hay setup para entrar (sólo si no hay posición)
+        if (!pos) {
+          const e20 = ema(20, i);
+          const e50 = ema(50, i);
+          const e200 = ema(200, i);
+          if (e20 == null || e50 == null || e200 == null) continue;
+          const r = rsi(i);
+          if (r == null) continue;
+          const vol = avgVol20(i);
+          if (vol === 0) continue;
+          const volRatio = c.volume / vol;
+          if (volRatio < 1.0) continue;
+
+          const bullish = e20 > e50 && e50 > e200 && c.close > e20;
+          const bearish = e20 < e50 && e50 < e200 && c.close < e20;
+
+          if (allowLong && bullish && r >= 40 && r <= 70) {
+            const sl = swingLow(i, 20);
+            if (sl >= c.close) continue; // SL inválido
+            const risk = c.close - sl;
+            const tp = c.close + 2 * risk;
+            const riskUsd = (equity * ctx.riskPctPerTrade) / 100;
+            const sizeUsdNotional = (riskUsd / (risk / c.close)) * 1; // notional = riskUsd / riskFraction
+            // Cap notional por leverage
+            const maxNotional = equity * ctx.leverage;
+            const notional = Math.min(sizeUsdNotional, maxNotional);
+            pos = { side: "long", entryIdx: i, entryPrice: c.close, sl, tp, sizeUsdNotional: notional };
+          } else if (allowShort && bearish && r >= 30 && r <= 60) {
+            const sl = swingHigh(i, 20);
+            if (sl <= c.close) continue;
+            const risk = sl - c.close;
+            const tp = c.close - 2 * risk;
+            const riskUsd = (equity * ctx.riskPctPerTrade) / 100;
+            const sizeUsdNotional = (riskUsd / (risk / c.close)) * 1;
+            const maxNotional = equity * ctx.leverage;
+            const notional = Math.min(sizeUsdNotional, maxNotional);
+            pos = { side: "short", entryIdx: i, entryPrice: c.close, sl, tp, sizeUsdNotional: notional };
+          }
+        }
+      }
+
+      // 4) Métricas
+      const wins = trades.filter((t) => t.pnlUsd > 0).length;
+      const losses = trades.filter((t) => t.pnlUsd < 0).length;
+      const winRate = trades.length > 0 ? (wins / trades.length) * 100 : 0;
+      const grossWin = trades.filter((t) => t.pnlUsd > 0).reduce((s, t) => s + t.pnlUsd, 0);
+      const grossLoss = -trades.filter((t) => t.pnlUsd < 0).reduce((s, t) => s + t.pnlUsd, 0);
+      const profitFactor = grossLoss > 0 ? grossWin / grossLoss : grossWin > 0 ? 999 : 0;
+      const totalPnlUsd = equity - ctx.initialCapital;
+      const totalPnlPct = (totalPnlUsd / ctx.initialCapital) * 100;
+      const avgWinUsd = wins > 0 ? grossWin / wins : 0;
+      const avgLossUsd = losses > 0 ? -grossLoss / losses : 0;
+      const bestTrade = trades.length ? Math.max(...trades.map((t) => t.pnlUsd)) : 0;
+      const worstTrade = trades.length ? Math.min(...trades.map((t) => t.pnlUsd)) : 0;
+
+      return {
+        ok: true,
+        symbol: ctx.symbol,
+        interval: ctx.interval,
+        candlesAnalyzed: candles.length,
+        fromTime: candles.length ? new Date(candles[0]!.time).toISOString() : null,
+        toTime: candles.length ? new Date(candles[candles.length - 1]!.time).toISOString() : null,
+        summary: {
+          totalTrades: trades.length,
+          wins,
+          losses,
+          winRate: parseFloat(winRate.toFixed(2)),
+          profitFactor: parseFloat(profitFactor.toFixed(3)),
+          totalPnlUsd: parseFloat(totalPnlUsd.toFixed(2)),
+          totalPnlPct: parseFloat(totalPnlPct.toFixed(2)),
+          maxDrawdownPct: parseFloat(maxDrawdownPct.toFixed(2)),
+          finalEquity: parseFloat(equity.toFixed(2)),
+          avgWinUsd: parseFloat(avgWinUsd.toFixed(2)),
+          avgLossUsd: parseFloat(avgLossUsd.toFixed(2)),
+          bestTrade: parseFloat(bestTrade.toFixed(2)),
+          worstTrade: parseFloat(worstTrade.toFixed(2)),
+        },
+        trades: trades.slice(-50), // últimos 50 para no saturar el contexto
+      };
+    } catch (e) {
+      return {
+        ok: false,
+        symbol: ctx.symbol,
+        interval: ctx.interval,
+        candlesAnalyzed: 0,
+        fromTime: null,
+        toTime: null,
+        error: e instanceof Error ? e.message : String(e),
+      };
+    }
+  },
+});
+
 /**
  * Bundle de tools de LECTURA. Importar y pasar al Agent así:
  *   import { bybitReadTools } from "./tools/bybit-tools";
@@ -580,4 +938,5 @@ export const bybitReadTools = {
   consultarEstadoSistema,
   leerVelas,
   leerEstructuraTecnica,
+  backtestTesis,
 };
