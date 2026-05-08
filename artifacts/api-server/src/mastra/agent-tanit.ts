@@ -12,6 +12,7 @@ import { PostgresStore } from "@mastra/pg";
 import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import { loadBootstrap } from "./bootstrap";
 import { bybitReadTools } from "./tools/bybit-tools";
+import { bybitWriteTools } from "./tools/bybit-write-tools";
 import { governanceTools } from "./tools/governance-tools";
 
 const GEMINI_API_KEY = process.env["GEMINI_API_KEY"];
@@ -67,11 +68,12 @@ export const tanitAgent = new Agent({
   model: google("gemini-2.5-flash"),
   maxRetries: 5,
   memory: tanitMemory,
-  // Tools de LECTURA Bybit (Fase A) + governance (Fase B).
-  // - Read Bybit: balance, posiciones, precios, estado del sistema.
-  // - Governance: consultar reglas, ajustar (con approval), kill-switch.
-  // Tools de WRITE Bybit (Fase C) llegarán pasando por validateOrder().
-  tools: { ...bybitReadTools, ...governanceTools },
+  // Tools cableadas:
+  //  - Read Bybit (Fase A): balance, posiciones, precios, estado.
+  //  - Governance (Fase B): consultar/ajustar reglas, kill-switch.
+  //  - Write Bybit (Fase C): abrir long/short, cerrar, mover stops, cancelar.
+  //    Triple barrera: governance check → confirmación humana → audit.
+  tools: { ...bybitReadTools, ...governanceTools, ...bybitWriteTools },
   instructions: async () => {
     const ctx = await loadBootstrap();
     return ctx.systemPrompt;
