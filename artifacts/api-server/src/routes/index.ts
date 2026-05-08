@@ -16,6 +16,7 @@ import tanitRouter from "./tanit";
 import tanitMastraRouter from "./tanit-mastra";
 import threadsRouter from "./threads";
 import audioRouter from "./audio";
+import systemRouter from "./system";
 const router: IRouter = Router();
 
 router.use(healthRouter);
@@ -34,6 +35,7 @@ router.use(tanitRouter);
 router.use(tanitMastraRouter);
 router.use(threadsRouter);
 router.use(audioRouter);
+router.use(systemRouter);
 router.use("/bybit", bybitRealRouter);
 
 export default router;
