@@ -91,20 +91,65 @@ async function checkOpenAI(): Promise<ComponentStatus> {
     };
   }
   try {
-    // GET /v1/models es el endpoint más barato para verificar auth
+    // Tocamos /v1/audio/speech con texto mínimo (~1 token). Esto sí consume
+    // cuota real; si la cuenta está sin saldo, OpenAI devuelve 429 con
+    // insufficient_quota — antes /v1/models pasaba aunque la cuenta estuviera
+    // vacía y el panel mentía diciendo "auth válida".
     const r = await withTimeout(
-      fetch("https://api.openai.com/v1/models", {
-        headers: { Authorization: `Bearer ${key}` },
+      fetch("https://api.openai.com/v1/audio/speech", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${key}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "tts-1",
+          voice: "nova",
+          input: ".",
+          response_format: "mp3",
+        }),
         signal: AbortSignal.timeout(2500),
       }),
       3000,
     );
+    if (r.ok) {
+      await r.arrayBuffer().catch(() => null);
+      return {
+        name: "OpenAI (Whisper + TTS)",
+        ok: true,
+        latencyMs: Date.now() - t0,
+        message: "voz disponible",
+        needsAttention: false,
+      };
+    }
+    if (r.status === 429) {
+      const txt = await r.text().catch(() => "");
+      const isQuota = /insufficient_quota|quota|billing/i.test(txt);
+      return {
+        name: "OpenAI (Whisper + TTS)",
+        ok: false,
+        latencyMs: Date.now() - t0,
+        message: isQuota
+          ? "sin saldo OpenAI — recargar en platform.openai.com/billing"
+          : "rate limit OpenAI (429) — esperar",
+        needsAttention: true,
+      };
+    }
+    if (r.status === 401) {
+      return {
+        name: "OpenAI (Whisper + TTS)",
+        ok: false,
+        latencyMs: Date.now() - t0,
+        message: "API key inválida o revocada",
+        needsAttention: true,
+      };
+    }
     return {
       name: "OpenAI (Whisper + TTS)",
-      ok: r.ok,
+      ok: false,
       latencyMs: Date.now() - t0,
-      message: r.ok ? `auth válida` : `OpenAI ${r.status}`,
-      needsAttention: !r.ok,
+      message: `OpenAI ${r.status}`,
+      needsAttention: true,
     };
   } catch (e) {
     return {

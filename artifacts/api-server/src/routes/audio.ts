@@ -1,90 +1,191 @@
 /**
- * Endpoints de audio:
- *  - POST /audio/transcribe — recibe audio (multipart/form-data o base64)
- *    y devuelve texto via OpenAI Whisper.
- *  - POST /audio/synthesize — recibe texto y devuelve MP3 via OpenAI TTS
- *    (voz "nova" — femenina cálida, encaja con la voz de Tanit).
+ * Endpoints de audio + imagen — TODO via Gemini (un solo vendor, una sola key).
  *
- * Reusan la OPENAI_API_KEY que ya está en Railway env.
+ *  - POST /audio/transcribe — audio base64 → texto (Gemini 2.5 Flash multimodal)
+ *  - POST /audio/synthesize — texto → WAV (Gemini 2.5 Flash TTS, voz "Kore")
+ *  - POST /image/generate   — prompt → PNG (Gemini 2.5 Flash Image, "nano banana")
+ *
+ * Antes /audio/transcribe usaba Whisper y /audio/synthesize usaba TTS-1 de
+ * OpenAI. Cuando se agotó la cuota de OpenAI la voz dejó de funcionar.
+ * Ahora todo va por Gemini con OpenAI como fallback opcional para Whisper
+ * (porque la calidad de Whisper sigue siendo top — pero solo si hay saldo).
+ *
+ * Variables: GEMINI_API_KEY (obligatorio); OPENAI_API_KEY (opcional, fallback).
  */
 import { Router } from "express";
 import { logger } from "../lib/logger";
 
 const router = Router();
 
+const GEMINI_API_KEY = process.env["GEMINI_API_KEY"];
 const OPENAI_API_KEY = process.env["OPENAI_API_KEY"];
-if (!OPENAI_API_KEY) {
-  logger.warn("[audio] OPENAI_API_KEY no está definida. Audio endpoints van a fallar.");
+if (!GEMINI_API_KEY) {
+  logger.warn("[audio] GEMINI_API_KEY no está definida — voz e imagen no funcionarán.");
+}
+
+/**
+ * Construye un header WAV PCM lineal 16-bit mono. Gemini TTS devuelve
+ * audio crudo PCM (mimeType "audio/L16;rate=24000"); el browser no puede
+ * reproducir eso directo, así que le pegamos el header WAV de 44 bytes.
+ */
+function pcmToWav(pcm: Buffer, sampleRate = 24000, channels = 1, bitsPerSample = 16): Buffer {
+  const byteRate = (sampleRate * channels * bitsPerSample) / 8;
+  const blockAlign = (channels * bitsPerSample) / 8;
+  const dataSize = pcm.length;
+  const header = Buffer.alloc(44);
+  header.write("RIFF", 0);
+  header.writeUInt32LE(36 + dataSize, 4);
+  header.write("WAVE", 8);
+  header.write("fmt ", 12);
+  header.writeUInt32LE(16, 16); // PCM chunk size
+  header.writeUInt16LE(1, 20); // PCM format
+  header.writeUInt16LE(channels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(bitsPerSample, 34);
+  header.write("data", 36);
+  header.writeUInt32LE(dataSize, 40);
+  return Buffer.concat([header, pcm]);
+}
+
+/** Extrae sampleRate de un mimeType tipo "audio/L16;rate=24000". */
+function sampleRateFromMime(mime: string, fallback = 24000): number {
+  const m = mime.match(/rate=(\d+)/);
+  if (m && m[1]) {
+    const n = parseInt(m[1], 10);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return fallback;
 }
 
 // ─── POST /audio/transcribe ─────────────────────────────────────────────────
-// Body: multipart/form-data con campo "audio" (Blob/File) — o JSON con
-// { audio_base64: string, mimeType: string }.
-// Devuelve: { ok: true, text: string }
+// Body: { audio_base64: string, mimeType?: string }
+// Devuelve: { ok: true, text: string, provider: 'gemini'|'openai' }
+//
+// Estrategia: Gemini multimodal primero (más barato, audio nativo). Si Gemini
+// falla y hay OPENAI_API_KEY con saldo, fallback a Whisper.
 router.post("/audio/transcribe", async (req, res): Promise<void> => {
-  if (!OPENAI_API_KEY) {
-    res.status(500).json({ ok: false, error: "OPENAI_API_KEY no configurada" });
-    return;
-  }
-
   try {
-    let audioBuffer: Buffer | null = null;
-    let mimeType = "audio/webm";
-
-    // Caso JSON con base64
     const ct = req.headers["content-type"] ?? "";
-    if (ct.startsWith("application/json")) {
-      const body = (req.body ?? {}) as { audio_base64?: string; mimeType?: string };
-      if (!body.audio_base64) {
-        res.status(400).json({ ok: false, error: "audio_base64 requerido" });
-        return;
-      }
-      audioBuffer = Buffer.from(body.audio_base64, "base64");
-      mimeType = body.mimeType ?? mimeType;
-    } else {
-      // multipart — usamos express raw body si está, o leemos el stream.
-      // express.json no parsea multipart, así que aquí asumimos que el
-      // cliente mande JSON. Mantenemos el flujo simple.
+    if (!ct.startsWith("application/json")) {
       res.status(400).json({
         ok: false,
         error: "Content-Type debe ser application/json con audio_base64",
       });
       return;
     }
-
-    if (!audioBuffer || audioBuffer.length === 0) {
+    const body = (req.body ?? {}) as { audio_base64?: string; mimeType?: string };
+    if (!body.audio_base64) {
+      res.status(400).json({ ok: false, error: "audio_base64 requerido" });
+      return;
+    }
+    const audioBuffer = Buffer.from(body.audio_base64, "base64");
+    const mimeType = body.mimeType ?? "audio/webm";
+    if (audioBuffer.length === 0) {
       res.status(400).json({ ok: false, error: "audio vacío" });
       return;
     }
-    if (audioBuffer.length > 25 * 1024 * 1024) {
-      res.status(413).json({ ok: false, error: "audio > 25MB no soportado por Whisper" });
+    if (audioBuffer.length > 20 * 1024 * 1024) {
+      res.status(413).json({ ok: false, error: "audio > 20MB" });
       return;
     }
 
-    // Construir multipart form para OpenAI Whisper
-    const form = new FormData();
-    const ext = mimeType.includes("webm") ? "webm" : mimeType.includes("mp4") ? "mp4" : "mp3";
-    const blob = new Blob([new Uint8Array(audioBuffer)], { type: mimeType });
-    form.append("file", blob, `audio.${ext}`);
-    form.append("model", "whisper-1");
-    form.append("language", "es");
-    form.append("response_format", "json");
+    // 1) Intento Gemini 2.5 Flash multimodal con audio inline
+    if (GEMINI_API_KEY) {
+      try {
+        const r = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              contents: [
+                {
+                  role: "user",
+                  parts: [
+                    {
+                      text: "Transcribe el siguiente audio al español tal y como lo escuches. Devuelve SOLO el texto transcrito, sin comillas, sin notas, sin explicaciones, sin signos extra.",
+                    },
+                    {
+                      inline_data: {
+                        mime_type: mimeType,
+                        data: body.audio_base64,
+                      },
+                    },
+                  ],
+                },
+              ],
+              generationConfig: {
+                temperature: 0,
+                maxOutputTokens: 2048,
+              },
+            }),
+          },
+        );
+        if (r.ok) {
+          const j = (await r.json()) as {
+            candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+          };
+          const parts = j.candidates?.[0]?.content?.parts ?? [];
+          const text = parts
+            .map((p) => p.text ?? "")
+            .join("")
+            .trim();
+          if (text) {
+            res.json({ ok: true, text, provider: "gemini" });
+            return;
+          }
+          logger.warn("[audio] gemini transcribe vacío, intento fallback");
+        } else {
+          const errTxt = await r.text().catch(() => "");
+          logger.warn(
+            { status: r.status, errTxt: errTxt.slice(0, 300) },
+            "[audio] gemini transcribe failed",
+          );
+        }
+      } catch (e) {
+        logger.warn({ err: e }, "[audio] gemini transcribe threw, intento fallback");
+      }
+    }
 
-    const r = await fetch("https://api.openai.com/v1/audio/transcriptions", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
-      body: form,
+    // 2) Fallback OpenAI Whisper (sólo si la cuenta tiene saldo)
+    if (OPENAI_API_KEY) {
+      try {
+        const form = new FormData();
+        const ext = mimeType.includes("webm") ? "webm" : mimeType.includes("mp4") ? "mp4" : "mp3";
+        const blob = new Blob([new Uint8Array(audioBuffer)], { type: mimeType });
+        form.append("file", blob, `audio.${ext}`);
+        form.append("model", "whisper-1");
+        form.append("language", "es");
+        form.append("response_format", "json");
+
+        const r = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
+          body: form,
+        });
+        if (r.ok) {
+          const data = (await r.json()) as { text?: string };
+          res.json({ ok: true, text: data.text ?? "", provider: "openai" });
+          return;
+        }
+        const errTxt = await r.text().catch(() => "");
+        logger.warn(
+          { status: r.status, errTxt: errTxt.slice(0, 300) },
+          "[audio] whisper fallback failed",
+        );
+      } catch (e) {
+        logger.warn({ err: e }, "[audio] whisper fallback threw");
+      }
+    }
+
+    res.status(502).json({
+      ok: false,
+      error: GEMINI_API_KEY
+        ? "Gemini no pudo transcribir y OpenAI tampoco (sin saldo)"
+        : "GEMINI_API_KEY no configurada",
     });
-
-    if (!r.ok) {
-      const errText = await r.text();
-      logger.warn({ status: r.status, errText: errText.slice(0, 300) }, "[audio] whisper failed");
-      res.status(502).json({ ok: false, error: `OpenAI ${r.status}: ${errText.slice(0, 300)}` });
-      return;
-    }
-
-    const data = (await r.json()) as { text?: string };
-    res.json({ ok: true, text: data.text ?? "" });
   } catch (e) {
     logger.error({ err: e }, "[audio] transcribe error");
     res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
@@ -92,14 +193,10 @@ router.post("/audio/transcribe", async (req, res): Promise<void> => {
 });
 
 // ─── POST /audio/synthesize ─────────────────────────────────────────────────
-// Body: { text: string, voice?: 'nova'|'shimmer'|'fable'|'alloy'|'echo'|'onyx' }
-// Devuelve: audio/mpeg binario para que el cliente lo reproduzca con <audio>.
+// Body: { text: string, voice?: 'Kore'|'Puck'|'Charon'|'Fenrir'|... }
+// Devuelve: audio/wav binario (Gemini TTS devuelve PCM L16 24kHz, lo
+// envolvemos en WAV para que el browser lo reproduzca directo con <audio>).
 router.post("/audio/synthesize", async (req, res): Promise<void> => {
-  if (!OPENAI_API_KEY) {
-    res.status(500).json({ ok: false, error: "OPENAI_API_KEY no configurada" });
-    return;
-  }
-
   try {
     const body = (req.body ?? {}) as { text?: string; voice?: string };
     const text = (body.text ?? "").trim();
@@ -108,45 +205,200 @@ router.post("/audio/synthesize", async (req, res): Promise<void> => {
       return;
     }
     if (text.length > 4096) {
-      res.status(413).json({ ok: false, error: "text > 4096 chars (límite OpenAI TTS)" });
+      res.status(413).json({ ok: false, error: "text > 4096 chars" });
       return;
     }
 
-    // Voz por default: "nova" — femenina, cálida, encaja con Tanit.
-    const voice = (body.voice ?? "nova").toLowerCase();
-    const allowed = ["nova", "shimmer", "fable", "alloy", "echo", "onyx"];
-    const safeVoice = allowed.includes(voice) ? voice : "nova";
+    // Voces Gemini: Kore (femenina cálida), Puck, Charon, Fenrir, Aoede, Leda…
+    // Mapeo retrocompatible: si el cliente manda 'nova' (OpenAI), traducimos.
+    const voiceMap: Record<string, string> = {
+      nova: "Kore",
+      shimmer: "Aoede",
+      fable: "Leda",
+      alloy: "Puck",
+      echo: "Charon",
+      onyx: "Fenrir",
+    };
+    const voiceInput = (body.voice ?? "Kore").trim();
+    const safeVoice = voiceMap[voiceInput.toLowerCase()] ?? voiceInput;
 
-    const r = await fetch("https://api.openai.com/v1/audio/speech", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "tts-1",
-        voice: safeVoice,
-        input: text,
-        response_format: "mp3",
-        speed: 1.0,
-      }),
+    if (GEMINI_API_KEY) {
+      try {
+        const r = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=${GEMINI_API_KEY}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              contents: [{ parts: [{ text }] }],
+              generationConfig: {
+                responseModalities: ["AUDIO"],
+                speechConfig: {
+                  voiceConfig: {
+                    prebuiltVoiceConfig: { voiceName: safeVoice },
+                  },
+                },
+              },
+            }),
+          },
+        );
+        if (r.ok) {
+          const j = (await r.json()) as {
+            candidates?: Array<{
+              content?: {
+                parts?: Array<{ inlineData?: { mimeType?: string; data?: string } }>;
+              };
+            }>;
+          };
+          const part = j.candidates?.[0]?.content?.parts?.find((p) => p.inlineData?.data);
+          const dataB64 = part?.inlineData?.data;
+          const mime = part?.inlineData?.mimeType ?? "audio/L16;rate=24000";
+          if (dataB64) {
+            const pcm = Buffer.from(dataB64, "base64");
+            const wav = pcmToWav(pcm, sampleRateFromMime(mime), 1, 16);
+            res.setHeader("Content-Type", "audio/wav");
+            res.setHeader("Content-Length", String(wav.length));
+            res.setHeader("Cache-Control", "private, max-age=3600");
+            res.setHeader("X-TTS-Provider", "gemini");
+            res.send(wav);
+            return;
+          }
+          logger.warn("[audio] gemini tts vacío, intento fallback OpenAI");
+        } else {
+          const errTxt = await r.text().catch(() => "");
+          logger.warn(
+            { status: r.status, errTxt: errTxt.slice(0, 300) },
+            "[audio] gemini tts failed",
+          );
+        }
+      } catch (e) {
+        logger.warn({ err: e }, "[audio] gemini tts threw, fallback");
+      }
+    }
+
+    // Fallback OpenAI TTS-1 (si hay saldo)
+    if (OPENAI_API_KEY) {
+      try {
+        const r = await fetch("https://api.openai.com/v1/audio/speech", {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${OPENAI_API_KEY}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            model: "tts-1",
+            voice: "nova",
+            input: text,
+            response_format: "mp3",
+            speed: 1.0,
+          }),
+        });
+        if (r.ok) {
+          const arrayBuffer = await r.arrayBuffer();
+          const buffer = Buffer.from(arrayBuffer);
+          res.setHeader("Content-Type", "audio/mpeg");
+          res.setHeader("Content-Length", String(buffer.length));
+          res.setHeader("Cache-Control", "private, max-age=3600");
+          res.setHeader("X-TTS-Provider", "openai");
+          res.send(buffer);
+          return;
+        }
+      } catch (e) {
+        logger.warn({ err: e }, "[audio] openai tts fallback threw");
+      }
+    }
+
+    res.status(502).json({
+      ok: false,
+      error: GEMINI_API_KEY
+        ? "Gemini TTS falló y OpenAI tampoco (sin saldo o no configurada)"
+        : "GEMINI_API_KEY no configurada",
     });
+  } catch (e) {
+    logger.error({ err: e }, "[audio] synthesize error");
+    res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+  }
+});
 
-    if (!r.ok) {
-      const errText = await r.text();
-      logger.warn({ status: r.status, errText: errText.slice(0, 300) }, "[audio] tts failed");
-      res.status(502).json({ ok: false, error: `OpenAI ${r.status}: ${errText.slice(0, 300)}` });
+// ─── POST /image/generate ───────────────────────────────────────────────────
+// Body: { prompt: string }
+// Devuelve: image/png binario generado con Gemini 2.5 Flash Image (Nano Banana).
+//
+// El frontend lo puede mostrar inline en el chat. Cuando Tanit decida que un
+// concepto necesita ilustración (ej. un setup técnico, un mapa de mercado),
+// puede llamar este endpoint vía un tool y adjuntar la imagen al mensaje.
+router.post("/image/generate", async (req, res): Promise<void> => {
+  if (!GEMINI_API_KEY) {
+    res.status(500).json({ ok: false, error: "GEMINI_API_KEY no configurada" });
+    return;
+  }
+  try {
+    const body = (req.body ?? {}) as { prompt?: string };
+    const prompt = (body.prompt ?? "").trim();
+    if (!prompt) {
+      res.status(400).json({ ok: false, error: "prompt requerido" });
+      return;
+    }
+    if (prompt.length > 2000) {
+      res.status(413).json({ ok: false, error: "prompt > 2000 chars" });
       return;
     }
 
-    const arrayBuffer = await r.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
-    res.setHeader("Content-Type", "audio/mpeg");
+    const r = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image-preview:generateContent?key=${GEMINI_API_KEY}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: {
+            responseModalities: ["TEXT", "IMAGE"],
+          },
+        }),
+      },
+    );
+    if (!r.ok) {
+      const errText = await r.text().catch(() => "");
+      logger.warn(
+        { status: r.status, errText: errText.slice(0, 400) },
+        "[image] gemini image gen failed",
+      );
+      res.status(502).json({
+        ok: false,
+        error: `Gemini ${r.status}: ${errText.slice(0, 200)}`,
+      });
+      return;
+    }
+
+    const j = (await r.json()) as {
+      candidates?: Array<{
+        content?: {
+          parts?: Array<{
+            text?: string;
+            inlineData?: { mimeType?: string; data?: string };
+          }>;
+        };
+      }>;
+    };
+    const part = j.candidates?.[0]?.content?.parts?.find((p) => p.inlineData?.data);
+    const dataB64 = part?.inlineData?.data;
+    const mime = part?.inlineData?.mimeType ?? "image/png";
+    if (!dataB64) {
+      // A veces Gemini responde solo texto si rechaza la imagen
+      const txtPart = j.candidates?.[0]?.content?.parts?.find((p) => p.text);
+      res.status(502).json({
+        ok: false,
+        error: txtPart?.text ?? "Gemini no devolvió imagen",
+      });
+      return;
+    }
+    const buffer = Buffer.from(dataB64, "base64");
+    res.setHeader("Content-Type", mime);
     res.setHeader("Content-Length", String(buffer.length));
     res.setHeader("Cache-Control", "private, max-age=3600");
     res.send(buffer);
   } catch (e) {
-    logger.error({ err: e }, "[audio] synthesize error");
+    logger.error({ err: e }, "[image] generate error");
     res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
   }
 });
