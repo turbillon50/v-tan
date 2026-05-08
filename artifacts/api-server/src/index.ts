@@ -1,3 +1,4 @@
+import http from "http";
 import app from "./app";
 import { logger } from "./lib/logger";
 import { initTelegramCommands } from "./lib/telegram-commands";
@@ -8,6 +9,7 @@ import { startAutonomousLoop } from "./mastra/autonomous-loop";
 import { startDailyReports } from "./lib/tanit-alerts";
 import { startBybitWs } from "./lib/bybit-ws";
 import { getRules } from "./lib/governance";
+import { attachVoiceLive } from "./lib/voice-live";
 
 const rawPort = process.env["PORT"] ?? "8080";
 const port = Number(rawPort);
@@ -32,12 +34,17 @@ async function handleShutdown(signal: string): Promise<void> {
 process.on("SIGTERM", () => handleShutdown("SIGTERM"));
 process.on("SIGINT",  () => handleShutdown("SIGINT"));
 
-app.listen(port, (err) => {
-  if (err) {
-    logger.error({ err }, "Error listening on port");
-    process.exit(1);
-  }
+// Creamos el HTTP server explícitamente para poder colgar el WS server
+// (voice-live) en el mismo puerto vía upgrade events.
+const server = http.createServer(app);
+attachVoiceLive(server);
 
+server.on("error", (err) => {
+  logger.error({ err }, "Error listening on port");
+  process.exit(1);
+});
+
+server.listen(port, () => {
   logger.info({ port }, "Server listening");
 
   // Boot: migrar las API keys de env vars a la tabla cifrada (idempotente).
