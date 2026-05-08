@@ -300,12 +300,12 @@ async function checkGovernanceAndAutonomy(): Promise<ComponentStatus[]> {
       ok: true,
       latencyMs: Date.now() - t0,
       message: !cfg.enabled
-        ? "deshabilitada"
+        ? "apagada — solo observa"
         : cfg.mode === "execute_with_governance"
           ? pausedNow
             ? `pausada hasta ${cfg.paused_until}`
-            : `🟢 operativa · ${cfg.daily_trade_count}/${cfg.max_daily_trades} trades hoy`
-          : `solo observa (mode=${cfg.mode})`,
+            : `🟢 operando según Tesis 5.1 · ${cfg.daily_trade_count}/${cfg.max_daily_trades} trades hoy`
+          : `solo observa`,
       needsAttention: pausedNow,
       meta: { mode: cfg.mode, enabled: cfg.enabled },
     });
