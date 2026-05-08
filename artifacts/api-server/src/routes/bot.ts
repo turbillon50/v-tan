@@ -1016,57 +1016,83 @@ router.post("/bot/gemini-chat", async (req, res): Promise<void> => {
 //   data: {"type":"thinking"} | {"type":"heartbeat"}
 //   data: {"type":"done","reply":"...","actionsExecuted":[...]}
 //   data: {"type":"error","message":"..."}
+// LEGACY endpoint — redirige internamente a Mastra para que CUALQUIER versión
+// cacheada del front (incluso navegadores con bundle viejo) hable con la voz
+// real de Tanit. Sin OBEDIENCIA, sin CMDR, sin fallback enlatado.
+// Mantiene el formato de eventos SSE { type: "thinking" | "token" | "done" | "error" }.
 router.post("/bot/gemini-chat-stream", async (req, res): Promise<void> => {
+  const { tanitAgent, getRecentTurns } = await import("../mastra/agent-tanit");
+
   res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
   res.setHeader("Connection", "keep-alive");
   res.setHeader("X-Accel-Buffering", "no");
+  // CORS — el endpoint dedicado /bot/mastra-chat-stream lo hace, este también.
+  const origin = req.headers.origin;
+  if (origin) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Access-Control-Allow-Credentials", "true");
+  }
   res.flushHeaders?.();
 
   const send = (event: Record<string, unknown>): void => {
-    res.write(`data: ${JSON.stringify(event)}\n\n`);
+    try { res.write(`data: ${JSON.stringify(event)}\n\n`); } catch {}
   };
 
-  const heartbeat = setInterval(() => {
-    try { send({ type: "heartbeat" }); } catch { /* socket closed */ }
-  }, 2000);
-
+  const heartbeat = setInterval(() => send({ type: "heartbeat" }), 5000);
   let aborted = false;
   req.on("close", () => { aborted = true; clearInterval(heartbeat); });
 
   try {
-    const { message, mode, imageBase64, imageMimeType, images, channel, sender } = req.body ?? {};
+    const { message, channel, sender } = req.body ?? {};
     if (!message || typeof message !== "string") {
       send({ type: "error", message: "message requerido" });
       clearInterval(heartbeat);
       res.end();
       return;
     }
-    const image = imageBase64 && imageMimeType
-      ? { base64: imageBase64 as string, mimeType: imageMimeType as string }
-      : undefined;
-    const multiImages = Array.isArray(images) ? images as { base64: string; mimeType: string }[] : undefined;
     const ch: "intimate" | "operational" = channel === "operational" ? "operational" : "intimate";
     const senderType = typeof sender === "string" && sender.length <= 30 ? sender : "human_luis";
 
+    // Persistir mensaje del usuario
+    try {
+      await pool.query(
+        `INSERT INTO tanit_chat (role, content, channel, sender_type) VALUES ('user', $1, $2, $3)`,
+        [message.trim(), ch, senderType],
+      );
+    } catch {}
+
     send({ type: "thinking" });
 
-    const result = await runGeminiUserCommand(
-      message.trim().slice(0, 50_000),
-      mode === "profesional" ? "profesional" : "casual",
-      image,
-      multiImages,
-      ch,
-      senderType,
-    );
+    const recentTurns = await getRecentTurns();
+    const messages = [...recentTurns, { role: "user" as const, content: message.trim() }];
+    const stream = await tanitAgent.stream(messages);
+
+    let fullReply = "";
+    for await (const chunk of stream.textStream) {
+      if (aborted) break;
+      if (chunk) {
+        fullReply += chunk;
+        send({ type: "token", content: chunk });
+      }
+    }
+
+    if (!aborted && fullReply.trim().length > 0) {
+      try {
+        await pool.query(
+          `INSERT INTO tanit_chat (role, content, channel, sender_type) VALUES ('assistant', $1, $2, 'tanit_reply')`,
+          [fullReply, ch],
+        );
+      } catch {}
+    }
 
     clearInterval(heartbeat);
     if (!aborted) {
       send({
         type: "done",
         channel: ch,
-        reply: result.reply,
-        actionsExecuted: result.actionsExecuted,
+        reply: fullReply,
+        actionsExecuted: [],
       });
     }
     res.end();
