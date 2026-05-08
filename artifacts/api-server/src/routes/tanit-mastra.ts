@@ -17,6 +17,8 @@ interface MastraChatBody {
   message?: string;
   channel?: "intimate" | "operational";
   sender_type?: string;
+  resourceId?: string;
+  threadId?: string;
 }
 
 router.post("/bot/mastra-chat-stream", async (req, res): Promise<void> => {
@@ -24,6 +26,9 @@ router.post("/bot/mastra-chat-stream", async (req, res): Promise<void> => {
   const message = (body.message ?? "").trim();
   const channel = body.channel === "operational" ? "operational" : "intimate";
   const senderType = body.sender_type ?? "human_luis";
+  // Mastra Memory: resource estable (Luis), thread por canal por defecto
+  const resourceId = (body.resourceId ?? "luis").toString().slice(0, 64);
+  const threadId = (body.threadId ?? `${channel}-main`).toString().slice(0, 128);
 
   if (!message) {
     res.status(400).json({ ok: false, error: "message is required" });
@@ -70,10 +75,10 @@ router.post("/bot/mastra-chat-stream", async (req, res): Promise<void> => {
       console.warn("[mastra-chat] warning persistiendo user msg:", (dbErr as Error).message);
     }
 
-    // 2) Obtener historial reciente del bootstrap
+    // 2) Bootstrap legacy SOLO en cold start (cuando Mastra todavía no tiene
+    //    histórico en este thread). Mastra inyecta automáticamente lastMessages
+    //    desde mastra_messages cuando la memoria se hidrata.
     const recentTurns = await getRecentTurns();
-
-    // 3) Construir lista de mensajes para el agent
     const messages = [
       ...recentTurns,
       { role: "user" as const, content: message },
@@ -81,8 +86,14 @@ router.post("/bot/mastra-chat-stream", async (req, res): Promise<void> => {
 
     send({ type: "thinking" });
 
-    // 4) Stream del agent. La instrucciones son dinámicas (loadBootstrap).
-    const stream = await tanitAgent.stream(messages);
+    // 3) Stream con Mastra Memory persistente (mastra_messages, mastra_threads
+    //    se crean al primer uso). Instructions dinámicas vía loadBootstrap.
+    const stream = await tanitAgent.stream(messages, {
+      memory: {
+        resource: resourceId,
+        thread: threadId,
+      },
+    });
 
     let fullReply = "";
     for await (const chunk of stream.textStream) {
