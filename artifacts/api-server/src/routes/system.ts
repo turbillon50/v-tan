@@ -372,7 +372,12 @@ async function checkGovernanceAndAutonomy(): Promise<ComponentStatus[]> {
             : `🟢 operando según Tesis 5.1 · ${cfg.daily_trade_count}/${cfg.max_daily_trades} trades hoy`
           : `solo observa`,
       needsAttention: pausedNow,
-      meta: { mode: cfg.mode, enabled: cfg.enabled },
+      meta: {
+        mode: cfg.mode,
+        enabled: cfg.enabled,
+        loop_active: cfg.loop_active,
+        loop_interval_minutes: cfg.loop_interval_minutes,
+      },
     });
   } catch (e) {
     out.push({
