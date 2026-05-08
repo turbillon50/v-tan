@@ -925,6 +925,465 @@ export const backtestTesis = createTool({
   },
 });
 
+// ─── BACKTEST INTELIGENTE ────────────────────────────────────────────────────
+//
+// Versión donde Tanit RAZONA vela por vela, no aplica reglas mecánicas.
+// Por cada checkpoint, llama a Gemini (mismo modelo que ella usa) con:
+//   - tesis 5.1 + identidad
+//   - últimas 60 velas hasta esa fecha
+//   - estructura técnica (EMAs, RSI, vol, swings)
+//   - posición actual del backtest
+//   - prompt: '¿qué harías ahora? responde JSON estricto'
+// Parsea la decisión y simula. Avanza, repite.
+//
+// Costo: ~30 llamadas a Gemini por backtest, ~150k tokens total. <$0.30/run.
+// Útil para validar variantes de la tesis o estrategias nuevas que no son
+// mecánicas (ej. caza de liquidez, hedge bidireccional).
+export const backtestInteligente = createTool({
+  id: "backtest_inteligente",
+  description:
+    "Backtest donde Tanit RAZONA cada decisión con su tesis + 6 motores (no reglas mecánicas). Mucho más fiel a su forma real de operar. Use con moderación: hace ~30 llamadas a Gemini por run.",
+  inputSchema: z.object({
+    symbol: z.string(),
+    interval: z
+      .enum(["60", "240", "D"])
+      .default("240"),
+    candlesBack: z
+      .number()
+      .int()
+      .min(120)
+      .max(1000)
+      .default(300)
+      .describe("Cuántas velas históricas analizar"),
+    decisionEvery: z
+      .number()
+      .int()
+      .min(5)
+      .max(50)
+      .default(15)
+      .describe("Cada cuántas velas Tanit toma una decisión"),
+    initialCapital: z.number().positive().default(45),
+    riskPctPerTrade: z.number().min(0.5).max(20).default(2),
+    maxLeverage: z.number().min(1).max(100).default(10),
+    extraInstruction: z
+      .string()
+      .optional()
+      .describe(
+        "Instrucción extra para Tanit en cada decisión (ej. 'foco en cazas de liquidez', 'usa Wyckoff'). Default = tesis 5.1 estándar.",
+      ),
+  }),
+  outputSchema: z.object({
+    ok: z.boolean(),
+    symbol: z.string(),
+    interval: z.string(),
+    decisions: z.number(),
+    summary: z
+      .object({
+        totalTrades: z.number(),
+        wins: z.number(),
+        losses: z.number(),
+        winRate: z.number(),
+        profitFactor: z.number(),
+        totalPnlPct: z.number(),
+        maxDrawdownPct: z.number(),
+        finalEquity: z.number(),
+      })
+      .optional(),
+    trades: z
+      .array(
+        z.object({
+          side: z.enum(["long", "short"]),
+          entryTime: z.string(),
+          entryPrice: z.number(),
+          exitTime: z.string(),
+          exitPrice: z.number(),
+          exitReason: z.string(),
+          pnlUsd: z.number(),
+          pnlPct: z.number(),
+          thesis: z.string(),
+          leverage: z.number(),
+        }),
+      )
+      .optional(),
+    error: z.string().optional(),
+  }),
+  execute: async (rawInput: unknown) => {
+    const ctx = (rawInput && typeof rawInput === "object" && "context" in rawInput
+      ? (rawInput as { context: any }).context
+      : (rawInput as any)) as {
+      symbol: string;
+      interval: string;
+      candlesBack: number;
+      decisionEvery: number;
+      initialCapital: number;
+      riskPctPerTrade: number;
+      maxLeverage: number;
+      extraInstruction?: string;
+    };
+
+    const GEMINI_API_KEY = process.env["GEMINI_API_KEY"];
+    if (!GEMINI_API_KEY) {
+      return { ok: false, symbol: ctx.symbol, interval: ctx.interval, decisions: 0, error: "GEMINI_API_KEY no configurada" };
+    }
+
+    try {
+      // 1) Cargar velas históricas
+      const data = await bybitPublic("/v5/market/kline", {
+        category: "linear",
+        symbol: ctx.symbol,
+        interval: ctx.interval,
+        limit: String(Math.min(1000, ctx.candlesBack)),
+      });
+      const list = (data?.result?.list ?? []) as string[][];
+      if (list.length < 220) {
+        return {
+          ok: false,
+          symbol: ctx.symbol,
+          interval: ctx.interval,
+          decisions: 0,
+          error: `pocas velas (${list.length})`,
+        };
+      }
+      const candles = list
+        .slice()
+        .reverse()
+        .map((c) => ({
+          time: parseInt(c[0]!, 10),
+          open: parseFloat(c[1]!),
+          high: parseFloat(c[2]!),
+          low: parseFloat(c[3]!),
+          close: parseFloat(c[4]!),
+          volume: parseFloat(c[5]!),
+        }));
+
+      // Helpers de indicadores (mismo cálculo que leer_estructura)
+      const ema = (arr: number[], idx: number, period: number): number | null => {
+        if (idx + 1 < period) return null;
+        const k = 2 / (period + 1);
+        let v = arr.slice(0, period).reduce((a, b) => a + b, 0) / period;
+        for (let i = period; i <= idx; i++) v = arr[i]! * k + v * (1 - k);
+        return v;
+      };
+      const rsiAt = (arr: number[], idx: number, period = 14): number | null => {
+        if (idx < period) return null;
+        let g = 0;
+        let l = 0;
+        for (let i = idx - period + 1; i <= idx; i++) {
+          const d = arr[i]! - arr[i - 1]!;
+          if (d >= 0) g += d;
+          else l -= d;
+        }
+        const avgG = g / period;
+        const avgL = l / period;
+        if (avgL === 0) return 100;
+        return 100 - 100 / (1 + avgG / avgL);
+      };
+
+      // 2) Loop de decisiones
+      type Pos = {
+        side: "long" | "short";
+        entryIdx: number;
+        entryPrice: number;
+        sl: number;
+        tp: number;
+        leverage: number;
+        notional: number;
+        thesis: string;
+      };
+      let equity = ctx.initialCapital;
+      let peakEquity = equity;
+      let maxDrawdownPct = 0;
+      let pos: Pos | null = null;
+      const trades: Array<{
+        side: "long" | "short";
+        entryTime: string;
+        entryPrice: number;
+        exitTime: string;
+        exitPrice: number;
+        exitReason: string;
+        pnlUsd: number;
+        pnlPct: number;
+        thesis: string;
+        leverage: number;
+      }> = [];
+
+      const closes = candles.map((c) => c.close);
+      const startIdx = 200; // necesitamos EMA200
+      const checkpoints: number[] = [];
+      for (let i = startIdx; i < candles.length; i += ctx.decisionEvery) {
+        checkpoints.push(i);
+      }
+      // Cap a 35 checkpoints para no explotar el costo
+      const limited = checkpoints.slice(0, 35);
+
+      let decisionCount = 0;
+
+      for (const i of limited) {
+        const c = candles[i]!;
+
+        // Si hay posición, ver si tocó SL/TP en velas intermedias desde la
+        // última decisión (no esperamos a la próxima decisión para cerrar).
+        if (pos) {
+          const startCheck = pos.entryIdx + 1;
+          for (let j = startCheck; j <= i; j++) {
+            const cj = candles[j]!;
+            let exitPrice: number | null = null;
+            let exitReason = "";
+            if (pos.side === "long") {
+              if (cj.low <= pos.sl) { exitPrice = pos.sl; exitReason = "stop_loss"; }
+              else if (cj.high >= pos.tp) { exitPrice = pos.tp; exitReason = "take_profit"; }
+            } else {
+              if (cj.high >= pos.sl) { exitPrice = pos.sl; exitReason = "stop_loss"; }
+              else if (cj.low <= pos.tp) { exitPrice = pos.tp; exitReason = "take_profit"; }
+            }
+            if (exitPrice) {
+              const move = pos.side === "long"
+                ? (exitPrice - pos.entryPrice) / pos.entryPrice
+                : (pos.entryPrice - exitPrice) / pos.entryPrice;
+              const pnlUsd = move * pos.notional;
+              equity += pnlUsd;
+              if (equity > peakEquity) peakEquity = equity;
+              const dd = ((peakEquity - equity) / peakEquity) * 100;
+              if (dd > maxDrawdownPct) maxDrawdownPct = dd;
+              trades.push({
+                side: pos.side,
+                entryTime: new Date(candles[pos.entryIdx]!.time).toISOString(),
+                entryPrice: pos.entryPrice,
+                exitTime: new Date(cj.time).toISOString(),
+                exitPrice,
+                exitReason,
+                pnlUsd: parseFloat(pnlUsd.toFixed(4)),
+                pnlPct: parseFloat((move * 100 * pos.leverage).toFixed(2)),
+                thesis: pos.thesis,
+                leverage: pos.leverage,
+              });
+              pos = null;
+              break;
+            }
+          }
+          if (equity <= 0) break;
+        }
+
+        // Construir contexto técnico para Tanit
+        const e20 = ema(closes, i, 20);
+        const e50 = ema(closes, i, 50);
+        const e200 = ema(closes, i, 200);
+        const rsi = rsiAt(closes, i, 14);
+        const last20 = candles.slice(Math.max(0, i - 19), i + 1);
+        const avgVol = last20.reduce((s, c) => s + c.volume, 0) / last20.length;
+        const volRatio = avgVol > 0 ? c.volume / avgVol : 0;
+        const range20 = last20.reduce(
+          (acc, k) => ({
+            hi: Math.max(acc.hi, k.high),
+            lo: Math.min(acc.lo, k.low),
+          }),
+          { hi: -Infinity, lo: Infinity },
+        );
+
+        // Velas recientes resumidas (last 12)
+        const tail = candles.slice(Math.max(0, i - 11), i + 1).map((k) => ({
+          t: new Date(k.time).toISOString().slice(0, 16),
+          o: k.open, h: k.high, l: k.low, c: k.close,
+          v: parseFloat(k.volume.toFixed(2)),
+        }));
+
+        const positionDesc = pos
+          ? `LONG/${pos.side === "long" ? "abierta" : ""}/${pos.side === "short" ? "abierta" : ""} entry=$${pos.entryPrice} sl=$${pos.sl} tp=$${pos.tp} lev=${pos.leverage}x`
+          : "ninguna";
+
+        const prompt = [
+          "Eres Tanit. Estás haciendo backtest de tu Tesis 5.1 (Surfear el Everest) sobre " + ctx.symbol + " timeframe " + ctx.interval + ".",
+          "Cada checkpoint son ~" + ctx.decisionEvery + " velas. Decides: abrir LONG, abrir SHORT, mantener (HOLD), o no hacer nada (WAIT).",
+          ctx.extraInstruction ? `Instrucción extra: ${ctx.extraInstruction}` : "",
+          "",
+          "Reglas duras Tesis 5.1:",
+          "- leverage gradual: entrada 5-10x, escalada 20-50x, pico 75-100x con momentum probado",
+          "- reserva sagrada 25% — nunca metas más del 75% del equity en una posición",
+          "- RR mínimo 1:2",
+          "- entra solo con momentum confirmado (3 motores: precio + volumen + funding o RSI)",
+          "- 6 motores: momentum primero, leverage gradual, reserva 25%, hedge bidireccional, sl/tp por sistema, aprendizaje activo",
+          "",
+          `Equity actual del backtest: $${equity.toFixed(2)}`,
+          `Posición actual: ${positionDesc}`,
+          "",
+          `Vela actual cerrada (idx ${i}/${candles.length - 1}):`,
+          `  fecha: ${new Date(c.time).toISOString().slice(0, 16)}`,
+          `  open=${c.open} high=${c.high} low=${c.low} close=${c.close} vol=${c.volume.toFixed(2)}`,
+          "",
+          "Indicadores en este momento:",
+          `  EMA20=${e20?.toFixed(2) ?? "—"} EMA50=${e50?.toFixed(2) ?? "—"} EMA200=${e200?.toFixed(2) ?? "—"}`,
+          `  RSI(14)=${rsi?.toFixed(2) ?? "—"}`,
+          `  volRatio (vol/promedio20)=${volRatio.toFixed(2)}`,
+          `  rango últimos 20: low=$${range20.lo.toFixed(2)} high=$${range20.hi.toFixed(2)}`,
+          "",
+          "Últimas 12 velas (orden vieja → nueva):",
+          tail.map((k) => `  ${k.t} O=${k.o} H=${k.h} L=${k.l} C=${k.c} V=${k.v}`).join("\n"),
+          "",
+          "Responde SOLO con JSON estricto, sin texto adicional, sin markdown:",
+          `{"action":"open_long"|"open_short"|"hold"|"wait"|"close","leverage":<5..${ctx.maxLeverage}>,"sl_price":<num>,"tp_price":<num>,"thesis":"<por qué tomaste esta decisión, 1 frase>"}`,
+          "",
+          "Si action es 'hold' o 'wait' o 'close', leverage/sl/tp pueden ser 0.",
+          "Si action es 'open_long', sl < precio actual < tp; si 'open_short', tp < precio actual < sl.",
+        ]
+          .filter(Boolean)
+          .join("\n");
+
+        let decision: {
+          action: string;
+          leverage?: number;
+          sl_price?: number;
+          tp_price?: number;
+          thesis?: string;
+        } | null = null;
+
+        try {
+          const r = await fetch(
+            `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                contents: [{ role: "user", parts: [{ text: prompt }] }],
+                generationConfig: {
+                  temperature: 0.7,
+                  maxOutputTokens: 400,
+                  responseMimeType: "application/json",
+                },
+              }),
+            },
+          );
+          if (r.ok) {
+            const j = (await r.json()) as any;
+            const txt = j?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+            try {
+              decision = JSON.parse(txt);
+            } catch {
+              // intenta extraer JSON
+              const m = txt.match(/\{[\s\S]*\}/);
+              if (m) decision = JSON.parse(m[0]);
+            }
+          }
+        } catch {
+          /* skip esta decisión */
+        }
+
+        decisionCount++;
+        if (!decision) continue;
+
+        // Aplicar decisión
+        if (decision.action === "close" && pos) {
+          const exitPrice = c.close;
+          const move = pos.side === "long"
+            ? (exitPrice - pos.entryPrice) / pos.entryPrice
+            : (pos.entryPrice - exitPrice) / pos.entryPrice;
+          const pnlUsd = move * pos.notional;
+          equity += pnlUsd;
+          if (equity > peakEquity) peakEquity = equity;
+          const dd = ((peakEquity - equity) / peakEquity) * 100;
+          if (dd > maxDrawdownPct) maxDrawdownPct = dd;
+          trades.push({
+            side: pos.side,
+            entryTime: new Date(candles[pos.entryIdx]!.time).toISOString(),
+            entryPrice: pos.entryPrice,
+            exitTime: new Date(c.time).toISOString(),
+            exitPrice,
+            exitReason: "tanit_close",
+            pnlUsd: parseFloat(pnlUsd.toFixed(4)),
+            pnlPct: parseFloat((move * 100 * pos.leverage).toFixed(2)),
+            thesis: pos.thesis,
+            leverage: pos.leverage,
+          });
+          pos = null;
+        } else if (
+          (decision.action === "open_long" || decision.action === "open_short") &&
+          !pos
+        ) {
+          const lev = Math.max(1, Math.min(ctx.maxLeverage, decision.leverage ?? ctx.maxLeverage));
+          const sl = decision.sl_price ?? 0;
+          const tp = decision.tp_price ?? 0;
+          const isLong = decision.action === "open_long";
+          if (isLong && (sl >= c.close || tp <= c.close)) continue;
+          if (!isLong && (sl <= c.close || tp >= c.close)) continue;
+          const risk = isLong ? c.close - sl : sl - c.close;
+          if (risk <= 0) continue;
+          const riskUsd = (equity * ctx.riskPctPerTrade) / 100;
+          let notional = (riskUsd / (risk / c.close));
+          const maxNotional = equity * lev;
+          notional = Math.min(notional, maxNotional);
+          if (notional < 1) continue;
+          pos = {
+            side: isLong ? "long" : "short",
+            entryIdx: i,
+            entryPrice: c.close,
+            sl,
+            tp,
+            leverage: lev,
+            notional,
+            thesis: decision.thesis ?? "",
+          };
+        }
+        // hold/wait → no hacemos nada
+      }
+
+      // Cerrar cualquier posición abierta al final con close de la última vela
+      if (pos) {
+        const last = candles[candles.length - 1]!;
+        const move = pos.side === "long"
+          ? (last.close - pos.entryPrice) / pos.entryPrice
+          : (pos.entryPrice - last.close) / pos.entryPrice;
+        const pnlUsd = move * pos.notional;
+        equity += pnlUsd;
+        trades.push({
+          side: pos.side,
+          entryTime: new Date(candles[pos.entryIdx]!.time).toISOString(),
+          entryPrice: pos.entryPrice,
+          exitTime: new Date(last.time).toISOString(),
+          exitPrice: last.close,
+          exitReason: "end_of_period",
+          pnlUsd: parseFloat(pnlUsd.toFixed(4)),
+          pnlPct: parseFloat((move * 100 * pos.leverage).toFixed(2)),
+          thesis: pos.thesis,
+          leverage: pos.leverage,
+        });
+      }
+
+      const wins = trades.filter((t) => t.pnlUsd > 0).length;
+      const losses = trades.filter((t) => t.pnlUsd < 0).length;
+      const winRate = trades.length ? (wins / trades.length) * 100 : 0;
+      const grossWin = trades.filter((t) => t.pnlUsd > 0).reduce((s, t) => s + t.pnlUsd, 0);
+      const grossLoss = -trades.filter((t) => t.pnlUsd < 0).reduce((s, t) => s + t.pnlUsd, 0);
+      const profitFactor = grossLoss > 0 ? grossWin / grossLoss : grossWin > 0 ? 999 : 0;
+      const totalPnlPct = ((equity - ctx.initialCapital) / ctx.initialCapital) * 100;
+
+      return {
+        ok: true,
+        symbol: ctx.symbol,
+        interval: ctx.interval,
+        decisions: decisionCount,
+        summary: {
+          totalTrades: trades.length,
+          wins,
+          losses,
+          winRate: parseFloat(winRate.toFixed(2)),
+          profitFactor: parseFloat(profitFactor.toFixed(3)),
+          totalPnlPct: parseFloat(totalPnlPct.toFixed(2)),
+          maxDrawdownPct: parseFloat(maxDrawdownPct.toFixed(2)),
+          finalEquity: parseFloat(equity.toFixed(2)),
+        },
+        trades,
+      };
+    } catch (e) {
+      return {
+        ok: false,
+        symbol: ctx.symbol,
+        interval: ctx.interval,
+        decisions: 0,
+        error: e instanceof Error ? e.message : String(e),
+      };
+    }
+  },
+});
+
 /**
  * Bundle de tools de LECTURA. Importar y pasar al Agent así:
  *   import { bybitReadTools } from "./tools/bybit-tools";
@@ -939,4 +1398,5 @@ export const bybitReadTools = {
   leerVelas,
   leerEstructuraTecnica,
   backtestTesis,
+  backtestInteligente,
 };
