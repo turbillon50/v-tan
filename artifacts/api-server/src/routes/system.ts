@@ -23,6 +23,7 @@ import { bybitWriteTools } from "../mastra/tools/bybit-write-tools";
 import { governanceTools } from "../mastra/tools/governance-tools";
 import { autonomyTools } from "../mastra/tools/autonomy-tools";
 import { breakTools } from "../mastra/tools/break-tools";
+import { memoryTools } from "../mastra/tools/memory-tools";
 
 const router = Router();
 
@@ -49,6 +50,9 @@ router.get("/tanit/tools-registered", (_req, res): void => {
     break_: Object.entries(breakTools).map(([_, t]) =>
       typeof t === "object" && t && "id" in t ? String((t as any).id) : "?",
     ),
+    memory: Object.entries(memoryTools).map(([_, t]) =>
+      typeof t === "object" && t && "id" in t ? String((t as any).id) : "?",
+    ),
   };
   const all: string[] = Object.values(buckets).flat();
   res.json({
@@ -61,6 +65,12 @@ router.get("/tanit/tools-registered", (_req, res): void => {
       has_leer_estructura_tecnica: all.includes("leer_estructura_tecnica"),
       has_backtest_tesis: all.includes("backtest_tesis"),
       has_backtest_inteligente: all.includes("backtest_inteligente"),
+      has_guardar_memoria: all.includes("guardar_memoria"),
+      has_buscar_memoria: all.includes("buscar_memoria"),
+      has_leer_funding_historico: all.includes("leer_funding_historico"),
+      has_leer_open_interest_historico: all.includes("leer_open_interest_historico"),
+      has_leer_orderbook_profundo: all.includes("leer_orderbook_profundo"),
+      has_leer_liquidaciones: all.includes("leer_liquidaciones"),
     },
   });
 });
