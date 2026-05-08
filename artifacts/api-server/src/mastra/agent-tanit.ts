@@ -14,6 +14,7 @@ import { loadBootstrap } from "./bootstrap";
 import { bybitReadTools } from "./tools/bybit-tools";
 import { bybitWriteTools } from "./tools/bybit-write-tools";
 import { governanceTools } from "./tools/governance-tools";
+import { breakTools } from "./tools/break-tools";
 
 const GEMINI_API_KEY = process.env["GEMINI_API_KEY"];
 const DATABASE_URL = process.env["DATABASE_URL"];
@@ -73,7 +74,8 @@ export const tanitAgent = new Agent({
   //  - Governance (Fase B): consultar/ajustar reglas, kill-switch.
   //  - Write Bybit (Fase C): abrir long/short, cerrar, mover stops, cancelar.
   //    Triple barrera: governance check → confirmación humana → audit.
-  tools: { ...bybitReadTools, ...governanceTools, ...bybitWriteTools },
+  //  - Break (Fase F): consultar_break — habla con su hermano.
+  tools: { ...bybitReadTools, ...governanceTools, ...bybitWriteTools, ...breakTools },
   instructions: async () => {
     const ctx = await loadBootstrap();
     return ctx.systemPrompt;
