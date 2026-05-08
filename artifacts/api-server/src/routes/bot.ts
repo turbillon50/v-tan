@@ -1044,7 +1044,7 @@ router.post("/bot/gemini-chat-stream", async (req, res): Promise<void> => {
   req.on("close", () => { aborted = true; clearInterval(heartbeat); });
 
   try {
-    const { message, channel, sender } = req.body ?? {};
+    const { message, channel, sender, resourceId: bodyResource, threadId: bodyThread } = req.body ?? {};
     if (!message || typeof message !== "string") {
       send({ type: "error", message: "message requerido" });
       clearInterval(heartbeat);
@@ -1053,8 +1053,12 @@ router.post("/bot/gemini-chat-stream", async (req, res): Promise<void> => {
     }
     const ch: "intimate" | "operational" = channel === "operational" ? "operational" : "intimate";
     const senderType = typeof sender === "string" && sender.length <= 30 ? sender : "human_luis";
+    // Mastra Memory: mismo contrato que /bot/mastra-chat-stream para que cliente
+    // legacy y cliente nuevo escriban al mismo thread persistente.
+    const resourceId = (typeof bodyResource === "string" ? bodyResource : "luis").slice(0, 64);
+    const threadId = (typeof bodyThread === "string" ? bodyThread : `${ch}-main`).slice(0, 128);
 
-    // Persistir mensaje del usuario
+    // Persistir mensaje del usuario en tanit_chat (dual-write con mastra_messages)
     try {
       await pool.query(
         `INSERT INTO tanit_chat (role, content, channel, sender_type) VALUES ('user', $1, $2, $3)`,
@@ -1066,7 +1070,12 @@ router.post("/bot/gemini-chat-stream", async (req, res): Promise<void> => {
 
     const recentTurns = await getRecentTurns();
     const messages = [...recentTurns, { role: "user" as const, content: message.trim() }];
-    const stream = await tanitAgent.stream(messages);
+    const stream = await tanitAgent.stream(messages, {
+      memory: {
+        resource: resourceId,
+        thread: threadId,
+      },
+    });
 
     let fullReply = "";
     for await (const chunk of stream.textStream) {
