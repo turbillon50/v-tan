@@ -448,6 +448,40 @@ export async function placeMarketOrder(
   }
 }
 
+/**
+ * Variante de placeMarketOrder que devuelve el detalle del error de Bybit
+ * (retCode + retMsg) en lugar de null silencioso. Necesario para que las
+ * tools de Tanit puedan reportar a Luis QUÉ rechazó Bybit y por qué.
+ */
+export async function placeMarketOrderDetailed(
+  symbol: string, side: "Buy" | "Sell", qty: string,
+  reduceOnly = false, positionIdx = 0
+): Promise<
+  | { ok: true; orderId: string }
+  | { ok: false; retCode: number | null; retMsg: string }
+> {
+  try {
+    const d = await bybitPrivate("POST", "/v5/order/create", {
+      category: "linear", symbol, side, orderType: "Market", qty,
+      timeInForce: "GoodTillCancel", reduceOnly, positionIdx,
+    });
+    if (d?.retCode === 0 && d?.result?.orderId) {
+      return { ok: true, orderId: String(d.result.orderId) };
+    }
+    return {
+      ok: false,
+      retCode: typeof d?.retCode === "number" ? d.retCode : null,
+      retMsg: String(d?.retMsg ?? "Bybit no devolvió orderId"),
+    };
+  } catch (e) {
+    return {
+      ok: false,
+      retCode: null,
+      retMsg: e instanceof Error ? e.message : String(e),
+    };
+  }
+}
+
 export async function closePosition(
   symbol: string, direction: "LONG" | "SHORT", qty: string, positionIdx = 0
 ): Promise<boolean> {

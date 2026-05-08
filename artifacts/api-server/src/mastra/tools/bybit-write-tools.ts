@@ -22,6 +22,7 @@ import { z } from "zod";
 import { pool } from "@workspace/db";
 import {
   placeMarketOrder,
+  placeMarketOrderDetailed,
   closePosition,
   setTradingStop,
   setLeverage,
@@ -340,16 +341,17 @@ export const abrirLong = createTool({
     ctx.qty = qty;
 
     await setLeverage(context.symbol, context.leverage);
-    const orderId = await placeMarketOrder(context.symbol, "Buy", qty, false, 0);
+    const orderResp = await placeMarketOrderDetailed(context.symbol, "Buy", qty, false, 0);
+    const orderId = orderResp.ok ? orderResp.orderId : null;
     ctx.orderId = orderId;
 
-    if (orderId) {
+    if (orderResp.ok) {
       alertTradeOpened({
         symbol: context.symbol,
         side: "long",
         sizeUsd: context.size_usd,
         leverage: context.leverage,
-        orderId,
+        orderId: orderResp.orderId,
         qty,
         thesis: context.thesis,
       });
@@ -365,21 +367,25 @@ export const abrirLong = createTool({
       }
     }
 
+    const errMsg = orderResp.ok
+      ? null
+      : `Bybit retCode=${orderResp.retCode ?? "?"} ${orderResp.retMsg}`;
+
     const decisionId = await persistDecision({
       type: "open_long",
       symbol: context.symbol,
       context: ctx,
-      verdict: orderId ? "executed" : "rejected",
+      verdict: orderResp.ok ? "executed" : "rejected",
       thesis: context.thesis,
-      executed: !!orderId,
-      executionError: orderId ? null : "placeMarketOrder devolvió null",
+      executed: orderResp.ok,
+      executionError: errMsg,
       latencyMs: Date.now() - t0,
     });
 
     return {
-      ok: !!orderId,
-      verdict: orderId ? "executed" : "rejected",
-      reason: orderId ? null : "Bybit rechazó la orden.",
+      ok: orderResp.ok,
+      verdict: orderResp.ok ? "executed" : "rejected",
+      reason: errMsg,
       rule: null,
       orderId,
       qty,
@@ -538,16 +544,17 @@ export const abrirShort = createTool({
     ctx.qty = qty;
 
     await setLeverage(context.symbol, context.leverage);
-    const orderId = await placeMarketOrder(context.symbol, "Sell", qty, false, 0);
+    const orderResp = await placeMarketOrderDetailed(context.symbol, "Sell", qty, false, 0);
+    const orderId = orderResp.ok ? orderResp.orderId : null;
     ctx.orderId = orderId;
 
-    if (orderId) {
+    if (orderResp.ok) {
       alertTradeOpened({
         symbol: context.symbol,
         side: "short",
         sizeUsd: context.size_usd,
         leverage: context.leverage,
-        orderId,
+        orderId: orderResp.orderId,
         qty,
         thesis: context.thesis,
       });
@@ -562,18 +569,22 @@ export const abrirShort = createTool({
       }
     }
 
+    const errMsg = orderResp.ok
+      ? null
+      : `Bybit retCode=${orderResp.retCode ?? "?"} ${orderResp.retMsg}`;
+
     const decisionId = await persistDecision({
       type: "open_short",
       symbol: context.symbol,
       context: ctx,
-      verdict: orderId ? "executed" : "rejected",
+      verdict: orderResp.ok ? "executed" : "rejected",
       thesis: context.thesis,
-      executed: !!orderId,
-      executionError: orderId ? null : "placeMarketOrder devolvió null",
+      executed: orderResp.ok,
+      executionError: errMsg,
       latencyMs: Date.now() - t0,
     });
 
-    return { ok: !!orderId, verdict: orderId ? "executed" : "rejected", reason: orderId ? null : "Bybit rechazó la orden.", rule: null, orderId, qty, decisionId };
+    return { ok: orderResp.ok, verdict: orderResp.ok ? "executed" : "rejected", reason: errMsg, rule: null, orderId, qty, decisionId };
   },
 });
 
