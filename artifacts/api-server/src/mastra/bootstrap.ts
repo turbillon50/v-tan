@@ -15,6 +15,7 @@
  */
 import { pool } from "@workspace/db";
 import { rulesAsPromptText } from "../lib/governance";
+import { autonomyAsPromptText } from "../lib/autonomy";
 
 interface BootstrapContext {
   systemPrompt: string;
@@ -151,6 +152,16 @@ export async function loadBootstrap(opts: { force?: boolean } = {}): Promise<Boo
   } catch (e) {
     lines.push(
       `\n## REGLAS DE GOBERNANZA\n\n[Error leyendo gobernanza: ${e instanceof Error ? e.message : String(e)}. NO ejecutes writes hasta verificar.]`,
+    );
+  }
+
+  // Autonomía operativa (Fase E): mode + límites + counters
+  try {
+    const autoText = await autonomyAsPromptText();
+    lines.push(`\n${autoText}`);
+  } catch (e) {
+    lines.push(
+      `\n## AUTONOMÍA\n\n[Error leyendo autonomy: ${e instanceof Error ? e.message : String(e)}. Asume modo observe_only.]`,
     );
   }
 

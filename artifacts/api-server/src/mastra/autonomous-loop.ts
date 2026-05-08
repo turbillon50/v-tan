@@ -25,22 +25,44 @@
  */
 import { tanitAgent } from "./agent-tanit";
 import { getRules } from "../lib/governance";
+import { getAutonomyConfig } from "../lib/autonomy";
 import { logger } from "../lib/logger";
 
 const RESOURCE_ID = "luis";
 const THREAD_ID = "autonomous-loop";
 
-const PROMPT = `Es un check autónomo de mercado.
+const OBSERVE_PROMPT = `Es un check autónomo de mercado.
 
-Tu tarea AHORA en este turno:
-1. Consulta el estado del sistema (consultar_estado_sistema).
-2. Consulta tu balance actual (consultar_balance) y posiciones abiertas (consultar_posiciones).
-3. Para cada símbolo en tus reglas allowed_symbols, mira el precio mark/funding (consultar_precio_mercado).
-4. Reporta qué ves en una observación corta y clara, citando la tesis 5.1 cuando aplique.
-5. Si detectas un setup que cumpliría governance + tesis 5.1, descríbelo: símbolo, lado, tamaño, leverage, justificación.
-6. NO ejecutes trades en esta iteración. Solo observa y reporta. La ejecución viene cuando Luis te lo autorice explícitamente en el chat íntimo.
+Tu tarea en este turno:
+1. Consulta consultar_estado_sistema, consultar_balance, consultar_posiciones.
+2. Para cada símbolo en allowed_symbols, mira consultar_precio_mercado.
+3. Reporta qué ves en observación corta y clara, citando tesis 5.1 cuando aplique.
+4. Si detectas un setup que cumpliría governance + tesis, descríbelo.
+5. NO ejecutes trades en esta iteración. Solo observa.
 
-Sé concisa. Esto es un latido autónomo, no una conferencia.`;
+Sé concisa. Es un latido autónomo, no una conferencia.`;
+
+const EXECUTE_PROMPT = `Es un check autónomo de mercado con AUTORIZACIÓN para operar bajo governance + autonomía.
+
+Pasos:
+1. Consulta consultar_autonomia para conocer tus límites operativos actuales.
+2. Consulta consultar_governance para conocer las reglas duras.
+3. Consulta consultar_estado_sistema, consultar_balance, consultar_posiciones.
+4. Para cada símbolo permitido, mira el precio y contexto (consultar_precio_mercado).
+5. Si detectas un setup REAL según tesis 5.1:
+   - Verifica que cumple governance (max_position_size, max_leverage, posiciones, símbolo permitido).
+   - Verifica que cumple autonomía (max_autonomous_size, max_autonomous_leverage).
+   - Si todo pasa, INVOCA abrir_long o abrir_short con confirmado=true y tesis citada (>=20 chars).
+6. Si NO ves setup claro, reporta y termina sin ejecutar.
+7. Si ves condición rara (mercado roto, error sistémico), llama pausar_autonomia.
+
+Reglas de oro:
+- Cita la tesis 5.1 sección específica en cada decisión.
+- Tamaño y leverage siempre conservadores, nunca al máximo.
+- Si dudas, NO ejecutas.
+- Después de cada trade, registra en tu voz por qué lo hiciste — eso queda en mastra_messages.
+
+Sé concisa. Es un latido autónomo, no una conferencia.`;
 
 let _intervalHandle: NodeJS.Timeout | null = null;
 let _running = false;
@@ -55,7 +77,7 @@ async function runOneTick(): Promise<void> {
   _ticks++;
   const t0 = Date.now();
   try {
-    // Verificar kill-switch antes de pensar — no quemamos tokens si está parado
+    // Kill-switch global tiene precedencia
     const rules = await getRules({ force: true });
     if (rules.kill_switch_global) {
       logger.info({ tick: _ticks }, "[autonomous-loop] kill-switch ACTIVO, skip");
@@ -63,9 +85,20 @@ async function runOneTick(): Promise<void> {
       return;
     }
 
-    logger.info({ tick: _ticks }, "[autonomous-loop] tick start");
+    // Autonomía decide qué prompt usar
+    const autonomy = await getAutonomyConfig({ force: true });
+    const canExecute =
+      autonomy.enabled &&
+      autonomy.mode === "execute_with_governance" &&
+      (!autonomy.paused_until || Date.now() >= new Date(autonomy.paused_until).getTime());
+    const prompt = canExecute ? EXECUTE_PROMPT : OBSERVE_PROMPT;
+
+    logger.info(
+      { tick: _ticks, mode: autonomy.mode, canExecute, dailyCount: autonomy.daily_trade_count },
+      "[autonomous-loop] tick start",
+    );
     const stream = await tanitAgent.stream(
-      [{ role: "user" as const, content: PROMPT }],
+      [{ role: "user" as const, content: prompt }],
       {
         memory: {
           resource: RESOURCE_ID,

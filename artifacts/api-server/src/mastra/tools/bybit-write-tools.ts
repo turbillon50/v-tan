@@ -38,10 +38,34 @@ import {
   type ValidationResult,
 } from "../../lib/governance";
 import {
+  gateAutonomousAction,
+  recordAutonomousTrade,
+} from "../../lib/autonomy";
+import {
   alertTradeOpened,
   alertTradeClosed,
   alertGovernanceBlocked,
 } from "../../lib/tanit-alerts";
+
+/**
+ * Detecta si la invocación de la tool viene del loop autónomo (thread
+ * autonomous-loop). Mastra incluye `threadId` en el runtime context cuando
+ * la tool es invocada por el agente. Si threadId === 'autonomous-loop',
+ * tratamos como autónomo y aplicamos gateAutonomousAction adicional.
+ */
+function isAutonomousContext(rawInput: unknown): boolean {
+  if (!rawInput || typeof rawInput !== "object") return false;
+  const r = rawInput as Record<string, unknown>;
+  // Mastra runtime expone runtimeContext / threadId
+  const tc = r.runtimeContext as Record<string, unknown> | undefined;
+  if (tc && typeof tc === "object") {
+    const tid = tc.threadId ?? tc.thread;
+    if (typeof tid === "string" && tid === "autonomous-loop") return true;
+  }
+  const directThread = r.threadId ?? r.thread;
+  if (typeof directThread === "string" && directThread === "autonomous-loop") return true;
+  return false;
+}
 
 interface DecisionContext {
   input: Record<string, unknown>;
@@ -201,7 +225,45 @@ export const abrirLong = createTool({
       };
     }
 
-    // 2) Confirmación explícita
+    // 2) Si es contexto autónomo + confirmado=true, gate adicional de autonomía
+    const autonomous = isAutonomousContext(rawInput);
+    if (autonomous && context.confirmado) {
+      const gate = await gateAutonomousAction({
+        sizeUsd: context.size_usd,
+        leverage: context.leverage,
+        thesis: context.thesis,
+      });
+      if (!gate.allowed) {
+        await auditEvent({
+          actor: "tanit-autonomous-loop",
+          action: "AUTONOMY_BLOCKED",
+          field: gate.rule ?? "unknown",
+          reason: `${context.symbol} long ${context.size_usd}USD ${context.leverage}x — ${gate.reason}`,
+          blocked: true,
+        });
+        const decisionId = await persistDecision({
+          type: "open_long",
+          symbol: context.symbol,
+          context: { ...ctx, warnings: [`autonomy_block: ${gate.reason}`] },
+          verdict: "blocked",
+          thesis: context.thesis,
+          executed: false,
+          executionError: `autonomy: ${gate.reason}`,
+          latencyMs: Date.now() - t0,
+        });
+        return {
+          ok: false,
+          verdict: "blocked",
+          reason: `autonomy: ${gate.reason}`,
+          rule: gate.rule,
+          orderId: null,
+          qty: null,
+          decisionId,
+        };
+      }
+    }
+
+    // 3) Confirmación explícita (humano o auto-autorizado por loop autónomo)
     if (!context.confirmado) {
       const previewText = `¿Autorizas abrir LONG ${context.symbol} por $${context.size_usd.toFixed(2)} con leverage ${context.leverage}x en ${isTestnet() ? "TESTNET" : "MAINNET"}? Tesis: "${context.thesis}". Si sí, dímelo y reinvoco con confirmado=true.`;
       const decisionId = await persistDecision({
@@ -225,7 +287,7 @@ export const abrirLong = createTool({
       };
     }
 
-    // 3) Ejecutar
+    // 4) Ejecutar
     const markPrice = await getMarkPrice(context.symbol);
     if (!markPrice) {
       const decisionId = await persistDecision({
@@ -272,6 +334,16 @@ export const abrirLong = createTool({
         qty,
         thesis: context.thesis,
       });
+      // Si fue autónomo, registrar en autonomy audit + bump counter
+      if (autonomous) {
+        await recordAutonomousTrade({
+          symbol: context.symbol,
+          side: "long",
+          sizeUsd: context.size_usd,
+          leverage: context.leverage,
+          thesis: context.thesis,
+        }).catch(() => {});
+      }
     }
 
     const decisionId = await persistDecision({
@@ -370,6 +442,36 @@ export const abrirShort = createTool({
       return { ok: false, verdict: "blocked", reason: validation.reason, rule: validation.rule, orderId: null, qty: null, decisionId };
     }
 
+    // Gate adicional si es contexto autónomo
+    const autonomous = isAutonomousContext(rawInput);
+    if (autonomous && context.confirmado) {
+      const gate = await gateAutonomousAction({
+        sizeUsd: context.size_usd,
+        leverage: context.leverage,
+        thesis: context.thesis,
+      });
+      if (!gate.allowed) {
+        await auditEvent({
+          actor: "tanit-autonomous-loop",
+          action: "AUTONOMY_BLOCKED",
+          field: gate.rule ?? "unknown",
+          reason: `${context.symbol} short ${context.size_usd}USD ${context.leverage}x — ${gate.reason}`,
+          blocked: true,
+        });
+        const decisionId = await persistDecision({
+          type: "open_short",
+          symbol: context.symbol,
+          context: { ...ctx, warnings: [`autonomy_block: ${gate.reason}`] },
+          verdict: "blocked",
+          thesis: context.thesis,
+          executed: false,
+          executionError: `autonomy: ${gate.reason}`,
+          latencyMs: Date.now() - t0,
+        });
+        return { ok: false, verdict: "blocked", reason: `autonomy: ${gate.reason}`, rule: gate.rule, orderId: null, qty: null, decisionId };
+      }
+    }
+
     if (!context.confirmado) {
       const previewText = `¿Autorizas abrir SHORT ${context.symbol} por $${context.size_usd.toFixed(2)} con leverage ${context.leverage}x en ${isTestnet() ? "TESTNET" : "MAINNET"}? Tesis: "${context.thesis}". Si sí, dímelo y reinvoco con confirmado=true.`;
       const decisionId = await persistDecision({
@@ -430,6 +532,15 @@ export const abrirShort = createTool({
         qty,
         thesis: context.thesis,
       });
+      if (autonomous) {
+        await recordAutonomousTrade({
+          symbol: context.symbol,
+          side: "short",
+          sizeUsd: context.size_usd,
+          leverage: context.leverage,
+          thesis: context.thesis,
+        }).catch(() => {});
+      }
     }
 
     const decisionId = await persistDecision({
