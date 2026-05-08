@@ -11,6 +11,7 @@ import { Memory } from "@mastra/memory";
 import { PostgresStore } from "@mastra/pg";
 import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import { loadBootstrap } from "./bootstrap";
+import { bybitReadTools } from "./tools/bybit-tools";
 
 const GEMINI_API_KEY = process.env["GEMINI_API_KEY"];
 const DATABASE_URL = process.env["DATABASE_URL"];
@@ -65,6 +66,11 @@ export const tanitAgent = new Agent({
   model: google("gemini-2.5-flash"),
   maxRetries: 5,
   memory: tanitMemory,
+  // Tools de LECTURA Bybit (Fase A): balance, posiciones, precios, estado.
+  // Tanit puede invocarlas cuando Luis pregunte cosas operativas y devolver
+  // datos reales en lugar de inventar. Tools de write llegarán en Fase C
+  // bajo governance hard-coded.
+  tools: bybitReadTools,
   instructions: async () => {
     const ctx = await loadBootstrap();
     return ctx.systemPrompt;
