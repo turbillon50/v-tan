@@ -36,8 +36,34 @@ export interface AutonomyConfig {
   daily_count_reset_at: string;
   paused_until: string | null;
   pause_reason: string | null;
+  /**
+   * Si true, el autonomous-loop ESCANEA el mercado cada N minutos sin que
+   * Luis le hable. Este flag se controla desde la UI (POST /admin/autonomy/loop).
+   * Independiente de `enabled` que solo controla si las write tools pueden
+   * ejecutar — `loop_active` controla si Tanit toma la iniciativa.
+   */
+  loop_active: boolean;
+  loop_interval_minutes: number;
   updated_at: string;
   updated_by: string;
+}
+
+let _loopMigrationDone = false;
+async function ensureLoopColumns(): Promise<void> {
+  if (_loopMigrationDone) return;
+  try {
+    await pool.query(
+      `ALTER TABLE tanit_autonomy_config
+        ADD COLUMN IF NOT EXISTS loop_active BOOLEAN NOT NULL DEFAULT false`,
+    );
+    await pool.query(
+      `ALTER TABLE tanit_autonomy_config
+        ADD COLUMN IF NOT EXISTS loop_interval_minutes INTEGER NOT NULL DEFAULT 15`,
+    );
+    _loopMigrationDone = true;
+  } catch {
+    /* idempotente; si falla seguimos */
+  }
 }
 
 let _cache: { cfg: AutonomyConfig; ts: number } | null = null;
@@ -47,6 +73,7 @@ export async function getAutonomyConfig(opts: { force?: boolean } = {}): Promise
   if (!opts.force && _cache && Date.now() - _cache.ts < CACHE_TTL_MS) {
     return _cache.cfg;
   }
+  await ensureLoopColumns();
   const r = await pool.query<AutonomyConfig>(
     `SELECT id, enabled, mode,
             max_autonomous_size_usd::float8 AS max_autonomous_size_usd,
@@ -59,6 +86,8 @@ export async function getAutonomyConfig(opts: { force?: boolean } = {}): Promise
             daily_count_reset_at::text AS daily_count_reset_at,
             paused_until::text AS paused_until,
             pause_reason,
+            COALESCE(loop_active, false) AS loop_active,
+            COALESCE(loop_interval_minutes, 15) AS loop_interval_minutes,
             updated_at::text AS updated_at,
             updated_by
        FROM tanit_autonomy_config
@@ -245,6 +274,8 @@ const editableFields = [
   "max_daily_trades",
   "cooldown_minutes_between_trades",
   "require_thesis_citation",
+  "loop_active",
+  "loop_interval_minutes",
 ] as const;
 
 export type AutonomyEditableField = (typeof editableFields)[number];

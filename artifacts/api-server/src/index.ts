@@ -62,16 +62,13 @@ server.listen(port, () => {
     logger.info("[telegram] desactivado (TELEGRAM_ENABLED != 'true')");
   }
 
-  // Loop autónomo de observación (Fase D). Solo arranca si el flag está
-  // explícitamente en true. Las write tools requieren confirmado=true que
-  // el loop no provee — es seguridad nativa.
-  if (process.env["ENABLE_AUTONOMOUS_LOOP"] === "true") {
-    const minRaw = process.env["AUTONOMOUS_LOOP_INTERVAL_MIN"] ?? "15";
-    const min = Math.max(1, parseInt(minRaw, 10) || 15);
-    startAutonomousLoop(min);
-  } else {
-    logger.info("[autonomous-loop] desactivado (ENABLE_AUTONOMOUS_LOOP != 'true')");
-  }
+  // Loop autónomo: SIEMPRE arrancamos el timer. Cada tick verifica
+  // tanit_autonomy_config.loop_active en BD y skip si está apagado. Esto
+  // permite encender/apagar desde la app sin restart Railway.
+  // El intervalo lo lee de la BD también (loop_interval_minutes, default 15).
+  const minRaw = process.env["AUTONOMOUS_LOOP_INTERVAL_MIN"] ?? "15";
+  const min = Math.max(1, parseInt(minRaw, 10) || 15);
+  startAutonomousLoop(min);
 
   // Reporte diario por Telegram solo si TELEGRAM_ENABLED=true (default off).
   if (

@@ -77,6 +77,13 @@ async function runOneTick(): Promise<void> {
   _ticks++;
   const t0 = Date.now();
   try {
+    // Toggle dinámico desde BD: si loop_active=false, skip y ya. No requiere
+    // restart de Railway para encender/apagar.
+    const autonomy = await getAutonomyConfig({ force: true });
+    if (!autonomy.loop_active) {
+      _running = false;
+      return;
+    }
     // Kill-switch global tiene precedencia
     const rules = await getRules({ force: true });
     if (rules.kill_switch_global) {
@@ -84,9 +91,7 @@ async function runOneTick(): Promise<void> {
       _running = false;
       return;
     }
-
-    // Autonomía decide qué prompt usar
-    const autonomy = await getAutonomyConfig({ force: true });
+    // (autonomy ya leído arriba)
     const canExecute =
       autonomy.enabled &&
       autonomy.mode === "execute_with_governance" &&

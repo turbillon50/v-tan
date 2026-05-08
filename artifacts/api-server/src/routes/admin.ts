@@ -167,6 +167,66 @@ router.post("/admin/autonomy/disable", async (req, res): Promise<void> => {
 });
 
 /**
+ * POST /admin/autonomy/loop
+ * body: { action: "start" | "stop", intervalMinutes?: number }
+ *
+ * Enciende o apaga el loop autónomo dinámicamente sin restart. Cuando está
+ * encendido (loop_active=true), Tanit escanea el mercado cada N minutos y
+ * decide si entrar — sin que Luis le hable.
+ */
+router.post("/admin/autonomy/loop", async (req, res): Promise<void> => {
+  const body = (req.body ?? {}) as {
+    secret?: unknown;
+    action?: string;
+    intervalMinutes?: number;
+  };
+  const guard = requireAdmin(body.secret, req.headers.origin);
+  if (guard) {
+    res.status(403).json({ ok: false, error: guard });
+    return;
+  }
+  const action = body.action;
+  if (action !== "start" && action !== "stop") {
+    res.status(400).json({ ok: false, error: "action debe ser 'start' o 'stop'" });
+    return;
+  }
+  try {
+    const reason = `loop ${action} via UI`;
+    if (action === "start") {
+      await updateAutonomyConfig({
+        field: "loop_active",
+        value: true,
+        actor: "luis-app",
+        reason,
+      });
+      if (typeof body.intervalMinutes === "number" && body.intervalMinutes >= 1) {
+        await updateAutonomyConfig({
+          field: "loop_interval_minutes",
+          value: body.intervalMinutes,
+          actor: "luis-app",
+          reason,
+        });
+      }
+    } else {
+      await updateAutonomyConfig({
+        field: "loop_active",
+        value: false,
+        actor: "luis-app",
+        reason,
+      });
+    }
+    const after = await getAutonomyConfig({ force: true });
+    res.json({
+      ok: true,
+      loop_active: after.loop_active,
+      loop_interval_minutes: after.loop_interval_minutes,
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
+/**
  * GET /admin/autonomy?secret=...
  * Lectura del estado actual.
  */
