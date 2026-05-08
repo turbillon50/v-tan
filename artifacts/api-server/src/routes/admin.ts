@@ -8,6 +8,7 @@
  */
 import { Router } from "express";
 import { updateAutonomyConfig, getAutonomyConfig } from "../lib/autonomy";
+import { updateRule, getRules } from "../lib/governance";
 import { logger } from "../lib/logger";
 
 const router = Router();
@@ -177,6 +178,99 @@ router.get("/admin/autonomy", async (req, res): Promise<void> => {
   }
   const cfg = await getAutonomyConfig({ force: true });
   res.json({ ok: true, autonomy: cfg });
+});
+
+/**
+ * POST /admin/sync-thesis
+ * Sincroniza governance + autonomy con la Tesis 5.1 (Surfear el Everest):
+ *   - leverage gradual hasta 100x (techo absoluto, NO punto de partida)
+ *   - sin tope absoluto $/posición (la tesis maneja % capital + reserva 25%)
+ *   - sin lista de símbolos cerrada
+ *   - circuit breaker −10% diario
+ *   - mode = execute_with_governance, enabled = true (decisión de Luis)
+ *
+ * Antes los caps eran $50/pos · 5x · 3 símbolos — eso fue MI freno
+ * conservador, no la tesis. Este endpoint los corrige.
+ */
+router.post("/admin/sync-thesis", async (req, res): Promise<void> => {
+  const body = (req.body ?? {}) as { secret?: unknown };
+  const guard = requireAdmin(body.secret, req.headers.origin);
+  if (guard) {
+    res.status(403).json({ ok: false, error: guard });
+    return;
+  }
+
+  const reason = "sync con Tesis 5.1 (Surfear el Everest)";
+  const actor = "luis-app";
+  const changes: Array<{ field: string; previous: unknown; new_value: unknown }> = [];
+
+  try {
+    const govBefore = await getRules({ force: true });
+    const autoBefore = await getAutonomyConfig({ force: true });
+
+    // Governance — valores fieles a la tesis 5.1
+    const govTargets: Array<[keyof typeof govBefore, number | string[] | string]> = [
+      ["max_leverage", 100], // techo absoluto que la tesis menciona
+      ["max_position_size_usd", 100000], // efectivo "sin tope $", la tesis usa % capital
+      ["max_daily_loss_usd", 100000], // circuit breaker se maneja por % no $
+      ["max_concurrent_positions", 6], // 6 motores → permite múltiples narrativas
+      ["allowed_symbols", []], // [] = sin restricción de símbolos
+      ["require_approval_above_usd", 100000], // efectivo: nunca pide aprobación
+    ];
+    for (const [field, value] of govTargets) {
+      const prev = (govBefore as unknown as Record<string, unknown>)[field as string];
+      if (JSON.stringify(prev) === JSON.stringify(value)) continue;
+      await updateRule({
+        field: field as never,
+        newValue: value as number | string | string[] | boolean,
+        actor,
+        reason,
+      });
+      changes.push({ field: `governance.${field as string}`, previous: prev, new_value: value });
+    }
+
+    // Autonomy — Tanit decide leverage gradual; quitamos topes míos
+    const autoTargets: Array<[Parameters<typeof updateAutonomyConfig>[0]["field"], number | string | boolean]> = [
+      ["mode", "execute_with_governance"],
+      ["enabled", true],
+      ["max_autonomous_size_usd", 100000], // sin tope $; gradual la maneja la tesis
+      ["max_autonomous_leverage", 100], // techo de la tesis
+      ["max_daily_trades", 10], // tesis dice ~3 expected, dejamos margen sano
+      ["cooldown_minutes_between_trades", 15],
+      ["require_thesis_citation", true], // la tesis SÍ exige citar el motor
+    ];
+    for (const [field, value] of autoTargets) {
+      const prev = (autoBefore as unknown as Record<string, unknown>)[field as string];
+      if (prev === value) continue;
+      await updateAutonomyConfig({ field, value, actor, reason });
+      changes.push({ field: `autonomy.${field as string}`, previous: prev, new_value: value });
+    }
+
+    const govAfter = await getRules({ force: true });
+    const autoAfter = await getAutonomyConfig({ force: true });
+    logger.info({ changes }, "[admin] sync-thesis completed");
+    res.json({
+      ok: true,
+      changes,
+      governance: govAfter,
+      autonomy: autoAfter,
+      thesis: {
+        version: "5.1",
+        leverage_bands: {
+          entry: "5x-10x",
+          escalation: "20x-50x",
+          peak: "75x-100x con momentum probado",
+        },
+        sacred_reserve_pct: 25,
+        rr_min: 2,
+        circuit_breaker_pct: 10,
+        consecutive_stops_pause: 3,
+      },
+    });
+  } catch (e) {
+    logger.error({ err: e }, "[admin] sync-thesis failed");
+    res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+  }
 });
 
 export default router;
