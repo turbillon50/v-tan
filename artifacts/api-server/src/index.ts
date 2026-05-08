@@ -4,6 +4,7 @@ import { initTelegramCommands } from "./lib/telegram-commands";
 import { sendTelegram } from "./lib/telegram";
 import { sendBotStartupAlert, engineReadyPromise } from "./lib/trading-engine";
 import { migrateEnvKeysIfEmpty } from "./lib/api-keys-provider";
+import { startAutonomousLoop } from "./mastra/autonomous-loop";
 
 const rawPort = process.env["PORT"] ?? "8080";
 const port = Number(rawPort);
@@ -47,4 +48,15 @@ app.listen(port, (err) => {
 
   // Aviso de arranque — espera a que el engine esté verdaderamente listo antes de anunciar
   engineReadyPromise.then(() => sendBotStartupAlert()).catch(() => {});
+
+  // Loop autónomo de observación (Fase D). Solo arranca si el flag está
+  // explícitamente en true. Las write tools requieren confirmado=true que
+  // el loop no provee — es seguridad nativa.
+  if (process.env["ENABLE_AUTONOMOUS_LOOP"] === "true") {
+    const minRaw = process.env["AUTONOMOUS_LOOP_INTERVAL_MIN"] ?? "15";
+    const min = Math.max(1, parseInt(minRaw, 10) || 15);
+    startAutonomousLoop(min);
+  } else {
+    logger.info("[autonomous-loop] desactivado (ENABLE_AUTONOMOUS_LOOP != 'true')");
+  }
 });
