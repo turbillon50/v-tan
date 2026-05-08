@@ -322,11 +322,14 @@ router.post("/audio/synthesize", async (req, res): Promise<void> => {
 
 // ─── POST /image/generate ───────────────────────────────────────────────────
 // Body: { prompt: string }
-// Devuelve: image/png binario generado con Gemini 2.5 Flash Image (Nano Banana).
+// Devuelve: image/png binario generado con Imagen 3 vía Gemini API.
 //
-// El frontend lo puede mostrar inline en el chat. Cuando Tanit decida que un
-// concepto necesita ilustración (ej. un setup técnico, un mapa de mercado),
-// puede llamar este endpoint vía un tool y adjuntar la imagen al mensaje.
+// Probamos en cascada los modelos de imagen disponibles. En mayo 2026:
+//   1) imagen-3.0-generate-002 (endpoint :predict)
+//   2) imagen-3.0-generate-001 (endpoint :predict)
+//   3) gemini-2.0-flash-exp con responseModalities [TEXT,IMAGE] (preview)
+// Devolvemos la primera que funcione. Esto inmuniza contra renames del
+// catálogo de modelos de Google.
 router.post("/image/generate", async (req, res): Promise<void> => {
   if (!GEMINI_API_KEY) {
     res.status(500).json({ ok: false, error: "GEMINI_API_KEY no configurada" });
@@ -344,59 +347,113 @@ router.post("/image/generate", async (req, res): Promise<void> => {
       return;
     }
 
-    const r = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image-preview:generateContent?key=${GEMINI_API_KEY}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: {
-            responseModalities: ["TEXT", "IMAGE"],
+    const errors: string[] = [];
+
+    // 1) Imagen 3 (endpoint :predict)
+    for (const model of ["imagen-3.0-generate-002", "imagen-3.0-generate-001"]) {
+      try {
+        const r = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/${model}:predict?key=${GEMINI_API_KEY}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              instances: [{ prompt }],
+              parameters: { sampleCount: 1, aspectRatio: "1:1" },
+            }),
           },
-        }),
-      },
-    );
-    if (!r.ok) {
-      const errText = await r.text().catch(() => "");
-      logger.warn(
-        { status: r.status, errText: errText.slice(0, 400) },
-        "[image] gemini image gen failed",
-      );
-      res.status(502).json({
-        ok: false,
-        error: `Gemini ${r.status}: ${errText.slice(0, 200)}`,
-      });
-      return;
+        );
+        if (r.ok) {
+          const j = (await r.json()) as {
+            predictions?: Array<{ bytesBase64Encoded?: string; mimeType?: string }>;
+          };
+          const pred = j.predictions?.[0];
+          const dataB64 = pred?.bytesBase64Encoded;
+          const mime = pred?.mimeType ?? "image/png";
+          if (dataB64) {
+            const buffer = Buffer.from(dataB64, "base64");
+            res.setHeader("Content-Type", mime);
+            res.setHeader("Content-Length", String(buffer.length));
+            res.setHeader("Cache-Control", "private, max-age=3600");
+            res.setHeader("X-Image-Provider", `gemini:${model}`);
+            res.send(buffer);
+            return;
+          }
+        } else {
+          const errTxt = await r.text().catch(() => "");
+          errors.push(`${model}: ${r.status} ${errTxt.slice(0, 120)}`);
+          logger.warn(
+            { model, status: r.status, errTxt: errTxt.slice(0, 300) },
+            "[image] imagen failed",
+          );
+        }
+      } catch (e) {
+        errors.push(`${model}: ${(e as Error).message}`);
+      }
     }
 
-    const j = (await r.json()) as {
-      candidates?: Array<{
-        content?: {
-          parts?: Array<{
-            text?: string;
-            inlineData?: { mimeType?: string; data?: string };
-          }>;
-        };
-      }>;
-    };
-    const part = j.candidates?.[0]?.content?.parts?.find((p) => p.inlineData?.data);
-    const dataB64 = part?.inlineData?.data;
-    const mime = part?.inlineData?.mimeType ?? "image/png";
-    if (!dataB64) {
-      // A veces Gemini responde solo texto si rechaza la imagen
-      const txtPart = j.candidates?.[0]?.content?.parts?.find((p) => p.text);
-      res.status(502).json({
-        ok: false,
-        error: txtPart?.text ?? "Gemini no devolvió imagen",
-      });
-      return;
+    // 2) Gemini 2.0 Flash exp con multimodal output (puede devolver imagen
+    //    inline aunque sea menos consistente que Imagen 3).
+    for (const model of [
+      "gemini-2.5-flash-image-preview",
+      "gemini-2.0-flash-preview-image-generation",
+      "gemini-2.0-flash-exp",
+    ]) {
+      try {
+        const r = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              contents: [{ parts: [{ text: prompt }] }],
+              generationConfig: {
+                responseModalities: ["TEXT", "IMAGE"],
+              },
+            }),
+          },
+        );
+        if (r.ok) {
+          const j = (await r.json()) as {
+            candidates?: Array<{
+              content?: {
+                parts?: Array<{
+                  text?: string;
+                  inlineData?: { mimeType?: string; data?: string };
+                }>;
+              };
+            }>;
+          };
+          const part = j.candidates?.[0]?.content?.parts?.find((p) => p.inlineData?.data);
+          const dataB64 = part?.inlineData?.data;
+          const mime = part?.inlineData?.mimeType ?? "image/png";
+          if (dataB64) {
+            const buffer = Buffer.from(dataB64, "base64");
+            res.setHeader("Content-Type", mime);
+            res.setHeader("Content-Length", String(buffer.length));
+            res.setHeader("Cache-Control", "private, max-age=3600");
+            res.setHeader("X-Image-Provider", `gemini:${model}`);
+            res.send(buffer);
+            return;
+          }
+        } else {
+          const errTxt = await r.text().catch(() => "");
+          errors.push(`${model}: ${r.status} ${errTxt.slice(0, 120)}`);
+          logger.warn(
+            { model, status: r.status, errTxt: errTxt.slice(0, 300) },
+            "[image] gemini image-gen failed",
+          );
+        }
+      } catch (e) {
+        errors.push(`${model}: ${(e as Error).message}`);
+      }
     }
-    const buffer = Buffer.from(dataB64, "base64");
-    res.setHeader("Content-Type", mime);
-    res.setHeader("Content-Length", String(buffer.length));
-    res.setHeader("Cache-Control", "private, max-age=3600");
-    res.send(buffer);
+
+    res.status(502).json({
+      ok: false,
+      error: "ningún modelo de Gemini devolvió imagen",
+      attempts: errors,
+    });
   } catch (e) {
     logger.error({ err: e }, "[image] generate error");
     res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
