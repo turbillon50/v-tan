@@ -16,6 +16,7 @@
  * mutación.
  */
 import { pool } from "@workspace/db";
+import { alertKillSwitch } from "./tanit-alerts";
 
 export interface GovernanceRules {
   id: number;
@@ -208,6 +209,7 @@ export async function setKillSwitch(args: {
     newValue: String(args.on),
     reason: args.reason,
   });
+  alertKillSwitch({ on: args.on, reason: args.reason, actor: args.actor });
   invalidateCache();
 }
 

@@ -37,6 +37,11 @@ import {
   auditEvent,
   type ValidationResult,
 } from "../../lib/governance";
+import {
+  alertTradeOpened,
+  alertTradeClosed,
+  alertGovernanceBlocked,
+} from "../../lib/tanit-alerts";
 
 interface DecisionContext {
   input: Record<string, unknown>;
@@ -164,6 +169,14 @@ export const abrirLong = createTool({
         reason: `${context.symbol} ${context.size_usd}USD ${context.leverage}x — ${validation.reason}`,
         blocked: true,
       });
+      alertGovernanceBlocked({
+        symbol: context.symbol,
+        side: "long",
+        sizeUsd: context.size_usd,
+        leverage: context.leverage,
+        rule: validation.rule ?? "unknown",
+        reason: validation.reason ?? "n/a",
+      });
       const decisionId = await persistDecision({
         type: "open_long",
         symbol: context.symbol,
@@ -246,6 +259,18 @@ export const abrirLong = createTool({
     const orderId = await placeMarketOrder(context.symbol, "Buy", qty, false, 0);
     ctx.orderId = orderId;
 
+    if (orderId) {
+      alertTradeOpened({
+        symbol: context.symbol,
+        side: "long",
+        sizeUsd: context.size_usd,
+        leverage: context.leverage,
+        orderId,
+        qty,
+        thesis: context.thesis,
+      });
+    }
+
     const decisionId = await persistDecision({
       type: "open_long",
       symbol: context.symbol,
@@ -318,6 +343,14 @@ export const abrirShort = createTool({
         reason: `${context.symbol} ${context.size_usd}USD ${context.leverage}x — ${validation.reason}`,
         blocked: true,
       });
+      alertGovernanceBlocked({
+        symbol: context.symbol,
+        side: "short",
+        sizeUsd: context.size_usd,
+        leverage: context.leverage,
+        rule: validation.rule ?? "unknown",
+        reason: validation.reason ?? "n/a",
+      });
       const decisionId = await persistDecision({
         type: "open_short",
         symbol: context.symbol,
@@ -380,6 +413,18 @@ export const abrirShort = createTool({
     await setLeverage(context.symbol, context.leverage);
     const orderId = await placeMarketOrder(context.symbol, "Sell", qty, false, 0);
     ctx.orderId = orderId;
+
+    if (orderId) {
+      alertTradeOpened({
+        symbol: context.symbol,
+        side: "short",
+        sizeUsd: context.size_usd,
+        leverage: context.leverage,
+        orderId,
+        qty,
+        thesis: context.thesis,
+      });
+    }
 
     const decisionId = await persistDecision({
       type: "open_short",
@@ -452,6 +497,16 @@ export const cerrarPosicion = createTool({
     }
 
     const ok = await closePosition(context.symbol, direction, size, 0);
+    if (ok) {
+      // PnL real lo conocemos sólo después; aquí mandamos null y el reporte
+      // diario resume con el closedPnl que llene Bybit unos segundos después.
+      alertTradeClosed({
+        symbol: context.symbol,
+        side: direction === "LONG" ? "long" : "short",
+        pnl: parseFloat(target.unrealisedPnl ?? "0") || null,
+        razon: context.razon,
+      });
+    }
     const decisionId = await persistDecision({
       type: "close_position",
       symbol: context.symbol,

@@ -5,6 +5,7 @@ import { sendTelegram } from "./lib/telegram";
 import { sendBotStartupAlert, engineReadyPromise } from "./lib/trading-engine";
 import { migrateEnvKeysIfEmpty } from "./lib/api-keys-provider";
 import { startAutonomousLoop } from "./mastra/autonomous-loop";
+import { startDailyReports } from "./lib/tanit-alerts";
 
 const rawPort = process.env["PORT"] ?? "8080";
 const port = Number(rawPort);
@@ -58,5 +59,11 @@ app.listen(port, (err) => {
     startAutonomousLoop(min);
   } else {
     logger.info("[autonomous-loop] desactivado (ENABLE_AUTONOMOUS_LOOP != 'true')");
+  }
+
+  // Reporte diario por Telegram (Fase H). Idempotente. Primer reporte 6h
+  // después del start; luego cada 24h. Solo si hay TELEGRAM_CHAT_ID.
+  if (process.env["TELEGRAM_BOT_TOKEN"] && process.env["TELEGRAM_CHAT_ID"]) {
+    startDailyReports();
   }
 });
