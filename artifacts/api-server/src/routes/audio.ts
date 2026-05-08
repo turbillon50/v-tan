@@ -349,8 +349,12 @@ router.post("/image/generate", async (req, res): Promise<void> => {
 
     const errors: string[] = [];
 
-    // 1) Imagen 3 (endpoint :predict)
-    for (const model of ["imagen-3.0-generate-002", "imagen-3.0-generate-001"]) {
+    // 1) Imagen 4 (endpoint :predict)
+    for (const model of [
+      "imagen-4.0-fast-generate-001",
+      "imagen-4.0-generate-001",
+      "imagen-4.0-ultra-generate-001",
+    ]) {
       try {
         const r = await fetch(
           `https://generativelanguage.googleapis.com/v1beta/models/${model}:predict?key=${GEMINI_API_KEY}`,
@@ -392,12 +396,12 @@ router.post("/image/generate", async (req, res): Promise<void> => {
       }
     }
 
-    // 2) Gemini 2.0 Flash exp con multimodal output (puede devolver imagen
-    //    inline aunque sea menos consistente que Imagen 3).
+    // 2) Gemini con multimodal output (responseModalities ["TEXT","IMAGE"]).
+    //    Modelos verificados disponibles vía /image/list-models.
     for (const model of [
-      "gemini-2.5-flash-image-preview",
-      "gemini-2.0-flash-preview-image-generation",
-      "gemini-2.0-flash-exp",
+      "gemini-2.5-flash-image",
+      "gemini-3.1-flash-image-preview",
+      "gemini-3-pro-image-preview",
     ]) {
       try {
         const r = await fetch(
