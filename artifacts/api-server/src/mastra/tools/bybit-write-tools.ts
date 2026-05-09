@@ -35,6 +35,7 @@ import {
   calcQtyReal,
   cancelAllOpenOrders,
   getOpenPositions,
+  getBybitBalance,
   isTestnet,
 } from "../../lib/bybit-auth";
 import { getWsPrice } from "../../lib/bybit-ws";
@@ -354,6 +355,11 @@ export const abrirLong = createTool({
 
     const qty = await calcQtyReal(context.symbol, context.size_usd, context.leverage, markPrice);
     if (!qty) {
+      const minNotional = 5;
+      const requestedNotional = context.size_usd * context.leverage;
+      const reason = requestedNotional < minNotional
+        ? `Tamaño insuficiente: pediste $${context.size_usd} a ${context.leverage}x = $${requestedNotional.toFixed(2)} nominal. Bybit exige mínimo $${minNotional}. Sube size o leverage.`
+        : `Tamaño insuficiente para min lot Bybit (size_usd ${context.size_usd}, leverage ${context.leverage}x, ${context.symbol}).`;
       const decisionId = await persistDecision({
         type: "open_long",
         symbol: context.symbol,
@@ -361,12 +367,33 @@ export const abrirLong = createTool({
         verdict: "rejected",
         thesis: context.thesis,
         executed: false,
-        executionError: "Tamaño insuficiente para min lot Bybit.",
+        executionError: reason,
         latencyMs: Date.now() - t0,
       });
-      return { ok: false, verdict: "rejected", reason: "Tamaño insuficiente para mínimo de Bybit.", rule: null, orderId: null, qty: null, decisionId };
+      return { ok: false, verdict: "rejected", reason, rule: null, orderId: null, qty: null, decisionId };
     }
     ctx.qty = qty;
+
+    // Validación pre-orden: ¿alcanza el margen disponible? Atajamos retCode=110007
+    // antes de pegar a Bybit. Buffer 10% para fees + slippage.
+    const bal = await getBybitBalance();
+    const requiredMargin = context.size_usd / context.leverage;
+    const SAFETY_BUFFER = 1.10;
+    const required = requiredMargin * SAFETY_BUFFER;
+    if (!bal || bal.available < required) {
+      const reason = `Margen insuficiente: requiero $${required.toFixed(2)} (size_usd $${context.size_usd} / lev ${context.leverage}x * 10% buffer), disponibles $${bal?.available.toFixed(2) ?? "0"}. Cierra otra posición o reduce size_usd.`;
+      const decisionId = await persistDecision({
+        type: "open_long",
+        symbol: context.symbol,
+        context: ctx,
+        verdict: "rejected",
+        thesis: context.thesis,
+        executed: false,
+        executionError: reason,
+        latencyMs: Date.now() - t0,
+      });
+      return { ok: false, verdict: "rejected", reason, rule: null, orderId: null, qty: null, decisionId };
+    }
 
     await setLeverage(context.symbol, context.leverage);
     const orderResp = await placeMarketOrderDetailed(context.symbol, "Buy", qty, false, 0);
@@ -557,6 +584,11 @@ export const abrirShort = createTool({
 
     const qty = await calcQtyReal(context.symbol, context.size_usd, context.leverage, markPrice);
     if (!qty) {
+      const minNotional = 5;
+      const requestedNotional = context.size_usd * context.leverage;
+      const reason = requestedNotional < minNotional
+        ? `Tamaño insuficiente: pediste $${context.size_usd} a ${context.leverage}x = $${requestedNotional.toFixed(2)} nominal. Bybit exige mínimo $${minNotional}. Sube size o leverage.`
+        : `Tamaño insuficiente para min lot Bybit (size_usd ${context.size_usd}, leverage ${context.leverage}x, ${context.symbol}).`;
       const decisionId = await persistDecision({
         type: "open_short",
         symbol: context.symbol,
@@ -564,12 +596,32 @@ export const abrirShort = createTool({
         verdict: "rejected",
         thesis: context.thesis,
         executed: false,
-        executionError: "Tamaño insuficiente para min lot Bybit.",
+        executionError: reason,
         latencyMs: Date.now() - t0,
       });
-      return { ok: false, verdict: "rejected", reason: "Tamaño insuficiente.", rule: null, orderId: null, qty: null, decisionId };
+      return { ok: false, verdict: "rejected", reason, rule: null, orderId: null, qty: null, decisionId };
     }
     ctx.qty = qty;
+
+    // Validación pre-orden: margen disponible (mismo patrón que abrir_long).
+    const bal = await getBybitBalance();
+    const requiredMargin = context.size_usd / context.leverage;
+    const SAFETY_BUFFER = 1.10;
+    const required = requiredMargin * SAFETY_BUFFER;
+    if (!bal || bal.available < required) {
+      const reason = `Margen insuficiente: requiero $${required.toFixed(2)} (size_usd $${context.size_usd} / lev ${context.leverage}x * 10% buffer), disponibles $${bal?.available.toFixed(2) ?? "0"}. Cierra otra posición o reduce size_usd.`;
+      const decisionId = await persistDecision({
+        type: "open_short",
+        symbol: context.symbol,
+        context: ctx,
+        verdict: "rejected",
+        thesis: context.thesis,
+        executed: false,
+        executionError: reason,
+        latencyMs: Date.now() - t0,
+      });
+      return { ok: false, verdict: "rejected", reason, rule: null, orderId: null, qty: null, decisionId };
+    }
 
     await setLeverage(context.symbol, context.leverage);
     const orderResp = await placeMarketOrderDetailed(context.symbol, "Sell", qty, false, 0);

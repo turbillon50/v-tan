@@ -1,7 +1,11 @@
 import { createHmac } from "crypto";
 import { getKey } from "./api-keys-provider";
 
-let useTestnet = true;
+// Default false: producción real. Override con env var BYBIT_TESTNET=true para
+// pruebas. Históricamente esto estaba hardcoded a true y mentía: el proxy
+// motivated-prosperity siempre va a mainnet, pero consultar_estado_sistema()
+// reportaba testnet:true confundiendo a Tanit y a Luis.
+let useTestnet = process.env.BYBIT_TESTNET === "true";
 const MAINNET_URL = "https://api.bybit.com";
 const TESTNET_URL = "https://api-testnet.bybit.com";
 const RECV_WINDOW = "5000";
@@ -359,15 +363,26 @@ export async function fetchQtyRule(symbol: string): Promise<{ min: number; step:
   return QTY_RULES_LOCAL[symbol] ?? { min: 0.001, step: 0.001, dp: 3 };
 }
 
+/**
+ * Convierte size_usd + leverage en qty de Bybit respetando lot step.
+ *
+ * IMPORTANTE: si el nocional pedido (capitalUSDT * leverage) es menor al
+ * MIN_NOTIONAL de Bybit ($5), retorna null. NO infla silenciosamente.
+ * Históricamente este fn inflaba al min_step, causando "Luis pidió $1 y se
+ * enviaron $80" (lección 2026-05-09). Si no alcanza, el caller debe abortar
+ * y pedirle al usuario subir size o leverage.
+ */
 export async function calcQtyReal(symbol: string, capitalUSDT: number, leverage: number, price: number): Promise<string | null> {
   const rule = await fetchQtyRule(symbol);
   const notional = capitalUSDT * leverage;
-  const rawQty   = notional / price;
-  let stepped    = Math.floor(rawQty / rule.step) * rule.step;
-  // Si el nocional real queda por debajo del mínimo de Bybit ($5), subir un step
   const BYBIT_MIN_NOTIONAL = 5.0;
-  if (stepped * price < BYBIT_MIN_NOTIONAL) stepped += rule.step;
+  // Pre-check: el nocional pedido no alcanza el mínimo de Bybit. NO inflar.
+  if (notional < BYBIT_MIN_NOTIONAL) return null;
+  const rawQty  = notional / price;
+  const stepped = Math.floor(rawQty / rule.step) * rule.step;
   if (stepped < rule.min) return null;
+  // Defensiva: tras el rounding-down podría caer bajo el min notional.
+  if (stepped * price < BYBIT_MIN_NOTIONAL) return null;
   return stepped.toFixed(rule.dp);
 }
 
