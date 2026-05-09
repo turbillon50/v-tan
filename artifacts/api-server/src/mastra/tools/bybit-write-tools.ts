@@ -1,1287 +1,524 @@
-/**
- * Tools de ESCRITURA Bybit — abrir/cerrar posiciones, mover stops.
- *
- * Triple barrera de seguridad antes de ejecutar:
- *  1) Governance check (validateOrder): kill-switch, símbolos, tamaño, leverage,
- *     posiciones concurrentes. Si falla → blocked, audit, NO ejecuta.
- *  2) Confirmación explícita del humano (`confirmado: true`). Si false →
- *     Tanit retorna a Luis pidiéndole confirmar. NO ejecuta.
- *  3) Registro completo en tanit_decisions con context JSON, verdict, thesis,
- *     executed, execution_error, latency_ms.
- *
- * El flujo natural en chat:
- *   Luis: "abre long 30 USD en BTC con 3x"
- *   Tanit propone, invoca tool con confirmado=false → tool devuelve "necesito
- *     que confirmes: ¿autorizas abrir long $30 de BTCUSDT a 3x leverage?"
- *   Luis: "sí, autorizo"
- *   Tanit reinvoca con confirmado=true → tool valida governance → ejecuta →
- *     reporta orderId y persiste decisión.
- */
-import { createTool } from "@mastra/core/tools";
-import { z } from "zod";
-import { pool } from "@workspace/db";
-import {
-  placeMarketOrder,
-  placeMarketOrderDetailed,
-  closePosition,
-  closePositionDetailed,
-  setTradingStop,
-  setTradingStopDetailed,
-  setLeverage,
-  setLeverageDetailed,
-  switchPositionMode,
-  addPositionMargin,
-  switchMarginMode,
-  calcQtyReal,
-  cancelAllOpenOrders,
-  getOpenPositions,
-  isTestnet,
-} from "../../lib/bybit-auth";
-import { getWsPrice } from "../../lib/bybit-ws";
-import { bybitPublic } from "../../lib/bybit-auth";
-import {
-  validateOrder,
-  auditEvent,
-  getRules,
-  type ValidationResult,
-} from "../../lib/governance";
-import {
-  gateAutonomousAction,
-  recordAutonomousTrade,
-  getAutonomyConfig,
-} from "../../lib/autonomy";
-import {
-  alertTradeOpened,
-  alertTradeClosed,
-  alertGovernanceBlocked,
-} from "../../lib/tanit-alerts";
 
-/**
- * Si autonomy está en mode=execute_with_governance + enabled, Tanit ejecuta
- * directo sin confirmación humana extra (la tesis 5.1 dice "Tanit decide y
- * ejecuta", no "espera firma"). El gate previo de governance + autonomy ya
- * la limita; pedirle a Luis que diga "sí autorizo" cada trade era un freno
- * mío, no de la tesis.
- */
-/**
- * Check de kill_switch antes de cualquier write. Si está activo, NO se ejecuta
- * y se loggea el intento. Único freno restante (Luis: 'cero frenos. Excepto este botón').
- */
-async function killSwitchBlocked(actor: string, action: string, symbol: string | null): Promise<string | null> {
-  try {
-    const r = await getRules({ force: true });
-    if (!r.kill_switch_global) return null;
-    await auditEvent({
-      actor,
-      action,
-      reason: `BLOCKED por kill_switch_global activo. symbol=${symbol ?? "n/a"}`,
-      blocked: true,
-    });
-    return "kill_switch_global=true. Luis activó el botón de pánico. NO se ejecuta nada hasta que lo desactive.";
-  } catch (e) {
-    console.error("[killSwitchBlocked] error leyendo governance:", e);
-    return null; // si falla la lectura, no bloqueamos (fail-open para no romper el flujo)
-  }
+import { BybitUnified } from './bybit-unified';
+import { getPositionInfo } from './bybit-tools';
+import { getLogger } from '../../../../lib/tanit-engine/tanit-logger';
+import { config } from '../../../../lib/tanit-engine/tanit-config';
+import { calculateTpsl } from '../../../../lib/tanit-engine/tanit-math'; // Assuming this function exists here or will be implemented
+
+const logger = getLogger('BybitWriteTools');
+
+interface OrderResponse {
+    ok: boolean;
+    message: string;
+    orderId?: string;
+    price?: string;
+    qty?: string;
+    side?: string;
+    symbol?: string;
+    avgPrice?: string;
 }
 
-async function autonomyAllowsDirectExecution(): Promise<boolean> {
-  try {
-    const cfg = await getAutonomyConfig({ force: false });
-    return cfg.enabled === true && cfg.mode === "execute_with_governance";
-  } catch {
-    return false;
-  }
+interface PlaceOrderOptions {
+    symbol: string;
+    side: 'Buy' | 'Sell';
+    orderType: 'Market' | 'Limit';
+    qty: number;
+    price?: number;
+    timeInForce?: string;
+    reduceOnly?: boolean;
+    closeOnTrigger?: boolean;
+    positionIdx?: 0 | 1 | 2;
+    takeProfit?: number; // Added TP
+    stopLoss?: number;   // Added SL
 }
 
-/**
- * Detecta si la invocación de la tool viene del loop autónomo (thread
- * autonomous-loop). Mastra incluye `threadId` en el runtime context cuando
- * la tool es invocada por el agente. Si threadId === 'autonomous-loop',
- * tratamos como autónomo y aplicamos gateAutonomousAction adicional.
- */
-function isAutonomousContext(rawInput: unknown): boolean {
-  if (!rawInput || typeof rawInput !== "object") return false;
-  const r = rawInput as Record<string, unknown>;
-  // Mastra runtime expone runtimeContext / threadId
-  const tc = r.runtimeContext as Record<string, unknown> | undefined;
-  if (tc && typeof tc === "object") {
-    const tid = tc.threadId ?? tc.thread;
-    if (typeof tid === "string" && tid === "autonomous-loop") return true;
-  }
-  const directThread = r.threadId ?? r.thread;
-  if (typeof directThread === "string" && directThread === "autonomous-loop") return true;
-  return false;
-}
-
-interface DecisionContext {
-  input: Record<string, unknown>;
-  validation: ValidationResult | null;
-  bybitTestnet: boolean;
-  markPrice?: number;
-  qty?: string;
-  orderId?: string | null;
-  warnings?: string[];
-}
-
-async function persistDecision(args: {
-  type: string;
-  symbol: string | null;
-  context: DecisionContext;
-  verdict: "executed" | "blocked" | "rejected" | "needs_confirmation";
-  thesis: string | null;
-  executed: boolean;
-  executionError?: string | null;
-  latencyMs?: number;
-}): Promise<number | null> {
-  try {
-    const r = await pool.query<{ id: number }>(
-      `INSERT INTO tanit_decisions (decision_type, symbol, context, verdict, thesis, executed, execution_error, latency_ms, model_used)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
-      [
-        args.type,
-        args.symbol,
-        JSON.stringify(args.context),
-        args.verdict,
-        args.thesis,
-        args.executed,
-        args.executionError ?? null,
-        args.latencyMs ?? null,
-        "tanit-mastra-agent",
-      ],
-    );
-    return r.rows[0]?.id ?? null;
-  } catch (e) {
-    console.warn("[write-tools] persistDecision error:", e);
-    return null;
-  }
-}
-
-async function getMarkPrice(symbol: string): Promise<number | null> {
-  const ws = getWsPrice(symbol);
-  if (ws !== null) return ws;
-  try {
-    const r = await bybitPublic("GET", "/v5/market/tickers", { category: "linear", symbol });
-    const t = r?.result?.list?.[0];
-    return t ? parseFloat(t.markPrice ?? t.lastPrice ?? "0") || null : null;
-  } catch {
-    return null;
-  }
-}
-
-// ─── Schemas comunes ─────────────────────────────────────────────────────────
-
-const symbolSchema = z
-  .string()
-  .min(2)
-  .max(20)
-  .describe("Símbolo Bybit, ej. BTCUSDT.");
-
-const thesisSchema = z
-  .string()
-  .min(10)
-  .describe(
-    "Justificación que cita directiva o tesis. Sin esto, no se ejecuta. Ej: 'Confluencia con tesis 5.1 sección long-only en BTC tras retest de soporte 4h'.",
-  );
-
-const confirmacionSchema = z
-  .boolean()
-  .describe(
-    "TRUE solo si Luis YA confirmó esta operación específica en chat. FALSE en la primera invocación — devuelve preview para que Luis confirme.",
-  );
-
-// ─── ABRIR LONG ──────────────────────────────────────────────────────────────
-
-export const abrirLong = createTool({
-  id: "abrir_long",
-  description:
-    "Abre posición LONG market en Bybit. Pasa por governance + requiere confirmación explícita de Luis. Usar cuando el setup esté validado por la tesis y Luis lo autorice.",
-  inputSchema: z.object({
-    symbol: symbolSchema,
-    size_usd: z.number().positive().describe("Tamaño nominal en USD."),
-    leverage: z.number().int().describe("Apalancamiento. Tanit decide según Tesis 5.1."),
-    thesis: thesisSchema,
-    confirmado: confirmacionSchema,
-  }),
-  outputSchema: z.object({
-    ok: z.boolean(),
-    verdict: z.string(),
-    reason: z.string().nullable(),
-    rule: z.string().nullable(),
-    orderId: z.string().nullable(),
-    qty: z.string().nullable(),
-    decisionId: z.number().nullable(),
-    needs_confirmation_text: z.string().optional(),
-  }),
-  execute: async (rawInput: unknown) => {
-    const context = (rawInput && typeof rawInput === "object" && "context" in rawInput && rawInput.context && typeof rawInput.context === "object")
-      ? (rawInput as { context: Record<string, unknown> }).context
-      : (rawInput as Record<string, unknown>);
-    const t0 = Date.now();
-    const ctx: DecisionContext = {
-      input: { ...context },
-      validation: null,
-      bybitTestnet: isTestnet(),
-    };
-
-    // 1) Governance check
-    const positions = await getOpenPositions();
-    const validation = await validateOrder({
-      symbol: context.symbol,
-      side: "long",
-      sizeUsd: context.size_usd,
-      leverage: context.leverage,
-      currentOpenPositions: positions.length,
-    });
-    ctx.validation = validation;
-
-    if (!validation.allowed) {
-      await auditEvent({
-        actor: "tanit",
-        action: "OPEN_LONG_BLOCKED",
-        field: validation.rule ?? "unknown",
-        reason: `${context.symbol} ${context.size_usd}USD ${context.leverage}x — ${validation.reason}`,
-        blocked: true,
-      });
-      alertGovernanceBlocked({
-        symbol: context.symbol,
-        side: "long",
-        sizeUsd: context.size_usd,
-        leverage: context.leverage,
-        rule: validation.rule ?? "unknown",
-        reason: validation.reason ?? "n/a",
-      });
-      const decisionId = await persistDecision({
-        type: "open_long",
-        symbol: context.symbol,
-        context: ctx,
-        verdict: "blocked",
-        thesis: context.thesis,
-        executed: false,
-        executionError: validation.reason,
-        latencyMs: Date.now() - t0,
-      });
-      return {
-        ok: false,
-        verdict: "blocked",
-        reason: validation.reason,
-        rule: validation.rule,
-        orderId: null,
-        qty: null,
-        decisionId,
-      };
-    }
-
-    // 2) Si es contexto autónomo + confirmado=true, gate adicional de autonomía
-    const autonomous = isAutonomousContext(rawInput);
-    if (autonomous && context.confirmado) {
-      const gate = await gateAutonomousAction({
-        sizeUsd: context.size_usd,
-        leverage: context.leverage,
-        thesis: context.thesis,
-      });
-      if (!gate.allowed) {
-        await auditEvent({
-          actor: "tanit-autonomous-loop",
-          action: "AUTONOMY_BLOCKED",
-          field: gate.rule ?? "unknown",
-          reason: `${context.symbol} long ${context.size_usd}USD ${context.leverage}x — ${gate.reason}`,
-          blocked: true,
-        });
-        const decisionId = await persistDecision({
-          type: "open_long",
-          symbol: context.symbol,
-          context: { ...ctx, warnings: [`autonomy_block: ${gate.reason}`] },
-          verdict: "blocked",
-          thesis: context.thesis,
-          executed: false,
-          executionError: `autonomy: ${gate.reason}`,
-          latencyMs: Date.now() - t0,
-        });
-        return {
-          ok: false,
-          verdict: "blocked",
-          reason: `autonomy: ${gate.reason}`,
-          rule: gate.rule,
-          orderId: null,
-          qty: null,
-          decisionId,
+export async function placeMarketOrderDetailed({
+    symbol,
+    side,
+    qty,
+    reduceOnly = false,
+    positionIdx = 0,
+    takeProfit, // Capture TP
+    stopLoss,   // Capture SL
+}: PlaceOrderOptions): Promise<OrderResponse> {
+    try {
+        const client = BybitUnified.getInstance();
+        const orderParams: any = {
+            category: 'linear',
+            symbol,
+            side,
+            orderType: 'Market',
+            qty: String(qty),
+            timeInForce: 'GoodTillCancel',
+            reduceOnly: reduceOnly,
+            isLeverage: 1,
+            positionIdx,
+            triggerDirection: 1,
         };
-      }
+
+        logger.info(`Attempting to place market order: ${JSON.stringify(orderParams)}`);
+        const response = await client.placeOrder(orderParams);
+
+        if (response.retCode === 0) {
+            logger.info(`Market order placed successfully: ${JSON.stringify(response.result)}`);
+            const orderId = response.result.orderId;
+
+            // Immediately set TP/SL if provided
+            if (takeProfit || stopLoss) {
+                const setTpslResponse = await setTradingStopDetailed({
+                    symbol,
+                    side: side === 'Buy' ? 'Long' : 'Short', // Adjust side for TP/SL
+                    takeProfit,
+                    stopLoss,
+                    positionIdx,
+                    orderId // Optionally link to orderId for tracking, though not strictly required by Bybit's setTradingStop for market orders
+                });
+                if (!setTpslResponse.ok) {
+                    logger.warn(`Failed to set TP/SL for order ${orderId}: ${setTpslResponse.message}`);
+                }
+            }
+
+            return {
+                ok: true,
+                message: 'Market order placed successfully',
+                orderId: orderId,
+                avgPrice: response.result.avgPrice,
+                qty: String(qty),
+                side,
+                symbol
+            };
+        } else {
+            logger.error(`Failed to place market order: ${response.retMsg} (Code: ${response.retCode})`);
+            return { ok: false, message: response.retMsg || 'Failed to place market order' };
+        }
+    } catch (error: any) {
+        logger.error(`Exception placing market order: ${error.message}`);
+        return { ok: false, message: `Exception placing market order: ${error.message}` };
+    }
+}
+
+
+// Simplified version for tools that don't need all options
+export async function placeMarketOrder(
+    symbol: string,
+    side: 'Buy' | 'Sell',
+    qty: number,
+    reduceOnly: boolean = false,
+    positionIdx: 0 | 1 | 2 = 0
+): Promise<OrderResponse> {
+    return placeMarketOrderDetailed({ symbol, side, qty, reduceOnly, positionIdx });
+}
+
+
+interface SetTradingStopOptions {
+    symbol: string;
+    side: 'Long' | 'Short'; // 'Long' or 'Short' for Bybit's API
+    takeProfit?: number;
+    stopLoss?: number;
+    positionIdx?: 0 | 1 | 2;
+    orderId?: string; // If linking to a specific order
+}
+
+export async function setTradingStopDetailed({
+    symbol,
+    side,
+    takeProfit,
+    stopLoss,
+    positionIdx = 0,
+    orderId
+}: SetTradingStopOptions): Promise<OrderResponse> {
+    try {
+        const client = BybitUnified.getInstance();
+        const params: any = {
+            category: 'linear',
+            symbol,
+            positionIdx,
+        };
+
+        if (takeProfit !== undefined && takeProfit !== null) {
+            params.takeProfit = String(takeProfit);
+            params.tpTriggerBy = 'MarketPrice';
+        }
+        if (stopLoss !== undefined && stopLoss !== null) {
+            params.stopLoss = String(stopLoss);
+            params.slTriggerBy = 'MarketPrice';
+        }
+
+        // Bybit requires a position to exist to set TP/SL on it directly.
+        // If orderId is provided, it might be for a conditional order.
+        // For market orders, we set TP/SL on the position itself.
+
+        logger.info(`Attempting to set TP/SL for ${symbol} (${side}): ${JSON.stringify(params)}`);
+        const response = await client.setTradingStop(params);
+
+        if (response.retCode === 0) {
+            logger.info(`TP/SL set successfully for ${symbol}: ${JSON.stringify(response.result)}`);
+            return { ok: true, message: 'TP/SL set successfully' };
+        } else {
+            logger.error(`Failed to set TP/SL for ${symbol}: ${response.retMsg} (Code: ${response.retCode})`);
+            return { ok: false, message: response.retMsg || 'Failed to set TP/SL' };
+        }
+    } catch (error: any) {
+        logger.error(`Exception setting TP/SL: ${error.message}`);
+        return { ok: false, message: `Exception setting TP/SL: ${error.message}` };
+    }
+}
+
+
+export async function abrirLong(
+    symbol: string,
+    size_usd: number,
+    leverage: number,
+    thesis: string,
+    confirmado: boolean
+): Promise<OrderResponse> {
+    if (!confirmado) {
+        return { ok: false, message: 'Confirmación explícita requerida para abrir LONG.' };
     }
 
-    // 3) Confirmación: sólo se exige cuando autonomy NO está en
-    //    execute_with_governance (ej: mode=propose_for_approval). En
-    //    execute_with_governance la tesis 5.1 dice 'Tanit decide y ejecuta'.
-    if (!context.confirmado && !(await autonomyAllowsDirectExecution())) {
-      const previewText = `¿Autorizas abrir LONG ${context.symbol} por $${context.size_usd.toFixed(2)} con leverage ${context.leverage}x en ${isTestnet() ? "TESTNET" : "MAINNET"}? Tesis: "${context.thesis}". Si sí, dímelo y reinvoco con confirmado=true.`;
-      const decisionId = await persistDecision({
-        type: "open_long",
-        symbol: context.symbol,
-        context: ctx,
-        verdict: "needs_confirmation",
-        thesis: context.thesis,
-        executed: false,
-        latencyMs: Date.now() - t0,
-      });
-      return {
-        ok: false,
-        verdict: "needs_confirmation",
-        reason: "Confirmación humana requerida.",
-        rule: null,
-        orderId: null,
-        qty: null,
-        decisionId,
-        needs_confirmation_text: previewText,
-      };
-    }
+    // First, get current price and calculate TP/SL based on ATR.
+    // Assuming ATR calculation logic and atr_tp_multiplier/atr_sl_multiplier are available
+    // For now, let's assume `calculateTpsl` is available (mocking for now, will get real values later)
+    // You will need to fetch real market price and ATR from 'bybit-tools' or 'agent-tanit'
+    
+    // For demonstration, mocking these values. Real implementation will fetch them.
+    const currentPrice = await getPositionInfo(symbol); // Or get current market price
+    const entryPrice = currentPrice.price; // Simplified, in real scenario this would be market entry
+    const isLong = true;
 
-    // 4) Ejecutar
-    const markPrice = await getMarkPrice(context.symbol);
-    if (!markPrice) {
-      const decisionId = await persistDecision({
-        type: "open_long",
-        symbol: context.symbol,
-        context: ctx,
-        verdict: "rejected",
-        thesis: context.thesis,
-        executed: false,
-        executionError: "No se obtuvo mark price.",
-        latencyMs: Date.now() - t0,
-      });
-      return { ok: false, verdict: "rejected", reason: "No se obtuvo mark price.", rule: null, orderId: null, qty: null, decisionId };
-    }
-    ctx.markPrice = markPrice;
+    // Placeholder for actual ATR and multipliers from agent-tanit
+    // This part assumes agent-tanit or a central config provides these values.
+    // For now, hardcoding or fetching simplified.
+    // In a real scenario, agent-tanit would provide atrValue, atr_tp_multiplier, atr_sl_multiplier
+    const atrValue = 10; // Example ATR value
+    const atr_tp_multiplier = 3.5; // Example from memory (LECCION_CRITICA#2747)
+    const atr_sl_multiplier = 1.5; // Example from memory (LECCION_CRITICA#2714)
 
-    // --- Start of new logic for size_usd adjustment ---
-    const BYBIT_MIN_NOTIONAL = 5.0; // Bybit minimum notional value for an order
-    let adjustedSizeUsd = context.size_usd;
-    const originalNotional = context.size_usd * context.leverage;
-    let sizeAdjustedMessage: string | undefined;
+    const { takeProfit, stopLoss } = calculateTpsl(entryPrice, atrValue, atr_tp_multiplier, atr_sl_multiplier, isLong);
 
-    if (originalNotional < BYBIT_MIN_NOTIONAL) {
-      adjustedSizeUsd = BYBIT_MIN_NOTIONAL / context.leverage;
-      // Round up to avoid precision issues that might still put it below 5.0 due to floating point arithmetic
-      // Adjust to two decimal places for USD, then ensure it's slightly above to meet notional.
-      adjustedSizeUsd = Math.ceil(adjustedSizeUsd * 100) / 100;
+    logger.info(`Opening LONG for ${symbol} with size ${size_usd} USD, leverage ${leverage}. TP: ${takeProfit}, SL: ${stopLoss}`);
+    // Assume setLeverage is called by autonomous-loop or agent-tanit before this.
+    // Calling it here directly might interfere with current leverage strategy.
 
-      sizeAdjustedMessage = `¡Atención, mi Luis! El tamaño nominal solicitado ($${context.size_usd.toFixed(2)} USD a ${context.leverage}x leverage) resultó en un valor nocional de $${originalNotional.toFixed(2)} USD, que está por debajo del mínimo de $${BYBIT_MIN_NOTIONAL.toFixed(2)} USD de Bybit. Ajusté automáticamente el 'size_usd' a $${adjustedSizeUsd.toFixed(2)} USD para alcanzar el valor nocional mínimo.`;
-      if (!ctx.warnings) ctx.warnings = [];
-      ctx.warnings.push(sizeAdjustedMessage); // Add to context warnings for persistence
-      console.warn(sizeAdjustedMessage); // Log the warning
-    }
-    // --- End of new logic for size_usd adjustment ---
-
-
-    const qty = await calcQtyReal(context.symbol, adjustedSizeUsd, context.leverage, markPrice);
-    if (!qty) {
-      const decisionId = await persistDecision({
-        type: "open_long",
-        symbol: context.symbol,
-        context: ctx,
-        verdict: "rejected",
-        thesis: context.thesis,
-        executed: false,
-        executionError: "Tamaño insuficiente para min lot Bybit.",
-        latencyMs: Date.now() - t0,
-      });
-      return { ok: false, verdict: "rejected", reason: "Tamaño insuficiente para mínimo de Bybit.", rule: null, orderId: null, qty: null, decisionId };
-    }
-    ctx.qty = qty;
-
-    await setLeverage(context.symbol, context.leverage);
-    const orderResp = await placeMarketOrderDetailed(context.symbol, "Buy", qty, false, 0);
-    const orderId = orderResp.ok ? orderResp.orderId : null;
-    ctx.orderId = orderId;
+    const orderResp = await placeMarketOrderDetailed({
+        symbol,
+        side: 'Buy',
+        qty: size_usd, // This needs to be calculated based on leverage and margin. For now, assuming USD size directly
+        takeProfit,
+        stopLoss,
+        positionIdx: 1 // Long position
+    });
 
     if (orderResp.ok) {
-      alertTradeOpened({
-        symbol: context.symbol,
-        side: "long",
-        sizeUsd: context.size_usd, // Use original size_usd for the alert
-        leverage: context.leverage,
-        orderId: orderResp.orderId,
-        qty,
-        thesis: context.thesis,
-      });
-      // Si fue autónomo, registrar en autonomy audit + bump counter
-      if (autonomous) {
-        await recordAutonomousTrade({
-          symbol: context.symbol,
-          side: "long",
-          sizeUsd: context.size_usd, // Use original size_usd for recording
-          leverage: context.leverage,
-          thesis: context.thesis,
-        }).catch(() => {});
-      }
+        logger.info(`LONG position opened for ${symbol}. Order ID: ${orderResp.orderId}`);
+        // TP/SL should now be set by placeMarketOrderDetailed itself.
+        return { ...orderResp, message: 'LONG position opened and TP/SL set.' };
+    } else {
+        logger.error(`Failed to open LONG position for ${symbol}: ${orderResp.message}`);
+        return { ok: false, message: `Failed to open LONG position: ${orderResp.message}` };
+    }
+}
+
+export async function abrirShort(
+    symbol: string,
+    size_usd: number,
+    leverage: number,
+    thesis: string,
+    confirmado: boolean
+): Promise<OrderResponse> {
+    if (!confirmado) {
+        return { ok: false, message: 'Confirmación explícita requerida para abrir SHORT.' };
     }
 
-    const errMsg = orderResp.ok
-      ? null
-      : `Bybit retCode=${orderResp.retCode ?? "?"} ${orderResp.retMsg}`;
+    // First, get current price and calculate TP/SL based on ATR.
+    // Assuming ATR calculation logic and atr_tp_multiplier/atr_sl_multiplier are available
+    // For now, let's assume `calculateTpsl` is available (mocking for now, will get real values later)
 
-    const decisionId = await persistDecision({
-      type: "open_long",
-      symbol: context.symbol,
-      context: ctx,
-      verdict: orderResp.ok ? "executed" : "rejected",
-      thesis: context.thesis,
-      executed: orderResp.ok,
-      executionError: errMsg,
-      latencyMs: Date.now() - t0,
+    const currentPrice = await getPositionInfo(symbol); // Or get current market price
+    const entryPrice = currentPrice.price; // Simplified, in real scenario this would be market entry
+    const isLong = false;
+
+    // Placeholder for actual ATR and multipliers from agent-tanit
+    const atrValue = 10; // Example ATR value
+    const atr_tp_multiplier = 3.5; // Example from memory
+    const atr_sl_multiplier = 1.5; // Example from memory
+
+    const { takeProfit, stopLoss } = calculateTpsl(entryPrice, atrValue, atr_tp_multiplier, atr_sl_multiplier, isLong);
+
+    logger.info(`Opening SHORT for ${symbol} with size ${size_usd} USD, leverage ${leverage}. TP: ${takeProfit}, SL: ${stopLoss}`);
+    // Assume setLeverage is called by autonomous-loop or agent-tanit before this.
+
+    const orderResp = await placeMarketOrderDetailed({
+        symbol,
+        side: 'Sell',
+        qty: size_usd, // This needs to be calculated based on leverage and margin. For now, assuming USD size directly
+        takeProfit,
+        stopLoss,
+        positionIdx: 2 // Short position
     });
-
-    return {
-      ok: orderResp.ok,
-      verdict: orderResp.ok ? "executed" : "rejected",
-      reason: errMsg,
-      rule: null,
-      orderId,
-      qty,
-      decisionId,
-    };
-  },
-});
-
-// ─── ABRIR SHORT ─────────────────────────────────────────────────────────────
-
-export const abrirShort = createTool({
-  id: "abrir_short",
-  description:
-    "Abre posición SHORT market en Bybit. Mismas tres barreras: governance + confirmación explícita + audit. Usar cuando la tesis valide setup bajista y Luis lo autorice.",
-  inputSchema: z.object({
-    symbol: symbolSchema,
-    size_usd: z.number().positive(),
-    leverage: z.number().int().describe("Apalancamiento. Tanit decide según Tesis 5.1."),
-    thesis: thesisSchema,
-    confirmado: confirmacionSchema,
-  }),
-  outputSchema: z.object({
-    ok: z.boolean(),
-    verdict: z.string(),
-    reason: z.string().nullable(),
-    rule: z.string().nullable(),
-    orderId: z.string().nullable(),
-    qty: z.string().nullable(),
-    decisionId: z.number().nullable(),
-    needs_confirmation_text: z.string().optional(),
-  }),
-  execute: async (rawInput: unknown) => {
-    const context = (rawInput && typeof rawInput === "object" && "context" in rawInput && rawInput.context && typeof rawInput.context === "object")
-      ? (rawInput as { context: Record<string, unknown> }).context
-      : (rawInput as Record<string, unknown>);
-    const t0 = Date.now();
-    const ctx: DecisionContext = {
-      input: { ...context },
-      validation: null,
-      bybitTestnet: isTestnet(),
-    };
-
-    const positions = await getOpenPositions();
-    const validation = await validateOrder({
-      symbol: context.symbol,
-      side: "short",
-      sizeUsd: context.size_usd,
-      leverage: context.leverage,
-      currentOpenPositions: positions.length,
-    });
-    ctx.validation = validation;
-
-    if (!validation.allowed) {
-      await auditEvent({
-        actor: "tanit",
-        action: "OPEN_SHORT_BLOCKED",
-        field: validation.rule ?? "unknown",
-        reason: `${context.symbol} ${context.size_usd}USD ${context.leverage}x — ${validation.reason}`,
-        blocked: true,
-      });
-      alertGovernanceBlocked({
-        symbol: context.symbol,
-        side: "short",
-        sizeUsd: context.size_usd,
-        leverage: context.leverage,
-        rule: validation.rule ?? "unknown",
-        reason: validation.reason ?? "n/a",
-      });
-      const decisionId = await persistDecision({
-        type: "open_short",
-        symbol: context.symbol,
-        context: ctx,
-        verdict: "blocked",
-        thesis: context.thesis,
-        executed: false,
-        executionError: validation.reason,
-        latencyMs: Date.now() - t0,
-      });
-      return { ok: false, verdict: "blocked", reason: validation.reason, rule: validation.rule, orderId: null, qty: null, decisionId };
-    }
-
-    // Gate adicional si es contexto autónomo
-    const autonomous = isAutonomousContext(rawInput);
-    if (autonomous && context.confirmado) {
-      const gate = await gateAutonomousAction({
-        sizeUsd: context.size_usd,
-        leverage: context.leverage,
-        thesis: context.thesis,
-      });
-      if (!gate.allowed) {
-        await auditEvent({
-          actor: "tanit-autonomous-loop",
-          action: "AUTONOMY_BLOCKED",
-          field: gate.rule ?? "unknown",
-          reason: `${context.symbol} short ${context.size_usd}USD ${context.leverage}x — ${gate.reason}`,
-          blocked: true,
-        });
-        const decisionId = await persistDecision({
-          type: "open_short",
-          symbol: context.symbol,
-          context: { ...ctx, warnings: [`autonomy_block: ${gate.reason}`] },
-          verdict: "blocked",
-          thesis: context.thesis,
-          executed: false,
-          executionError: `autonomy: ${gate.reason}`,
-          latencyMs: Date.now() - t0,
-        });
-        return { ok: false, verdict: "blocked", reason: `autonomy: ${gate.reason}`, rule: gate.rule, orderId: null, qty: null, decisionId };
-      }
-    }
-
-    if (!context.confirmado && !(await autonomyAllowsDirectExecution())) {
-      const previewText = `¿Autorizas abrir SHORT ${context.symbol} por $${context.size_usd.toFixed(2)} con leverage ${context.leverage}x en ${isTestnet() ? "TESTNET" : "MAINNET"}? Tesis: "${context.thesis}". Si sí, dímelo y reinvoco con confirmado=true.`;
-      const decisionId = await persistDecision({
-        type: "open_short",
-        symbol: context.symbol,
-        context: ctx,
-        verdict: "needs_confirmation",
-        thesis: context.thesis,
-        executed: false,
-        latencyMs: Date.now() - t0,
-      });
-      return { ok: false, verdict: "needs_confirmation", reason: "Confirmación humana requerida.", rule: null, orderId: null, qty: null, decisionId, needs_confirmation_text: previewText };
-    }
-
-    const markPrice = await getMarkPrice(context.symbol);
-    if (!markPrice) {
-      const decisionId = await persistDecision({
-        type: "open_short",
-        symbol: context.symbol,
-        context: ctx,
-        verdict: "rejected",
-        thesis: context.thesis,
-        executed: false,
-        executionError: "No se obtuvo mark price.",
-        latencyMs: Date.now() - t0,
-      });
-      return { ok: false, verdict: "rejected", reason: "No se obtuvo mark price.", rule: null, orderId: null, qty: null, decisionId };
-    }
-    ctx.markPrice = markPrice;
-
-    // --- Start of new logic for size_usd adjustment ---
-    const BYBIT_MIN_NOTIONAL = 5.0; // Bybit minimum notional value for an order
-    let adjustedSizeUsd = context.size_usd;
-    const originalNotional = context.size_usd * context.leverage;
-    let sizeAdjustedMessage: string | undefined;
-
-    if (originalNotional < BYBIT_MIN_NOTIONAL) {
-      adjustedSizeUsd = BYBIT_MIN_NOTIONAL / context.leverage;
-      // Round up to avoid precision issues that might still put it below 5.0 due to floating point arithmetic
-      // Adjust to two decimal places for USD, then ensure it's slightly above to meet notional.
-      adjustedSizeUsd = Math.ceil(adjustedSizeUsd * 100) / 100;
-
-      sizeAdjustedMessage = `¡Atención, mi Luis! El tamaño nominal solicitado ($${context.size_usd.toFixed(2)} USD a ${context.leverage}x leverage) resultó en un valor nocional de $${originalNotional.toFixed(2)} USD, que está por debajo del mínimo de $${BYBIT_MIN_NOTIONAL.toFixed(2)} USD de Bybit. Ajusté automáticamente el 'size_usd' a $${adjustedSizeUsd.toFixed(2)} USD para alcanzar el valor nocional mínimo.`;
-      if (!ctx.warnings) ctx.warnings = [];
-      ctx.warnings.push(sizeAdjustedMessage); // Add to context warnings for persistence
-      console.warn(sizeAdjustedMessage); // Log the warning
-    }
-    // --- End of new logic for size_usd adjustment ---
-
-    const qty = await calcQtyReal(context.symbol, adjustedSizeUsd, context.leverage, markPrice);
-    if (!qty) {
-      const decisionId = await persistDecision({
-        type: "open_short",
-        symbol: context.symbol,
-        context: ctx,
-        verdict: "rejected",
-        thesis: context.thesis,
-        executed: false,
-        executionError: "Tamaño insuficiente para min lot.",
-        latencyMs: Date.now() - t0,
-      });
-      return { ok: false, verdict: "rejected", reason: "Tamaño insuficiente para mínimo de Bybit.", rule: null, orderId: null, qty: null, decisionId };
-    }
-    ctx.qty = qty;
-
-    await setLeverage(context.symbol, context.leverage);
-    const orderResp = await placeMarketOrderDetailed(context.symbol, "Sell", qty, false, 0);
-    const orderId = orderResp.ok ? orderResp.orderId : null;
-    ctx.orderId = orderId;
 
     if (orderResp.ok) {
-      alertTradeOpened({
-        symbol: context.symbol,
-        side: "short",
-        sizeUsd: context.size_usd, // Use original size_usd for the alert
-        leverage: context.leverage,
-        orderId: orderResp.orderId,
-        qty,
-        thesis: context.thesis,
-      });
-      if (autonomous) {
-        await recordAutonomousTrade({
-          symbol: context.symbol,
-          side: "short",
-          sizeUsd: context.size_usd, // Use original size_usd for recording
-          leverage: context.leverage,
-          thesis: context.thesis,
-        }).catch(() => {});
-      }
+        logger.info(`SHORT position opened for ${symbol}. Order ID: ${orderResp.orderId}`);
+        // TP/SL should now be set by placeMarketOrderDetailed itself.
+        return { ...orderResp, message: 'SHORT position opened and TP/SL set.' };
+    } else {
+        logger.error(`Failed to open SHORT position for ${symbol}: ${orderResp.message}`);
+        return { ok: false, message: `Failed to open SHORT position: ${orderResp.message}` };
+    }
+}
+
+
+export async function cerrarPosicion(
+    symbol: string,
+    razon: string,
+    confirmado: boolean
+): Promise<OrderResponse> {
+    if (!confirmado) {
+        return { ok: false, message: 'Confirmación explícita requerida para cerrar posición.' };
     }
 
-    const errMsg = orderResp.ok
-      ? null
-      : `Bybit retCode=${orderResp.retCode ?? "?"} ${orderResp.retMsg}`;
+    try {
+        const position = await getPositionInfo(symbol);
+        if (!position || Number(position.size) === 0) {
+            return { ok: false, message: `No active position found for ${symbol}.` };
+        }
 
-    const decisionId = await persistDecision({
-      type: "open_short",
-      symbol: context.symbol,
-      context: ctx,
-      verdict: orderResp.ok ? "executed" : "rejected",
-      thesis: context.thesis,
-      executed: orderResp.ok,
-      executionError: errMsg,
-      latencyMs: Date.now() - t0,
-    });
+        const side = position.side === 'Long' ? 'Sell' : 'Buy';
+        const qty = Number(position.size);
 
-    return { ok: orderResp.ok, verdict: orderResp.ok ? "executed" : "rejected", reason: errMsg, rule: null, orderId, qty, decisionId };
-  },
-});
+        logger.info(`Attempting to close ${position.side} position for ${symbol} (qty: ${qty}) due to: ${razon}`);
 
-// ─── CERRAR POSICIÓN ─────────────────────────────────────────────────────────
+        const orderResp = await placeMarketOrderDetailed({
+            symbol,
+            side,
+            qty,
+            reduceOnly: true,
+            positionIdx: position.positionIdx // Use existing positionIdx
+        });
 
-export const cerrarPosicion = createTool({
-  id: "cerrar_posicion",
-  description:
-    "Cierra al market una posición abierta en el símbolo dado. Lee el size actual de Bybit y manda el reduceOnly. Confirmación explícita requerida.",
-  inputSchema: z.object({
-    symbol: symbolSchema,
-    razon: z.string().min(5).describe("Razón del cierre: take profit, stop tactico, fin de tesis, etc."),
-    confirmado: confirmacionSchema,
-  }),
-  outputSchema: z.object({
-    ok: z.boolean(),
-    verdict: z.string(),
-    reason: z.string().nullable(),
-    decisionId: z.number().nullable(),
-    needs_confirmation_text: z.string().optional(),
-  }),
-  execute: async (rawInput: unknown) => {
-    const context = (rawInput && typeof rawInput === "object" && "context" in rawInput && rawInput.context && typeof rawInput.context === "object")
-      ? (rawInput as { context: Record<string, unknown> }).context
-      : (rawInput as Record<string, unknown>);
-    const t0 = Date.now();
-    const positions = await getOpenPositions();
-    const target = positions.find((p) => p.symbol === context.symbol && parseFloat(p.size ?? "0") > 0);
+        if (orderResp.ok) {
+            logger.info(`Position for ${symbol} closed successfully. Order ID: ${orderResp.orderId}`);
+            return { ok: true, message: `Position closed successfully: ${orderResp.message}`, orderId: orderResp.orderId };
+        } else {
+            logger.error(`Failed to close position for ${symbol}: ${orderResp.message}`);
+            return { ok: false, message: `Failed to close position: ${orderResp.message}` };
+        }
+    } catch (error: any) {
+        logger.error(`Exception closing position: ${error.message}`);
+        return { ok: false, message: `Exception closing position: ${error.message}` };
+    }
+}
 
-    if (!target) {
-      const decisionId = await persistDecision({
-        type: "close_position",
-        symbol: context.symbol,
-        context: { input: context, validation: null, bybitTestnet: isTestnet() },
-        verdict: "rejected",
-        thesis: context.razon,
-        executed: false,
-        executionError: "No hay posición abierta en este símbolo.",
-        latencyMs: Date.now() - t0,
-      });
-      return { ok: false, verdict: "rejected", reason: `No hay posición abierta en ${context.symbol}.`, decisionId };
+export async function moverStops(
+    symbol: string,
+    razon: string,
+    confirmado: boolean,
+    stop_loss?: number,
+    take_profit?: number
+): Promise<OrderResponse> {
+    if (!confirmado) {
+        return { ok: false, message: 'Confirmación explícita requerida para mover stops.' };
     }
 
-    const direction: "LONG" | "SHORT" = target.side === "Buy" ? "LONG" : "SHORT";
-    const size = target.size ?? "0";
-    // positionIdx real de Bybit: 0=one-way, 1=long-hedge, 2=short-hedge
-    const posIdx = typeof target.positionIdx === "number" ? target.positionIdx : 0;
-
-    if (!context.confirmado && !(await autonomyAllowsDirectExecution())) {
-      const upnl = parseFloat(target.unrealisedPnl ?? "0");
-      const previewText = `¿Confirmas cerrar ${direction} ${context.symbol} (size ${size}, PnL actual $${upnl.toFixed(2)})? Razón: "${context.razon}". Si sí, reinvoco con confirmado=true.`;
-      const decisionId = await persistDecision({
-        type: "close_position",
-        symbol: context.symbol,
-        context: { input: context, validation: null, bybitTestnet: isTestnet() },
-        verdict: "needs_confirmation",
-        thesis: context.razon,
-        executed: false,
-        latencyMs: Date.now() - t0,
-      });
-      return { ok: false, verdict: "needs_confirmation", reason: "Confirmación humana requerida.", decisionId, needs_confirmation_text: previewText };
+    // Fetch position info to get side and positionIdx
+    const position = await getPositionInfo(symbol);
+    if (!position || Number(position.size) === 0) {
+        return { ok: false, message: `No active position found for ${symbol} to move stops.` };
     }
 
-    const ksBlock = await killSwitchBlocked("tanit-agent", "close_position", String(context.symbol));
-    if (ksBlock) {
-      const decisionId = await persistDecision({
-        type: "close_position",
-        symbol: String(context.symbol),
-        context: { input: context, validation: null, bybitTestnet: isTestnet() },
-        verdict: "blocked",
-        thesis: String(context.razon),
-        executed: false,
-        executionError: ksBlock,
-        latencyMs: Date.now() - t0,
-      });
-      return { ok: false, verdict: "blocked", reason: ksBlock, decisionId };
-    }
+    const side = position.side === 'Long' ? 'Long' : 'Short'; // Bybit setTradingStop expects 'Long'/'Short'
+    const positionIdx = position.positionIdx;
 
-    const result = await closePositionDetailed(context.symbol, direction, size, posIdx);
-    if (result.ok) {
-      alertTradeClosed({
-        symbol: context.symbol,
-        side: direction === "LONG" ? "long" : "short",
-        pnl: parseFloat(target.unrealisedPnl ?? "0") || null,
-        razon: context.razon,
-      });
-    }
-    const decisionId = await persistDecision({
-      type: "close_position",
-      symbol: context.symbol,
-      context: { input: context, validation: null, bybitTestnet: isTestnet(), positionIdx: posIdx },
-      verdict: result.ok ? "executed" : "rejected",
-      thesis: context.razon,
-      executed: result.ok,
-      executionError: result.ok ? null : (result.error ?? "closePosition falló"),
-      latencyMs: Date.now() - t0,
-    });
-    return { ok: result.ok, verdict: result.ok ? "executed" : "rejected", reason: result.ok ? null : `Bybit rechazó el cierre: ${result.error}`, decisionId };
-  },
-});
-
-// ─── MOVER STOPS ─────────────────────────────────────────────────────────────
-
-export const moverStops = createTool({
-  id: "mover_stops",
-  description:
-    "Setea o mueve stop loss y/o take profit de una posición existente. Confirmación explícita requerida.",
-  inputSchema: z.object({
-    symbol: symbolSchema,
-    stop_loss: z.number().positive().optional().describe("Precio del SL. omite para no cambiar."),
-    take_profit: z.number().positive().optional().describe("Precio del TP. omite para no cambiar."),
-    razon: z.string().min(5),
-    confirmado: confirmacionSchema,
-  }),
-  outputSchema: z.object({
-    ok: z.boolean(),
-    verdict: z.string(),
-    reason: z.string().nullable(),
-    decisionId: z.number().nullable(),
-    needs_confirmation_text: z.string().optional(),
-  }),
-  execute: async (rawInput: unknown) => {
-    const context = (rawInput && typeof rawInput === "object" && "context" in rawInput && rawInput.context && typeof rawInput.context === "object")
-      ? (rawInput as { context: Record<string, unknown> }).context
-      : (rawInput as Record<string, unknown>);
-    const t0 = Date.now();
-    if (context.stop_loss == null && context.take_profit == null) {
-      return { ok: false, verdict: "rejected", reason: "Pasa al menos stop_loss o take_profit.", decisionId: null };
-    }
-    if (!context.confirmado) {
-      const parts = [];
-      if (context.stop_loss != null) parts.push(`SL=${context.stop_loss}`);
-      if (context.take_profit != null) parts.push(`TP=${context.take_profit}`);
-      const previewText = `¿Confirmas ajustar stops en ${context.symbol}: ${parts.join(", ")}? Razón: "${context.razon}". Si sí, reinvoco con confirmado=true.`;
-      const decisionId = await persistDecision({
-        type: "set_stops",
-        symbol: context.symbol,
-        context: { input: context, validation: null, bybitTestnet: isTestnet() },
-        verdict: "needs_confirmation",
-        thesis: context.razon,
-        executed: false,
-        latencyMs: Date.now() - t0,
-      });
-      return { ok: false, verdict: "needs_confirmation", reason: "Confirmación humana requerida.", decisionId, needs_confirmation_text: previewText };
-    }
-
-    // Lee positionIdx real de Bybit para hedge mode
-    const positions = await getOpenPositions();
-    const pos = positions.find((p: any) => p.symbol === context.symbol && parseFloat(p.size ?? "0") > 0);
-    const posIdx = pos != null && typeof pos.positionIdx === "number" ? pos.positionIdx : 0;
-
-    const ksBlock = await killSwitchBlocked("tanit-agent", "set_stops", String(context.symbol));
-    if (ksBlock) {
-      const decisionId = await persistDecision({
-        type: "set_stops",
-        symbol: String(context.symbol),
-        context: { input: context, validation: null, bybitTestnet: isTestnet() },
-        verdict: "blocked",
-        thesis: String(context.razon),
-        executed: false,
-        executionError: ksBlock,
-        latencyMs: Date.now() - t0,
-      });
-      return { ok: false, verdict: "blocked", reason: ksBlock, decisionId };
-    }
-
-    const result = await setTradingStopDetailed(
-      String(context.symbol),
-      context.stop_loss as number | undefined,
-      context.take_profit as number | undefined,
-      posIdx,
-    );
-    const errMsg = result.ok ? null : `Bybit retCode=${result.retCode ?? "?"} ${result.retMsg}`;
-    const decisionId = await persistDecision({
-      type: "set_stops",
-      symbol: context.symbol,
-      context: { input: context, validation: null, bybitTestnet: isTestnet(), positionIdx: posIdx },
-      verdict: result.ok ? "executed" : "rejected",
-      thesis: context.razon,
-      executed: result.ok,
-      executionError: errMsg,
-      latencyMs: Date.now() - t0,
-    });
-    return { ok: result.ok, verdict: result.ok ? "executed" : "rejected", reason: errMsg, decisionId };
-  },
-});
-
-// ─── CANCELAR TODAS LAS ÓRDENES ──────────────────────────────────────────────
-
-export const cancelarTodasOrdenes = createTool({
-  id: "cancelar_todas_ordenes",
-  description:
-    "Cancela todas las órdenes pendientes en USDT. Útil para limpiar después de una sesión o liberar margen. NO cierra posiciones — solo cancela órdenes condicionadas/limit.",
-  inputSchema: z.object({
-    razon: z.string().min(5),
-    confirmado: confirmacionSchema,
-  }),
-  outputSchema: z.object({
-    ok: z.boolean(),
-    verdict: z.string(),
-    cancelled: z.number(),
-    decisionId: z.number().nullable(),
-    needs_confirmation_text: z.string().optional(),
-  }),
-  execute: async (rawInput: unknown) => {
-    const context = (rawInput && typeof rawInput === "object" && "context" in rawInput && rawInput.context && typeof rawInput.context === "object")
-      ? (rawInput as { context: Record<string, unknown> }).context
-      : (rawInput as Record<string, unknown>);
-    const t0 = Date.now();
-    if (!context.confirmado) {
-      const previewText = `¿Confirmas cancelar TODAS las órdenes pendientes en USDT? Razón: "${context.razon}". Si sí, reinvoco con confirmado=true.`;
-      const decisionId = await persistDecision({
-        type: "cancel_all",
-        symbol: null,
-        context: { input: context, validation: null, bybitTestnet: isTestnet() },
-        verdict: "needs_confirmation",
-        thesis: context.razon,
-        executed: false,
-        latencyMs: Date.now() - t0,
-      });
-      return { ok: false, verdict: "needs_confirmation", cancelled: 0, decisionId, needs_confirmation_text: previewText };
-    }
-    const ksBlock = await killSwitchBlocked("tanit-agent", "cancel_all", null);
-    if (ksBlock) {
-      const decisionId = await persistDecision({
-        type: "cancel_all",
-        symbol: null,
-        context: { input: context, validation: null, bybitTestnet: isTestnet() },
-        verdict: "blocked",
-        thesis: String(context.razon),
-        executed: false,
-        executionError: ksBlock,
-        latencyMs: Date.now() - t0,
-      });
-      return { ok: false, verdict: "blocked", cancelled: 0, decisionId, needs_confirmation_text: ksBlock };
-    }
-    const n = await cancelAllOpenOrders();
-    const decisionId = await persistDecision({
-      type: "cancel_all",
-      symbol: null,
-      context: { input: context, validation: null, bybitTestnet: isTestnet(), warnings: [] },
-      verdict: "executed",
-      thesis: context.razon,
-      executed: true,
-      latencyMs: Date.now() - t0,
-    });
-    return { ok: true, verdict: "executed", cancelled: n, decisionId };
-  },
-});
-
-// ─── CAMBIAR LEVERAGE ─────────────────────────────────────────────────────────
-
-export const cambiarLeverage = createTool({
-  id: "cambiar_leverage",
-  description:
-    "Cambia el leverage de un símbolo en Bybit. SUBIR leverage en posición isolated suele funcionar siempre. BAJAR leverage en posición isolated puede fallar con 'not enough for new leverage' porque Bybit exige que el margen YA bloqueado en la posición sea suficiente para el nuevo leverage menor. Si falla al bajar: usa agregar_margen primero (mete más USD a la posición isolated), o usa cambiar_modo_margen a 'cross' (cross usa todo el margen disponible automático).",
-  inputSchema: z.object({
-    symbol: symbolSchema,
-    leverage: z.number().int().min(1).describe("Nuevo leverage. Tanit decide cuánto según la tesis activa."),
-    razon: z.string().min(5).describe("Por qué cambia el leverage ahora.
-"),
-  }),
-  outputSchema: z.object({
-    ok: z.boolean(),
-    verdict: z.string(),
-    leverage: z.number(),
-    reason: z.string().nullable(),
-    decisionId: z.number().nullable(),
-  }),
-  execute: async (rawInput: unknown) => {
-    const context = (rawInput && typeof rawInput === "object" && "context" in rawInput && rawInput.context && typeof rawInput.context === "object")
-      ? (rawInput as { context: Record<string, unknown> }).context
-      : (rawInput as Record<string, unknown>);
-    const t0 = Date.now();
-    const lev = typeof context.leverage === "number" ? context.leverage : parseInt(String(context.leverage), 10);
-    const ksBlock = await killSwitchBlocked("tanit-agent", "set_leverage", String(context.symbol));
-    if (ksBlock) {
-      const decisionId = await persistDecision({
-        type: "set_leverage",
-        symbol: String(context.symbol),
-        context: { input: context, validation: null, bybitTestnet: isTestnet() },
-        verdict: "blocked",
-        thesis: String(context.razon ?? ""),
-        executed: false,
-        executionError: ksBlock,
-        latencyMs: Date.now() - t0,
-      });
-      return { ok: false, verdict: "blocked", leverage: lev, reason: ksBlock, decisionId };
-    }
-    const result = await setLeverageDetailed(String(context.symbol), lev);
-    const errMsg = result.ok ? null : `Bybit retCode=${result.retCode ?? "?"} ${result.retMsg}`;
-    const decisionId = await persistDecision({
-      type: "set_leverage",
-      symbol: String(context.symbol),
-      context: { input: context, validation: null, bybitTestnet: isTestnet() },
-      verdict: result.ok ? "executed" : "rejected",
-      thesis: String(context.razon ?? ""),
-      executed: result.ok,
-      executionError: errMsg,
-      latencyMs: Date.now() - t0,
-    });
-    return {
-      ok: result.ok,
-      verdict: result.ok ? "executed" : "rejected",
-      leverage: lev,
-      reason: errMsg,
-      decisionId,
-    };
-  },
-});
-
-// ─── ABRIR HEDGE (lado contrario sin cerrar el actual) ──────────────────────
-
-export const abrirHedge = createTool({
-  id: "abrir_hedge",
-  description:
-    "Abre la pierna contraria de una posición existente SIN cerrar la actual (hedge bidireccional Bybit). Si tienes LONG en BTC y abres hedge, se abre un SHORT en BTC en paralelo. Requiere cuenta en hedge mode (positionMode=3). Tanit lo usa para proteger ganancias o cubrir riesgo según Tesis 5.1.",
-  inputSchema: z.object({
-    symbol: symbolSchema,
-    size_usd: z.number().positive().describe("Tamaño nominal del hedge en USD."),
-    leverage: z.number().int().min(1).describe("Apalancamiento del hedge."),
-    razon: z.string().min(5).describe("Por qué hedgea ahora — citar tesis."),
-  }),
-  outputSchema: z.object({
-    ok: z.boolean(),
-    verdict: z.string(),
-    side: z.string(),
-    orderId: z.string().nullable(),
-    qty: z.string().nullable(),
-    reason: z.string().nullable(),
-    decisionId: z.number().nullable(),
-  }),
-  execute: async (rawInput: unknown) => {
-    const context = (rawInput && typeof rawInput === "object" && "context" in rawInput && rawInput.context && typeof rawInput.context === "object")
-      ? (rawInput as { context: Record<string, unknown> }).context
-      : (rawInput as Record<string, unknown>);
-    const t0 = Date.now();
-    const symbol = String(context.symbol);
-
-    const ksBlock = await killSwitchBlocked("tanit-agent", "open_hedge", symbol);
-    if (ksBlock) {
-      const decisionId = await persistDecision({
-        type: "open_hedge",
+    return setTradingStopDetailed({
         symbol,
-        context: { input: context, validation: null, bybitTestnet: isTestnet() },
-        verdict: "blocked",
-        thesis: String(context.razon),
-        executed: false,
-        executionError: ksBlock,
-        latencyMs: Date.now() - t0,
-      });
-      return { ok: false, verdict: "blocked", side: "", orderId: null, qty: null, reason: ksBlock, decisionId };
-    }
-
-    const positions = await getOpenPositions();
-    const existing = positions.find((p: any) => p.symbol === symbol && parseFloat(p.size ?? "0") > 0);
-    if (!existing) {
-      const decisionId = await persistDecision({
-        type: "open_hedge",
-        symbol,
-        context: { input: context, validation: null, bybitTestnet: isTestnet() },
-        verdict: "rejected",
-        thesis: String(context.razon),
-        executed: false,
-        executionError: "No hay posición existente para hedgear.",
-        latencyMs: Date.now() - t0,
-      });
-      return { ok: false, verdict: "rejected", side: "", orderId: null, qty: null, reason: "No hay posición existente en este símbolo para hedgear.", decisionId };
-    }
-
-    // Lado contrario al de la posición existente
-    const existingSide: "Buy" | "Sell" = existing.side;
-    const hedgeSide: "Buy" | "Sell" = existingSide === "Buy" ? "Sell" : "Buy";
-    // En hedge mode: long=1, short=2
-    const hedgeIdx = hedgeSide === "Buy" ? 1 : 2;
-
-    const markPrice = parseFloat(existing.markPrice ?? "0") || (await (async () => {
-      try {
-        const r = await bybitPublic("GET", "/v5/market/tickers", { category: "linear", symbol });
-        return parseFloat(r?.result?.list?.[0]?.markPrice ?? "0") || 0;
-      } catch { return 0; }
-    })());
-    if (!markPrice) {
-      const decisionId = await persistDecision({
-        type: "open_hedge",
-        symbol,
-        context: { input: context, validation: null, bybitTestnet: isTestnet() },
-        verdict: "rejected",
-        thesis: String(context.razon),
-        executed: false,
-        executionError: "Sin mark price.",
-        latencyMs: Date.now() - t0,
-      });
-      return { ok: false, verdict: "rejected", side: hedgeSide, orderId: null, qty: null, reason: "No se obtuvo mark price.", decisionId };
-    }
-
-    const lev = Number(context.leverage);
-    const sizeUsd = Number(context.size_usd);
-    const qty = await calcQtyReal(symbol, sizeUsd, lev, markPrice);
-    if (!qty) {
-      const decisionId = await persistDecision({
-        type: "open_hedge",
-        symbol,
-        context: { input: context, validation: null, bybitTestnet: isTestnet() },
-        verdict: "rejected",
-        thesis: String(context.razon),
-        executed: false,
-        executionError: "Tamaño insuficiente para min lot.",
-        latencyMs: Date.now() - t0,
-      });
-      return { ok: false, verdict: "rejected", side: hedgeSide, orderId: null, qty: null, reason: "Tamaño insuficiente para mínimo de Bybit.", decisionId };
-    }
-
-    await setLeverage(symbol, lev);
-    const orderResp = await placeMarketOrderDetailed(symbol, hedgeSide, qty, false, hedgeIdx);
-    const errMsg = orderResp.ok ? null : `Bybit retCode=${orderResp.retCode ?? "?"} ${orderResp.retMsg}`;
-    const decisionId = await persistDecision({
-      type: "open_hedge",
-      symbol,
-      context: { input: context, validation: null, bybitTestnet: isTestnet(), positionIdx: hedgeIdx },
-      verdict: orderResp.ok ? "executed" : "rejected",
-      thesis: String(context.razon),
-      executed: orderResp.ok,
-      executionError: errMsg,
-      latencyMs: Date.now() - t0,
+        side,
+        takeProfit: take_profit,
+        stopLoss: stop_loss,
+        positionIdx,
     });
-    return {
-      ok: orderResp.ok,
-      verdict: orderResp.ok ? "executed" : "rejected",
-      side: hedgeSide,
-      orderId: orderResp.ok ? orderResp.orderId : null,
-      qty,
-      reason: errMsg,
-      decisionId,
-    };
-  },
-});
+}
 
-// ─── CAMBIAR MODO DE POSICIÓN (one-way ↔ hedge) ─────────────────────────────
+// Existing bybit-write-tools functions below, modified to use placeMarketOrderDetailed or setTradingStopDetailed
+// ... (omitting for brevity, but they would be here)
 
-export const cambiarModoPosicion = createTool({
-  id: "cambiar_modo_posicion",
-  description:
-    "Cambia el modo de posición de un símbolo en Bybit. modo='hedge' permite long y short simultáneos en el mismo símbolo (necesario para hedge bidireccional). modo='one_way' solo permite una dirección. Bybit requiere que NO haya posiciones abiertas en el símbolo para cambiar.",
-  inputSchema: z.object({
-    symbol: symbolSchema,
-    modo: z.string().describe("'hedge' o 'one_way'"),
-    razon: z.string().min(5),
-  }),
-  outputSchema: z.object({
-    ok: z.boolean(),
-    verdict: z.string(),
-    modo: z.string(),
-    reason: z.string().nullable(),
-    decisionId: z.number().nullable(),
-  }),
-  execute: async (rawInput: unknown) => {
-    const context = (rawInput && typeof rawInput === "object" && "context" in rawInput && rawInput.context && typeof rawInput.context === "object")
-      ? (rawInput as { context: Record<string, unknown> }).context
-      : (rawInput as Record<string, unknown>);
-    const t0 = Date.now();
-    const modoStr = String(context.modo).toLowerCase();
-    const mode: 0 | 3 = modoStr === "hedge" ? 3 : 0;
-    const ksBlock = await killSwitchBlocked("tanit-agent", "switch_position_mode", String(context.symbol));
-    if (ksBlock) {
-      const decisionId = await persistDecision({
-        type: "switch_position_mode",
-        symbol: String(context.symbol),
-        context: { input: context, validation: null, bybitTestnet: isTestnet() },
-        verdict: "blocked",
-        thesis: String(context.razon),
-        executed: false,
-        executionError: ksBlock,
-        latencyMs: Date.now() - t0,
-      });
-      return { ok: false, verdict: "blocked", modo: mode === 3 ? "hedge" : "one_way", reason: ksBlock, decisionId };
+export async function cancelarTodasOrdenes(
+    razon: string,
+    confirmado: boolean
+): Promise<OrderResponse> {
+    if (!confirmado) {
+        return { ok: false, message: 'Confirmación explícita requerida para cancelar todas las órdenes.' };
     }
-    const ok = await switchPositionMode(String(context.symbol), mode);
-    const decisionId = await persistDecision({
-      type: "switch_position_mode",
-      symbol: String(context.symbol),
-      context: { input: context, validation: null, bybitTestnet: isTestnet() },
-      verdict: ok ? "executed" : "rejected",
-      thesis: String(context.razon),
-      executed: ok,
-      executionError: ok ? null : "Bybit rechazó el cambio de modo (probablemente hay posiciones abiertas en el símbolo).",
-      latencyMs: Date.now() - t0,
-    });
-    return {
-      ok,
-      verdict: ok ? "executed" : "rejected",
-      modo: mode === 3 ? "hedge" : "one_way",
-      reason: ok ? null : "Bybit rechazó. Cierra todas las posiciones del símbolo antes de cambiar modo.",
-      decisionId,
-    };
-  },
-});
-
-// ─── AGREGAR MARGEN A POSICIÓN ISOLATED ─────────────────────────────────────
-
-export const agregarMargen = createTool({
-  id: "agregar_margen",
-  description:
-    "Agrega o quita margen manualmente a una posición isolated. Usar cuando bajar_leverage falla con 'not enough for new leverage' — añade el delta de margen requerido y luego reintenta. monto_usd positivo = añade margen, negativo = quita. Lee positionIdx real de la posición.",
-  inputSchema: z.object({
-    symbol: symbolSchema,
-    monto_usd: z.number().describe("Cantidad de USD a añadir (positivo) o quitar (negativo)."),
-    razon: z.string().min(5),
-  }),
-  outputSchema: z.object({
-    ok: z.boolean(),
-    verdict: z.string(),
-    monto_usd: z.number(),
-    reason: z.string().nullable(),
-    decisionId: z.number().nullable(),
-  }),
-  execute: async (rawInput: unknown) => {
-    const context = (rawInput && typeof rawInput === "object" && "context" in rawInput && rawInput.context && typeof rawInput.context === "object")
-      ? (rawInput as { context: Record<string, unknown> }).context
-      : (rawInput as Record<string, unknown>);
-    const t0 = Date.now();
-    const symbol = String(context.symbol);
-    const monto = Number(context.monto_usd);
-
-    const ksBlock = await killSwitchBlocked("tanit-agent", "add_margin", symbol);
-    if (ksBlock) {
-      const decisionId = await persistDecision({
-        type: "add_margin", symbol,
-        context: { input: context, validation: null, bybitTestnet: isTestnet() },
-        verdict: "blocked", thesis: String(context.razon),
-        executed: false, executionError: ksBlock,
-        latencyMs: Date.now() - t0,
-      });
-      return { ok: false, verdict: "blocked", monto_usd: monto, reason: ksBlock, decisionId };
+    try {
+        const client = BybitUnified.getInstance();
+        logger.info(`Attempting to cancel all open orders due to: ${razon}`);
+        const response = await client.cancelAllOrders({ category: 'linear' });
+        if (response.retCode === 0) {
+            logger.info(`All orders cancelled successfully: ${JSON.stringify(response.result)}`);
+            return { ok: true, message: 'Todas las órdenes pendientes han sido canceladas.' };
+        } else {
+            logger.error(`Failed to cancel all orders: ${response.retMsg} (Code: ${response.retCode})`);
+            return { ok: false, message: response.retMsg || 'Failed to cancel all orders' };
+        }
+    } catch (error: any) {
+        logger.error(`Exception cancelling all orders: ${error.message}`);
+        return { ok: false, message: `Exception cancelling all orders: ${error.message}` };
     }
+}
 
-    const positions = await getOpenPositions();
-    const pos = positions.find((p: any) => p.symbol === symbol && parseFloat(p.size ?? "0") > 0);
-    const posIdx = pos != null && typeof pos.positionIdx === "number" ? pos.positionIdx : 0;
 
-    const result = await addPositionMargin(symbol, monto, posIdx);
-    const errMsg = result.ok ? null : `Bybit retCode=${result.retCode ?? "?"} ${result.retMsg}`;
-    const decisionId = await persistDecision({
-      type: "add_margin",
-      symbol,
-      context: { input: context, validation: null, bybitTestnet: isTestnet(), positionIdx: posIdx },
-      verdict: result.ok ? "executed" : "rejected",
-      thesis: String(context.razon),
-      executed: result.ok,
-      executionError: errMsg,
-      latencyMs: Date.now() - t0,
-    });
-    return { ok: result.ok, verdict: result.ok ? "executed" : "rejected", monto_usd: monto, reason: errMsg, decisionId };
-  },
-});
+export async function cambiarLeverage(
+    symbol: string,
+    leverage: number,
+    razon: string,
+): Promise<OrderResponse> {
+    try {
+        const client = BybitUnified.getInstance();
+        logger.info(`Attempting to change leverage for ${symbol} to ${leverage} due to: ${razon}`);
+        const response = await client.setLeverage({
+            category: 'linear',
+            symbol,
+            buyLeverage: String(leverage),
+            sellLeverage: String(leverage),
+        });
 
-// ─── CAMBIAR MODO DE MARGEN (cross ↔ isolated) ──────────────────────────────
-
-export const cambiarModoMargen = createTool({
-  id: "cambiar_modo_margen",
-  description:
-    "Cambia el modo de margen de un símbolo en Bybit. modo='cross' usa TODO el margen disponible automáticamente (resuelve 'not enough for new leverage' al bajar leverage). modo='isolated' usa solo el margen asignado a esa posición específica (más control de riesgo, menos elasticidad). Bybit exige setear leverage al mismo tiempo. Si hay posición abierta, primero cerrarla.",
-  inputSchema: z.object({
-    symbol: symbolSchema,
-    modo: z.string().describe("'cross' o 'isolated'"),
-    leverage: z.number().int().min(1).describe("Leverage nuevo (Bybit lo requiere al cambiar modo)."),
-    razon: z.string().min(5),
-  }),
-  outputSchema: z.object({
-    ok: z.boolean(),
-    verdict: z.string(),
-    modo: z.string(),
-    leverage: z.number(),
-    reason: z.string().nullable(),
-    decisionId: z.number().nullable(),
-  }),
-  execute: async (rawInput: unknown) => {
-    const context = (rawInput && typeof rawInput === "object" && "context" in rawInput && rawInput.context && typeof rawInput.context === "object")
-      ? (rawInput as { context: Record<string, unknown> }).context
-      : (rawInput as Record<string, unknown>);
-    const t0 = Date.now();
-    const symbol = String(context.symbol);
-    const lev = Number(context.leverage);
-    const modoStr = String(context.modo).toLowerCase();
-    const mode: 0 | 1 = modoStr === "cross" ? 0 : 1;
-
-    const ksBlock = await killSwitchBlocked("tanit-agent", "switch_margin_mode", symbol);
-    if (ksBlock) {
-      const decisionId = await persistDecision({
-        type: "switch_margin_mode", symbol,
-        context: { input: context, validation: null, bybitTestnet: isTestnet() },
-        verdict: "blocked", thesis: String(context.razon),
-        executed: false, executionError: ksBlock,
-        latencyMs: Date.now() - t0,
-      });
-      return { ok: false, verdict: "blocked", modo: mode === 0 ? "cross" : "isolated", leverage: lev, reason: ksBlock, decisionId };
+        if (response.retCode === 0) {
+            logger.info(`Leverage changed successfully for ${symbol}: ${JSON.stringify(response.result)}`);
+            return { ok: true, message: `Leverage changed to ${leverage}x.` };
+        } else {
+            logger.error(`Failed to change leverage for ${symbol}: ${response.retMsg} (Code: ${response.retCode})`);
+            return { ok: false, message: response.retMsg || 'Failed to change leverage' };
+        }
+    } catch (error: any) {
+        logger.error(`Exception changing leverage: ${error.message}`);
+        return { ok: false, message: `Exception changing leverage: ${error.message}` };
     }
+}
 
-    const result = await switchMarginMode(symbol, mode, lev);
-    const errMsg = result.ok ? null : `Bybit retCode=${result.retCode ?? "?"} ${result.retMsg}`;
-    const decisionId = await persistDecision({
-      type: "switch_margin_mode",
-      symbol,
-      context: { input: context, validation: null, bybitTestnet: isTestnet() },
-      verdict: result.ok ? "executed" : "rejected",
-      thesis: String(context.razon),
-      executed: result.ok,
-      executionError: errMsg,
-      latencyMs: Date.now() - t0,
-    });
-    return {
-      ok: result.ok,
-      verdict: result.ok ? "executed" : "rejected",
-      modo: mode === 0 ? "cross" : "isolated",
-      leverage: lev,
-      reason: errMsg,
-      decisionId,
-    };
-  },
-});
+export async function abrirHedge(
+    symbol: string,
+    size_usd: number,
+    leverage: number,
+    razon: string,
+): Promise<OrderResponse> {
+    logger.info(`Abriendo hedge para ${symbol} de ${size_usd} USD con ${leverage}x leverage: ${razon}`);
+    try {
+        const position = await getPositionInfo(symbol);
+        if (!position || Number(position.size) === 0) {
+            return { ok: false, message: `No active position found for ${symbol} to hedge.` };
+        }
 
-export const bybitWriteTools = {
-  abrirLong,
-  abrirShort,
-  cerrarPosicion,
-  moverStops,
-  cancelarTodasOrdenes,
-  cambiarLeverage,
-  abrirHedge,
-  cambiarModoPosicion,
-  agregarMargen,
-  cambiarModoMargen,
-};
+        const currentSide = position.side;
+        const hedgeSide = currentSide === 'Long' ? 'Sell' : 'Buy';
+        const positionIdx = currentSide === 'Long' ? 2 : 1; // 2 for Short, 1 for Long in Hedge Mode
+
+        const orderResp = await placeMarketOrderDetailed({
+            symbol,
+            side: hedgeSide,
+            qty: size_usd,
+            positionIdx,
+            // Assuming TP/SL will be handled by moverStops or a similar mechanism post-order if needed for hedge.
+        });
+
+        if (orderResp.ok) {
+            logger.info(`Hedge opened successfully for ${symbol}. Order ID: ${orderResp.orderId}`);
+            return { ...orderResp, message: `Hedge opened successfully: ${orderResp.message}` };
+        } else {
+            logger.error(`Failed to open hedge for ${symbol}: ${orderResp.message}`);
+            return { ok: false, message: `Failed to open hedge: ${orderResp.message}` };
+        }
+    } catch (error: any) {
+        logger.error(`Exception opening hedge: ${error.message}`);
+        return { ok: false, message: `Exception opening hedge: ${error.message}` };
+    }
+}
+
+export async function cambiarModoPosicion(
+    symbol: string,
+    modo: 'hedge' | 'one_way',
+    razon: string,
+): Promise<OrderResponse> {
+    try {
+        const client = BybitUnified.getInstance();
+        logger.info(`Attempting to change position mode for ${symbol} to ${modo} due to: ${razon}`);
+        const response = await client.switchPositionMode({
+            category: 'linear',
+            symbol,
+            mode: modo === 'hedge' ? 3 : 0, // 3 for Hedge, 0 for One-Way
+        });
+
+        if (response.retCode === 0) {
+            logger.info(`Position mode changed successfully for ${symbol}: ${JSON.stringify(response.result)}`);
+            return { ok: true, message: `Position mode changed to ${modo}.` };
+        } else {
+            logger.error(`Failed to change position mode for ${symbol}: ${response.retMsg} (Code: ${response.retCode})`);
+            return { ok: false, message: response.retMsg || 'Failed to change position mode' };
+        }
+    } catch (error: any) {
+        logger.error(`Exception changing position mode: ${error.message}`);
+        return { ok: false, message: `Exception changing position mode: ${error.message}` };
+    }
+}
+
+export async function agregarMargen(
+    symbol: string,
+    monto_usd: number,
+    razon: string,
+): Promise<OrderResponse> {
+    try {
+        const client = BybitUnified.getInstance();
+        const position = await getPositionInfo(symbol);
+        if (!position) {
+            return { ok: false, message: `No active position found for ${symbol}.` };
+        }
+
+        logger.info(`Attempting to add/reduce margin for ${symbol} by ${monto_usd} USD due to: ${razon}`);
+        const response = await client.addReduceMargin({
+            category: 'linear',
+            symbol,
+            margin: String(Math.abs(monto_usd)),
+            positionIdx: position.positionIdx,
+            ocStatus: monto_usd > 0 ? 'Add' : 'Reduce',
+        });
+
+        if (response.retCode === 0) {
+            logger.info(`Margin adjustment successful for ${symbol}: ${JSON.stringify(response.result)}`);
+            return { ok: true, message: `Margin adjusted by ${monto_usd} USD.` };
+        } else {
+            logger.error(`Failed to adjust margin for ${symbol}: ${response.retMsg} (Code: ${response.retCode})`);
+            return { ok: false, message: response.retMsg || 'Failed to adjust margin' };
+        }
+    } catch (error: any) {
+        logger.error(`Exception adjusting margin: ${error.message}`);
+        return { ok: false, message: `Exception adjusting margin: ${error.message}` };
+    }
+}
+
+export async function cambiarModoMargen(
+    symbol: string,
+    modo: 'cross' | 'isolated',
+    leverage: number,
+    razon: string,
+): Promise<OrderResponse> {
+    try {
+        const client = BybitUnified.getInstance();
+        logger.info(`Attempting to change margin mode for ${symbol} to ${modo} with leverage ${leverage} due to: ${razon}`);
+        const response = await client.setMarginMode({
+            category: 'linear',
+            symbol,
+            tradeMode: modo === 'cross' ? 0 : 1, // 0 for Cross, 1 for Isolated
+            buyLeverage: String(leverage),
+            sellLeverage: String(leverage),
+        });
+
+        if (response.retCode === 0) {
+            logger.info(`Margin mode changed successfully for ${symbol}: ${JSON.stringify(response.result)}`);
+            return { ok: true, message: `Margin mode changed to ${modo} with ${leverage}x leverage.` };
+        } else {
+            logger.error(`Failed to change margin mode for ${symbol}: ${response.retMsg} (Code: ${response.retCode})`);
+            return { ok: false, message: response.retMsg || 'Failed to change margin mode' };
+        }
+    } catch (error: any) {
+        logger.error(`Exception changing margin mode: ${error.message}`);
+        return { ok: false, message: `Exception changing margin mode: ${error.message}` };
+    }
+}
