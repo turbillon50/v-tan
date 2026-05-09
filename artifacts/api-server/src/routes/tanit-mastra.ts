@@ -53,15 +53,35 @@ router.post("/bot/mastra-chat-stream", async (req, res): Promise<void> => {
   res.flushHeaders?.();
 
   const send = (event: Record<string, unknown>) => {
+    if (res.writableEnded) return;
     try {
       res.write(`data: ${JSON.stringify(event)}\n\n`);
+      // Forzamos flush para que el browser reciba los chunks aunque el
+      // proxy intermedio (Railway/Cloudflare) tenga buffering. Sin esto,
+      // operaciones largas (backtest, multi-tool) se ven como 'Load failed'
+      // en Safari porque la conexión queda idle visualmente aunque hay
+      // heartbeats internos.
+      (res as unknown as { flush?: () => void }).flush?.();
     } catch {
       // socket cerrado — no se hace nada
     }
   };
 
-  // Heartbeat cada 5s para mantener viva la conexión cuando Gemini tarda
-  const hb = setInterval(() => send({ type: "heartbeat" }), 5000);
+  // Heartbeat más frecuente (2s) — algunos proxies cortan conexiones SSE
+  // tras 30s sin data; con 2s aseguramos refresco continuo durante tools
+  // que tardan 30-60s (backtest_inteligente, agent multi-step).
+  const hb = setInterval(() => {
+    if (res.writableEnded) {
+      clearInterval(hb);
+      return;
+    }
+    send({ type: "heartbeat", t: Date.now() });
+  }, 2000);
+
+  // Si el cliente cierra la conexión, paramos el heartbeat para no leakear.
+  req.on("close", () => {
+    clearInterval(hb);
+  });
 
   try {
     // 1) Persistir mensaje del usuario en tanit_chat
@@ -142,38 +162,56 @@ router.post("/bot/mastra-chat-stream", async (req, res): Promise<void> => {
     // fullStream emite: text-delta, tool-call, tool-result, finish, etc.
     // Mantenemos el contrato existente (token/heartbeat/done/error) y agregamos
     // tool_call y tool_result. Frontend viejo ignora los nuevos sin romper.
-    for await (const chunk of stream.fullStream as AsyncIterable<{
-      type: string;
-      payload?: Record<string, unknown>;
-    }>) {
-      if (!chunk || !chunk.type) continue;
-      const t = chunk.type;
-      const p = chunk.payload ?? {};
+    //
+    // Wrappamos el iterador en try-catch INTERNO porque si una tool tira un
+    // error inesperado durante el for-await, queremos enviar evento estructurado
+    // y NO cerrar la conexión abruptamente con 'Load failed' al cliente.
+    try {
+      for await (const chunk of stream.fullStream as AsyncIterable<{
+        type: string;
+        payload?: Record<string, unknown>;
+      }>) {
+        if (!chunk || !chunk.type) continue;
+        const t = chunk.type;
+        const p = chunk.payload ?? {};
 
-      if (t === "text-delta") {
-        const text = (p as { text?: string; delta?: string }).text
-          ?? (p as { delta?: string }).delta
-          ?? "";
-        if (text) {
-          fullReply += text;
-          send({ type: "token", content: text });
+        if (t === "text-delta") {
+          const text = (p as { text?: string; delta?: string }).text
+            ?? (p as { delta?: string }).delta
+            ?? "";
+          if (text) {
+            fullReply += text;
+            send({ type: "token", content: text });
+          }
+        } else if (t === "tool-call") {
+          send({
+            type: "tool_call",
+            toolCallId: (p as { toolCallId?: string }).toolCallId,
+            tool: (p as { toolName?: string }).toolName,
+            args: (p as { args?: unknown }).args,
+          });
+        } else if (t === "tool-result") {
+          send({
+            type: "tool_result",
+            toolCallId: (p as { toolCallId?: string }).toolCallId,
+            tool: (p as { toolName?: string }).toolName,
+            result: (p as { result?: unknown }).result,
+          });
+        } else if (t === "error") {
+          // Mastra puede emitir errores en el stream — los reportamos sin morir
+          send({
+            type: "error",
+            message: String((p as { error?: unknown }).error ?? "stream error"),
+          });
         }
-      } else if (t === "tool-call") {
-        send({
-          type: "tool_call",
-          toolCallId: (p as { toolCallId?: string }).toolCallId,
-          tool: (p as { toolName?: string }).toolName,
-          args: (p as { args?: unknown }).args,
-        });
-      } else if (t === "tool-result") {
-        send({
-          type: "tool_result",
-          toolCallId: (p as { toolCallId?: string }).toolCallId,
-          tool: (p as { toolName?: string }).toolName,
-          result: (p as { result?: unknown }).result,
-        });
+        // ignoramos finish/start/etc — el done explícito lo emitimos abajo
       }
-      // ignoramos finish/start/etc — el done explícito lo emitimos abajo
+    } catch (streamErr) {
+      // Error del fullStream interno (tool exception, gemini timeout, etc.)
+      // Lo enviamos como evento estructurado y dejamos que el finally cierre.
+      const m = streamErr instanceof Error ? streamErr.message : String(streamErr);
+      console.warn("[mastra-chat] fullStream error:", m);
+      send({ type: "error", message: m });
     }
 
     // 5) Persistir reply de Tanit
