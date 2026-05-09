@@ -219,7 +219,7 @@ export const consultarPrecioMercado = createTool({
         };
       }
       // Fallback a REST si WS no tiene ese símbolo subscrito
-      const r = await bybitPublic("/v5/market/tickers", {
+      const r = await bybitPublic("GET", "/v5/market/tickers", {
         category: "linear",
         symbol,
       });
@@ -333,7 +333,7 @@ export const leerVelas = createTool({
       ? (rawInput as { context: { symbol: string; interval: string; limit: number } }).context
       : (rawInput as { symbol: string; interval: string; limit: number }));
     try {
-      const data = await bybitPublic("/v5/market/kline", {
+      const data = await bybitPublic("GET", "/v5/market/kline", {
         category: "linear",
         symbol: ctx.symbol,
         interval: ctx.interval,
@@ -423,7 +423,7 @@ export const leerEstructuraTecnica = createTool({
       structure: "unknown",
     };
     try {
-      const data = await bybitPublic("/v5/market/kline", {
+      const data = await bybitPublic("GET", "/v5/market/kline", {
         category: "linear",
         symbol,
         interval,
@@ -614,7 +614,7 @@ export const backtestTesis = createTool({
     };
     try {
       // 1) Cargar velas históricas
-      const data = await bybitPublic("/v5/market/kline", {
+      const data = await bybitPublic("GET", "/v5/market/kline", {
         category: "linear",
         symbol: ctx.symbol,
         interval: ctx.interval,
@@ -976,7 +976,7 @@ export const backtestInteligente = createTool({
 
     try {
       // 1) Cargar velas históricas
-      const data = await bybitPublic("/v5/market/kline", {
+      const data = await bybitPublic("GET", "/v5/market/kline", {
         category: "linear",
         symbol: ctx.symbol,
         interval: ctx.interval,
@@ -1370,7 +1370,7 @@ export const leerFundingHistorico = createTool({
       avg7d: 0, avg30d: 0, avgAllPct: 0, seriesJson: "[]",
     };
     try {
-      const r = await bybitPublic("/v5/market/funding/history", {
+      const r = await bybitPublic("GET", "/v5/market/funding/history", {
         category: "linear", symbol, limit: String(limit),
       });
       const list = (r?.result?.list ?? []) as Array<{ fundingRate: string; fundingRateTimestamp: string }>;
@@ -1433,7 +1433,7 @@ export const leerOpenInterestHistorico = createTool({
       latestOI: 0, delta24hPct: 0, delta7dPct: 0, seriesJson: "[]",
     };
     try {
-      const r = await bybitPublic("/v5/market/open-interest", {
+      const r = await bybitPublic("GET", "/v5/market/open-interest", {
         category: "linear", symbol, intervalTime, limit: String(limit),
       });
       const list = (r?.result?.list ?? []) as Array<{ openInterest: string; timestamp: string }>;
@@ -1502,7 +1502,7 @@ export const leerOrderbookProfundo = createTool({
       bidsJson: "[]", asksJson: "[]",
     };
     try {
-      const r = await bybitPublic("/v5/market/orderbook", {
+      const r = await bybitPublic("GET", "/v5/market/orderbook", {
         category: "linear", symbol, limit: String(levels),
       });
       const ob = r?.result;
