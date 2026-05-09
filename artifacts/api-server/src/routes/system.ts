@@ -33,6 +33,10 @@ const router = Router();
  * Útil para verificar que las nuevas tools (leer_velas, backtest_*) sí están
  * disponibles para ella, y no quedaron solo en el commit local.
  */
+// Marker hardcoded para verificar qué build está corriendo en producción.
+// Cambiar este valor en cada deploy para confirmar que Railway tomó el código.
+const BUILD_MARKER = "v8-aplanado-radical-2026-05-08T20:30:00Z";
+
 router.get("/tanit/tools-registered", (_req, res): void => {
   const buckets: Record<string, string[]> = {
     read: Object.entries(bybitReadTools).map(([_, t]) =>
@@ -57,6 +61,7 @@ router.get("/tanit/tools-registered", (_req, res): void => {
   const all: string[] = Object.values(buckets).flat();
   res.json({
     ok: true,
+    build: BUILD_MARKER,
     total: all.length,
     by_bucket: buckets,
     all_tools: all.sort(),
