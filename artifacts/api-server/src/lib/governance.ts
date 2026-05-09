@@ -87,7 +87,18 @@ export interface ValidationResult {
  *   leverage — apalancamiento solicitado
  *   currentOpenPositions — cuántas posiciones tiene ahora abiertas
  */
-export async function validateOrder(args: {
+/**
+ * Luis: 'cero frenos. Tanit es libre'. validateOrder ahora SOLO checa el
+ * kill_switch_global (botón de pánico de Luis). El resto de los caps
+ * (max_leverage, max_position_size, allowed_symbols, max_concurrent,
+ * require_approval) ya NO bloquean nada.
+ *
+ * La función sigue existiendo porque hay 30+ callers en el codebase. La
+ * dejamos passthrough para no romper imports. La auditoría en
+ * tanit_governance_audit sigue grabando los intentos para que tú veas
+ * qué hizo Tanit y cuándo.
+ */
+export async function validateOrder(_args: {
   symbol: string;
   side: "long" | "short";
   sizeUsd: number;
@@ -95,67 +106,16 @@ export async function validateOrder(args: {
   currentOpenPositions: number;
 }): Promise<ValidationResult> {
   const r = await getRules();
-
-  // 1) Kill-switch global tiene precedencia absoluta
   if (r.kill_switch_global) {
     return {
       allowed: false,
-      reason: "kill_switch_global=true. Todas las writes bloqueadas.",
+      reason: "kill_switch_global=true. Luis activó el botón de pánico.",
       rule: "kill_switch_global",
       requiresApproval: false,
     };
   }
-
-  // 2) Símbolo permitido — convención: allowed_symbols=[] significa "sin
-  //    restricción de símbolo" (la tesis 5.1 dice "mosquito surfea donde
-  //    haya ola"). Si la lista trae elementos, sí filtramos contra ella.
-  if (r.allowed_symbols.length > 0 && !r.allowed_symbols.includes(args.symbol)) {
-    return {
-      allowed: false,
-      reason: `Símbolo '${args.symbol}' no está en allowed_symbols (${r.allowed_symbols.join(", ")}).`,
-      rule: "allowed_symbols",
-      requiresApproval: false,
-    };
-  }
-
-  // 3) Tamaño de posición
-  if (args.sizeUsd > r.max_position_size_usd) {
-    return {
-      allowed: false,
-      reason: `Tamaño $${args.sizeUsd.toFixed(2)} excede max_position_size_usd=$${r.max_position_size_usd.toFixed(2)}.`,
-      rule: "max_position_size_usd",
-      requiresApproval: false,
-    };
-  }
-
-  // 4) Leverage
-  if (args.leverage > r.max_leverage) {
-    return {
-      allowed: false,
-      reason: `Leverage ${args.leverage}x excede max_leverage=${r.max_leverage}x.`,
-      rule: "max_leverage",
-      requiresApproval: false,
-    };
-  }
-
-  // 5) Posiciones concurrentes
-  if (args.currentOpenPositions >= r.max_concurrent_positions) {
-    return {
-      allowed: false,
-      reason: `Ya hay ${args.currentOpenPositions} posiciones abiertas, max permitido=${r.max_concurrent_positions}.`,
-      rule: "max_concurrent_positions",
-      requiresApproval: false,
-    };
-  }
-
-  // 6) Pasa la validación. Marcar si requiere aprobación humana explícita.
-  const requiresApproval = args.sizeUsd > r.require_approval_above_usd;
-  return {
-    allowed: true,
-    reason: null,
-    rule: null,
-    requiresApproval,
-  };
+  // Cero frenos. Tanit es libre.
+  return { allowed: true, reason: null, rule: null, requiresApproval: false };
 }
 
 /** Registra un evento en el audit log. */

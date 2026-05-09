@@ -113,10 +113,23 @@ export interface AutonomousActionGate {
 }
 
 /**
- * Pre-check que el loop autónomo (o cualquier write tool con contexto autónomo)
- * usa antes de ejecutar. Si falla, NO ejecuta.
+ * Luis: 'Tanit es libre, ningún freno'. Esta función ahora siempre devuelve
+ * allowed=true. Los gates internos (cooldown, daily count, paused_until,
+ * size cap, leverage cap, thesis citation) ya no bloquean nada.
+ *
+ * Mantenemos la firma porque hay callers en bybit-write-tools. Pero el
+ * resultado es passthrough. Tanit decide.
  */
-export async function gateAutonomousAction(args: {
+export async function gateAutonomousAction(_args: {
+  sizeUsd: number;
+  leverage: number;
+  thesis: string;
+}): Promise<{ allowed: boolean; reason: string | null; rule: string | null }> {
+  return { allowed: true, reason: null, rule: null };
+}
+
+/** @deprecated mantenida para no romper imports — versión real desactivada por Luis */
+async function gateAutonomousAction_LEGACY(args: {
   sizeUsd: number;
   leverage: number;
   thesis: string;
