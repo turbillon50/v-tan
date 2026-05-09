@@ -452,34 +452,61 @@ export async function placeMarketOrder(
  * Variante de placeMarketOrder que devuelve el detalle del error de Bybit
  * (retCode + retMsg) en lugar de null silencioso. Necesario para que las
  * tools de Tanit puedan reportar a Luis QUÉ rechazó Bybit y por qué.
+ *
+ * Auto-retry inteligente para retCode=10001 ('position idx not match
+ * position mode'): la cuenta puede estar en One-Way (idx=0) o Hedge Mode
+ * (idx=1 long, idx=2 short). Si el primer intento falla con ese error,
+ * reintentamos con el idx alternativo según el side.
  */
 export async function placeMarketOrderDetailed(
   symbol: string, side: "Buy" | "Sell", qty: string,
   reduceOnly = false, positionIdx = 0
 ): Promise<
-  | { ok: true; orderId: string }
+  | { ok: true; orderId: string; positionMode: "one-way" | "hedge" }
   | { ok: false; retCode: number | null; retMsg: string }
 > {
-  try {
-    const d = await bybitPrivate("POST", "/v5/order/create", {
-      category: "linear", symbol, side, orderType: "Market", qty,
-      timeInForce: "GoodTillCancel", reduceOnly, positionIdx,
-    });
-    if (d?.retCode === 0 && d?.result?.orderId) {
-      return { ok: true, orderId: String(d.result.orderId) };
+  const tryOrder = async (idx: number): Promise<any> => {
+    try {
+      return await bybitPrivate("POST", "/v5/order/create", {
+        category: "linear", symbol, side, orderType: "Market", qty,
+        timeInForce: "GoodTillCancel", reduceOnly, positionIdx: idx,
+      });
+    } catch (e) {
+      return { _exception: e instanceof Error ? e.message : String(e) };
     }
-    return {
-      ok: false,
-      retCode: typeof d?.retCode === "number" ? d.retCode : null,
-      retMsg: String(d?.retMsg ?? "Bybit no devolvió orderId"),
-    };
-  } catch (e) {
-    return {
-      ok: false,
-      retCode: null,
-      retMsg: e instanceof Error ? e.message : String(e),
-    };
+  };
+
+  // Primer intento con el idx solicitado (default 0 = One-Way)
+  let d = await tryOrder(positionIdx);
+  if (d?.retCode === 0 && d?.result?.orderId) {
+    return { ok: true, orderId: String(d.result.orderId), positionMode: positionIdx === 0 ? "one-way" : "hedge" };
   }
+
+  // Si fue 10001 (position idx mismatch), reintentar con idx alternativo
+  if (d?.retCode === 10001 && /position idx/i.test(String(d?.retMsg ?? ""))) {
+    // Si pidió 0 (One-Way) y falló, cuenta está en Hedge → idx 1 long, 2 short
+    // Si pidió 1/2 (Hedge) y falló, cuenta está en One-Way → idx 0
+    const altIdx = positionIdx === 0 ? (side === "Buy" ? 1 : 2) : 0;
+    console.warn(`[bybit-real] retCode=10001 retry: positionIdx ${positionIdx} → ${altIdx} (side=${side})`);
+    d = await tryOrder(altIdx);
+    if (d?.retCode === 0 && d?.result?.orderId) {
+      return {
+        ok: true,
+        orderId: String(d.result.orderId),
+        positionMode: altIdx === 0 ? "one-way" : "hedge",
+      };
+    }
+  }
+
+  // Fallo definitivo
+  if (d?._exception) {
+    return { ok: false, retCode: null, retMsg: String(d._exception) };
+  }
+  return {
+    ok: false,
+    retCode: typeof d?.retCode === "number" ? d.retCode : null,
+    retMsg: String(d?.retMsg ?? "Bybit no devolvió orderId"),
+  };
 }
 
 export async function closePosition(
