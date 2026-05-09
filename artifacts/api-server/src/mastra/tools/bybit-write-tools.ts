@@ -26,7 +26,9 @@ import {
   closePosition,
   closePositionDetailed,
   setTradingStop,
+  setTradingStopDetailed,
   setLeverage,
+  setLeverageDetailed,
   calcQtyReal,
   cancelAllOpenOrders,
   getOpenPositions,
@@ -722,23 +724,24 @@ export const moverStops = createTool({
     const pos = positions.find((p: any) => p.symbol === context.symbol && parseFloat(p.size ?? "0") > 0);
     const posIdx = pos != null && typeof pos.positionIdx === "number" ? pos.positionIdx : 0;
 
-    const ok = await setTradingStop(
-      context.symbol,
-      context.stop_loss ?? undefined,
-      context.take_profit ?? undefined,
+    const result = await setTradingStopDetailed(
+      String(context.symbol),
+      context.stop_loss as number | undefined,
+      context.take_profit as number | undefined,
       posIdx,
     );
+    const errMsg = result.ok ? null : `Bybit retCode=${result.retCode ?? "?"} ${result.retMsg}`;
     const decisionId = await persistDecision({
       type: "set_stops",
       symbol: context.symbol,
       context: { input: context, validation: null, bybitTestnet: isTestnet(), positionIdx: posIdx },
-      verdict: ok ? "executed" : "rejected",
+      verdict: result.ok ? "executed" : "rejected",
       thesis: context.razon,
-      executed: ok,
-      executionError: ok ? null : "setTradingStop devolvió false",
+      executed: result.ok,
+      executionError: errMsg,
       latencyMs: Date.now() - t0,
     });
-    return { ok, verdict: ok ? "executed" : "rejected", reason: ok ? null : "Bybit rechazó el ajuste de stops.", decisionId };
+    return { ok: result.ok, verdict: result.ok ? "executed" : "rejected", reason: errMsg, decisionId };
   },
 });
 
@@ -815,22 +818,23 @@ export const cambiarLeverage = createTool({
       : (rawInput as Record<string, unknown>);
     const t0 = Date.now();
     const lev = typeof context.leverage === "number" ? context.leverage : parseInt(String(context.leverage), 10);
-    const ok = await setLeverage(String(context.symbol), lev);
+    const result = await setLeverageDetailed(String(context.symbol), lev);
+    const errMsg = result.ok ? null : `Bybit retCode=${result.retCode ?? "?"} ${result.retMsg}`;
     const decisionId = await persistDecision({
       type: "set_leverage",
       symbol: String(context.symbol),
       context: { input: context, validation: null, bybitTestnet: isTestnet() },
-      verdict: ok ? "executed" : "rejected",
+      verdict: result.ok ? "executed" : "rejected",
       thesis: String(context.razon ?? ""),
-      executed: ok,
-      executionError: ok ? null : "setLeverage devolvió false — Bybit rechazó",
+      executed: result.ok,
+      executionError: errMsg,
       latencyMs: Date.now() - t0,
     });
     return {
-      ok,
-      verdict: ok ? "executed" : "rejected",
+      ok: result.ok,
+      verdict: result.ok ? "executed" : "rejected",
       leverage: lev,
-      reason: ok ? null : "Bybit rechazó el cambio de leverage.",
+      reason: errMsg,
       decisionId,
     };
   },

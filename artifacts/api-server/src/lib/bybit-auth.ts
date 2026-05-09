@@ -411,6 +411,13 @@ export function calcQty(symbol: string, capitalUSDT: number, leverage: number, p
 // ═══════════════════════════════════════════════════════════════════════════════
 
 export async function setLeverage(symbol: string, leverage: number): Promise<boolean> {
+  const r = await setLeverageDetailed(symbol, leverage);
+  return r.ok;
+}
+
+export async function setLeverageDetailed(
+  symbol: string, leverage: number
+): Promise<{ ok: boolean; retCode: number | null; retMsg: string }> {
   try {
     const d = await bybitPrivate("POST", "/v5/position/set-leverage", {
       category: "linear", symbol,
@@ -418,12 +425,18 @@ export async function setLeverage(symbol: string, leverage: number): Promise<boo
       sellLeverage: String(leverage),
     });
     // 0 = OK, 110043 = leverage sin cambio (también OK)
-    if (d?.retCode === 0 || d?.retCode === 110043) return true;
+    if (d?.retCode === 0 || d?.retCode === 110043) {
+      return { ok: true, retCode: d.retCode, retMsg: d?.retMsg ?? "OK" };
+    }
     console.error(`[bybit] setLeverage ${symbol} ${leverage}x retCode=${d?.retCode} msg=${d?.retMsg}`);
-    return false;
+    return {
+      ok: false,
+      retCode: typeof d?.retCode === "number" ? d.retCode : null,
+      retMsg: String(d?.retMsg ?? "Bybit no devolvió retCode"),
+    };
   } catch (e) {
     console.error(`[bybit] setLeverage ${symbol} exception:`, e);
-    return false;
+    return { ok: false, retCode: null, retMsg: e instanceof Error ? e.message : String(e) };
   }
 }
 
@@ -545,6 +558,13 @@ export async function closePositionMainnet(
 export async function setTradingStop(
   symbol: string, stopLoss?: number, takeProfit?: number | null, positionIdx = 0
 ): Promise<boolean> {
+  const r = await setTradingStopDetailed(symbol, stopLoss, takeProfit, positionIdx);
+  return r.ok;
+}
+
+export async function setTradingStopDetailed(
+  symbol: string, stopLoss?: number, takeProfit?: number | null, positionIdx = 0
+): Promise<{ ok: boolean; retCode: number | null; retMsg: string }> {
   try {
     const params: Record<string, unknown> = { category: "linear", symbol, positionIdx };
     if (stopLoss != null) params.stopLoss = String(stopLoss);
@@ -556,15 +576,20 @@ export async function setTradingStop(
     const d = await bybitPrivate("POST", "/v5/position/set-trading-stop", params);
     if (d?.error === "Unexpected end of JSON input") {
       console.log(`[bybit] setTradingStop ${symbol} OK (empty body = success)`);
-      return true;
+      return { ok: true, retCode: 0, retMsg: "OK (empty body)" };
     }
     if (d?.retCode !== 0) {
       console.error(`[bybit] setTradingStop ${symbol} retCode=${d?.retCode} msg=${d?.retMsg}`);
     }
-    return d?.retCode === 0;
+    if (d?.retCode === 0) return { ok: true, retCode: 0, retMsg: "OK" };
+    return {
+      ok: false,
+      retCode: typeof d?.retCode === "number" ? d.retCode : null,
+      retMsg: String(d?.retMsg ?? "Bybit no devolvió retCode"),
+    };
   } catch (e: any) {
     console.error(`[bybit] setTradingStop ${symbol} EXCEPCION:`, e);
-    return false;
+    return { ok: false, retCode: null, retMsg: e instanceof Error ? e.message : String(e) };
   }
 }
 
