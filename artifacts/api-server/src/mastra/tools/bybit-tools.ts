@@ -304,8 +304,11 @@ export const leerVelas = createTool({
   inputSchema: z.object({
     symbol: z.string().describe("ej. BTCUSDT, ETHUSDT, SOLUSDT"),
     interval: z
-      .enum(["1", "3", "5", "15", "30", "60", "120", "240", "360", "720", "D", "W", "M"])
-      .default("60"),
+      .string()
+      .default("60")
+      .describe(
+        "timeframe — válidos: '1' (1m), '3', '5', '15', '30', '60' (1h), '120', '240' (4h), '360', '720', 'D' (diario), 'W' (semanal), 'M' (mensual)",
+      ),
     limit: z.number().int().min(10).max(500).default(100),
   }),
   outputSchema: z.object({
@@ -383,7 +386,7 @@ export const leerEstructuraTecnica = createTool({
   inputSchema: z.object({
     symbol: z.string(),
     interval: z
-      .enum(["5", "15", "60", "240", "D"])
+      .string()
       .default("240")
       .describe("'5'=5m, '15'=15m, '60'=1h, '240'=4h, 'D'=diario"),
   }),
@@ -590,7 +593,7 @@ export const backtestTesis = createTool({
   inputSchema: z.object({
     symbol: z.string(),
     interval: z
-      .enum(["15", "60", "240", "D"])
+      .string()
       .default("240")
       .describe("'15'=15m, '60'=1h, '240'=4h, 'D'=diario"),
     candles: z
@@ -609,8 +612,9 @@ export const backtestTesis = createTool({
       .describe("% del capital arriesgado por trade (default 2%)"),
     leverage: z.number().min(1).max(100).default(10),
     side: z
-      .enum(["both", "long_only", "short_only"])
-      .default("both"),
+      .string()
+      .default("both")
+      .describe("'both' | 'long_only' | 'short_only'"),
   }),
   outputSchema: z.object({
     ok: z.boolean(),
@@ -946,8 +950,9 @@ export const backtestInteligente = createTool({
   inputSchema: z.object({
     symbol: z.string(),
     interval: z
-      .enum(["60", "240", "D"])
-      .default("240"),
+      .string()
+      .default("240")
+      .describe("'60'=1h, '240'=4h, 'D'=diario"),
     candlesBack: z
       .number()
       .int()
@@ -1472,8 +1477,9 @@ export const leerOpenInterestHistorico = createTool({
   inputSchema: z.object({
     symbol: z.string(),
     intervalTime: z
-      .enum(["5min", "15min", "30min", "1h", "4h", "1d"])
-      .default("4h"),
+      .string()
+      .default("4h")
+      .describe("válidos: '5min', '15min', '30min', '1h', '4h', '1d'"),
     limit: z.number().int().min(1).max(200).default(50),
   }),
   outputSchema: z.object({
