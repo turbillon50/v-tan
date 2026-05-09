@@ -412,13 +412,19 @@ export function calcQty(symbol: string, capitalUSDT: number, leverage: number, p
 
 export async function setLeverage(symbol: string, leverage: number): Promise<boolean> {
   try {
-    await bybitPrivate("POST", "/v5/position/set-leverage", {
+    const d = await bybitPrivate("POST", "/v5/position/set-leverage", {
       category: "linear", symbol,
       buyLeverage:  String(leverage),
       sellLeverage: String(leverage),
     });
-    return true;
-  } catch { return false; }
+    // 0 = OK, 110043 = leverage sin cambio (también OK)
+    if (d?.retCode === 0 || d?.retCode === 110043) return true;
+    console.error(`[bybit] setLeverage ${symbol} ${leverage}x retCode=${d?.retCode} msg=${d?.retMsg}`);
+    return false;
+  } catch (e) {
+    console.error(`[bybit] setLeverage ${symbol} exception:`, e);
+    return false;
+  }
 }
 
 export async function switchPositionMode(symbol: string, mode: 0 | 3): Promise<boolean> {
@@ -512,29 +518,28 @@ export async function placeMarketOrderDetailed(
 export async function closePosition(
   symbol: string, direction: "LONG" | "SHORT", qty: string, positionIdx = 0
 ): Promise<boolean> {
+  const result = await closePositionDetailed(symbol, direction, qty, positionIdx);
+  return result.ok;
+}
+
+export async function closePositionDetailed(
+  symbol: string, direction: "LONG" | "SHORT", qty: string, positionIdx = 0
+): Promise<{ ok: boolean; orderId?: string; error?: string }> {
   const side = direction === "LONG" ? "Sell" : "Buy";
   invalidateBalanceCache();
-  const orderId = await placeMarketOrder(symbol, side, qty, true, positionIdx);
-  return !!orderId;
+  const result = await placeMarketOrderDetailed(symbol, side, qty, true, positionIdx);
+  if (result.ok) {
+    console.log(`[bybit] closePositionDetailed OK: ${symbol} ${direction} qty=${qty} orderId=${result.orderId} positionMode=${result.positionMode}`);
+    return { ok: true, orderId: result.orderId };
+  }
+  return { ok: false, error: `${result.retCode}: ${result.retMsg}` };
 }
 
 export async function closePositionMainnet(
   symbol: string, direction: "LONG" | "SHORT", qty: string, positionIdx = 0
 ): Promise<boolean> {
-  const side = direction === "LONG" ? "Sell" : "Buy";
-  invalidateBalanceCache();
-  try {
-    const d = await bybitPrivate("POST", "/v5/order/create", {
-      category: "linear", symbol, side, orderType: "Market", qty,
-      timeInForce: "GoodTillCancel", reduceOnly: true, positionIdx,
-    });
-    if (d?.retCode === 0) return true;
-    console.error("[bybit] closePositionMainnet error:", d?.retMsg);
-    return false;
-  } catch (e) {
-    console.error("[bybit] closePositionMainnet exception:", e);
-    return false;
-  }
+  const result = await closePositionDetailed(symbol, direction, qty, positionIdx);
+  return result.ok;
 }
 
 export async function setTradingStop(

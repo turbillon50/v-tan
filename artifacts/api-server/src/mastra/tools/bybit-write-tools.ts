@@ -24,6 +24,7 @@ import {
   placeMarketOrder,
   placeMarketOrderDetailed,
   closePosition,
+  closePositionDetailed,
   setTradingStop,
   setLeverage,
   calcQtyReal,
@@ -132,7 +133,7 @@ async function getMarkPrice(symbol: string): Promise<number | null> {
   const ws = getWsPrice(symbol);
   if (ws !== null) return ws;
   try {
-    const r = await bybitPublic("/v5/market/tickers", { category: "linear", symbol });
+    const r = await bybitPublic("GET", "/v5/market/tickers", { category: "linear", symbol });
     const t = r?.result?.list?.[0];
     return t ? parseFloat(t.markPrice ?? t.lastPrice ?? "0") || null : null;
   } catch {
@@ -630,6 +631,8 @@ export const cerrarPosicion = createTool({
 
     const direction: "LONG" | "SHORT" = target.side === "Buy" ? "LONG" : "SHORT";
     const size = target.size ?? "0";
+    // positionIdx real de Bybit: 0=one-way, 1=long-hedge, 2=short-hedge
+    const posIdx = typeof target.positionIdx === "number" ? target.positionIdx : 0;
 
     if (!context.confirmado && !(await autonomyAllowsDirectExecution())) {
       const upnl = parseFloat(target.unrealisedPnl ?? "0");
@@ -646,10 +649,8 @@ export const cerrarPosicion = createTool({
       return { ok: false, verdict: "needs_confirmation", reason: "Confirmación humana requerida.", decisionId, needs_confirmation_text: previewText };
     }
 
-    const ok = await closePosition(context.symbol, direction, size, 0);
-    if (ok) {
-      // PnL real lo conocemos sólo después; aquí mandamos null y el reporte
-      // diario resume con el closedPnl que llene Bybit unos segundos después.
+    const result = await closePositionDetailed(context.symbol, direction, size, posIdx);
+    if (result.ok) {
       alertTradeClosed({
         symbol: context.symbol,
         side: direction === "LONG" ? "long" : "short",
@@ -660,14 +661,14 @@ export const cerrarPosicion = createTool({
     const decisionId = await persistDecision({
       type: "close_position",
       symbol: context.symbol,
-      context: { input: context, validation: null, bybitTestnet: isTestnet() },
-      verdict: ok ? "executed" : "rejected",
+      context: { input: context, validation: null, bybitTestnet: isTestnet(), positionIdx: posIdx },
+      verdict: result.ok ? "executed" : "rejected",
       thesis: context.razon,
-      executed: ok,
-      executionError: ok ? null : "closePosition devolvió false",
+      executed: result.ok,
+      executionError: result.ok ? null : (result.error ?? "closePosition falló"),
       latencyMs: Date.now() - t0,
     });
-    return { ok, verdict: ok ? "executed" : "rejected", reason: ok ? null : "Bybit rechazó el cierre.", decisionId };
+    return { ok: result.ok, verdict: result.ok ? "executed" : "rejected", reason: result.ok ? null : `Bybit rechazó el cierre: ${result.error}`, decisionId };
   },
 });
 
@@ -716,23 +717,28 @@ export const moverStops = createTool({
       return { ok: false, verdict: "needs_confirmation", reason: "Confirmación humana requerida.", decisionId, needs_confirmation_text: previewText };
     }
 
+    // Lee positionIdx real de Bybit para hedge mode
+    const positions = await getOpenPositions();
+    const pos = positions.find((p: any) => p.symbol === context.symbol && parseFloat(p.size ?? "0") > 0);
+    const posIdx = pos != null && typeof pos.positionIdx === "number" ? pos.positionIdx : 0;
+
     const ok = await setTradingStop(
       context.symbol,
       context.stop_loss ?? undefined,
       context.take_profit ?? undefined,
-      0,
+      posIdx,
     );
     const decisionId = await persistDecision({
       type: "set_stops",
       symbol: context.symbol,
-      context: { input: context, validation: null, bybitTestnet: isTestnet() },
+      context: { input: context, validation: null, bybitTestnet: isTestnet(), positionIdx: posIdx },
       verdict: ok ? "executed" : "rejected",
       thesis: context.razon,
       executed: ok,
       executionError: ok ? null : "setTradingStop devolvió false",
       latencyMs: Date.now() - t0,
     });
-    return { ok, verdict: ok ? "executed" : "rejected", reason: ok ? null : "Bybit rechazó.", decisionId };
+    return { ok, verdict: ok ? "executed" : "rejected", reason: ok ? null : "Bybit rechazó el ajuste de stops.", decisionId };
   },
 });
 
@@ -785,10 +791,56 @@ export const cancelarTodasOrdenes = createTool({
   },
 });
 
+// ─── CAMBIAR LEVERAGE ─────────────────────────────────────────────────────────
+
+export const cambiarLeverage = createTool({
+  id: "cambiar_leverage",
+  description:
+    "Cambia el leverage de un símbolo en Bybit (sube o baja). Aplica tanto a posiciones existentes como a nuevas. No requiere cerrar la posición. Tanit decide el leverage según Tesis 5.1.",
+  inputSchema: z.object({
+    symbol: symbolSchema,
+    leverage: z.number().int().min(1).describe("Nuevo leverage. Tanit decide cuánto según la tesis activa."),
+    razon: z.string().min(5).describe("Por qué cambia el leverage ahora."),
+  }),
+  outputSchema: z.object({
+    ok: z.boolean(),
+    verdict: z.string(),
+    leverage: z.number(),
+    reason: z.string().nullable(),
+    decisionId: z.number().nullable(),
+  }),
+  execute: async (rawInput: unknown) => {
+    const context = (rawInput && typeof rawInput === "object" && "context" in rawInput && rawInput.context && typeof rawInput.context === "object")
+      ? (rawInput as { context: Record<string, unknown> }).context
+      : (rawInput as Record<string, unknown>);
+    const t0 = Date.now();
+    const lev = typeof context.leverage === "number" ? context.leverage : parseInt(String(context.leverage), 10);
+    const ok = await setLeverage(String(context.symbol), lev);
+    const decisionId = await persistDecision({
+      type: "set_leverage",
+      symbol: String(context.symbol),
+      context: { input: context, validation: null, bybitTestnet: isTestnet() },
+      verdict: ok ? "executed" : "rejected",
+      thesis: String(context.razon ?? ""),
+      executed: ok,
+      executionError: ok ? null : "setLeverage devolvió false — Bybit rechazó",
+      latencyMs: Date.now() - t0,
+    });
+    return {
+      ok,
+      verdict: ok ? "executed" : "rejected",
+      leverage: lev,
+      reason: ok ? null : "Bybit rechazó el cambio de leverage.",
+      decisionId,
+    };
+  },
+});
+
 export const bybitWriteTools = {
   abrirLong,
   abrirShort,
   cerrarPosicion,
   moverStops,
   cancelarTodasOrdenes,
+  cambiarLeverage,
 };
