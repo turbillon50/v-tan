@@ -29,6 +29,7 @@ import {
   setTradingStopDetailed,
   setLeverage,
   setLeverageDetailed,
+  switchPositionMode,
   calcQtyReal,
   cancelAllOpenOrders,
   getOpenPositions,
@@ -840,6 +841,164 @@ export const cambiarLeverage = createTool({
   },
 });
 
+// ─── ABRIR HEDGE (lado contrario sin cerrar el actual) ──────────────────────
+
+export const abrirHedge = createTool({
+  id: "abrir_hedge",
+  description:
+    "Abre la pierna contraria de una posición existente SIN cerrar la actual (hedge bidireccional Bybit). Si tienes LONG en BTC y abres hedge, se abre un SHORT en BTC en paralelo. Requiere cuenta en hedge mode (positionMode=3). Tanit lo usa para proteger ganancias o cubrir riesgo según Tesis 5.1.",
+  inputSchema: z.object({
+    symbol: symbolSchema,
+    size_usd: z.number().positive().describe("Tamaño nominal del hedge en USD."),
+    leverage: z.number().int().min(1).describe("Apalancamiento del hedge."),
+    razon: z.string().min(5).describe("Por qué hedgea ahora — citar tesis."),
+  }),
+  outputSchema: z.object({
+    ok: z.boolean(),
+    verdict: z.string(),
+    side: z.string(),
+    orderId: z.string().nullable(),
+    qty: z.string().nullable(),
+    reason: z.string().nullable(),
+    decisionId: z.number().nullable(),
+  }),
+  execute: async (rawInput: unknown) => {
+    const context = (rawInput && typeof rawInput === "object" && "context" in rawInput && rawInput.context && typeof rawInput.context === "object")
+      ? (rawInput as { context: Record<string, unknown> }).context
+      : (rawInput as Record<string, unknown>);
+    const t0 = Date.now();
+    const symbol = String(context.symbol);
+
+    const positions = await getOpenPositions();
+    const existing = positions.find((p: any) => p.symbol === symbol && parseFloat(p.size ?? "0") > 0);
+    if (!existing) {
+      const decisionId = await persistDecision({
+        type: "open_hedge",
+        symbol,
+        context: { input: context, validation: null, bybitTestnet: isTestnet() },
+        verdict: "rejected",
+        thesis: String(context.razon),
+        executed: false,
+        executionError: "No hay posición existente para hedgear.",
+        latencyMs: Date.now() - t0,
+      });
+      return { ok: false, verdict: "rejected", side: "", orderId: null, qty: null, reason: "No hay posición existente en este símbolo para hedgear.", decisionId };
+    }
+
+    // Lado contrario al de la posición existente
+    const existingSide: "Buy" | "Sell" = existing.side;
+    const hedgeSide: "Buy" | "Sell" = existingSide === "Buy" ? "Sell" : "Buy";
+    // En hedge mode: long=1, short=2
+    const hedgeIdx = hedgeSide === "Buy" ? 1 : 2;
+
+    const markPrice = parseFloat(existing.markPrice ?? "0") || (await (async () => {
+      try {
+        const r = await bybitPublic("GET", "/v5/market/tickers", { category: "linear", symbol });
+        return parseFloat(r?.result?.list?.[0]?.markPrice ?? "0") || 0;
+      } catch { return 0; }
+    })());
+    if (!markPrice) {
+      const decisionId = await persistDecision({
+        type: "open_hedge",
+        symbol,
+        context: { input: context, validation: null, bybitTestnet: isTestnet() },
+        verdict: "rejected",
+        thesis: String(context.razon),
+        executed: false,
+        executionError: "Sin mark price.",
+        latencyMs: Date.now() - t0,
+      });
+      return { ok: false, verdict: "rejected", side: hedgeSide, orderId: null, qty: null, reason: "No se obtuvo mark price.", decisionId };
+    }
+
+    const lev = Number(context.leverage);
+    const sizeUsd = Number(context.size_usd);
+    const qty = await calcQtyReal(symbol, sizeUsd, lev, markPrice);
+    if (!qty) {
+      const decisionId = await persistDecision({
+        type: "open_hedge",
+        symbol,
+        context: { input: context, validation: null, bybitTestnet: isTestnet() },
+        verdict: "rejected",
+        thesis: String(context.razon),
+        executed: false,
+        executionError: "Tamaño insuficiente para min lot.",
+        latencyMs: Date.now() - t0,
+      });
+      return { ok: false, verdict: "rejected", side: hedgeSide, orderId: null, qty: null, reason: "Tamaño insuficiente para mínimo de Bybit.", decisionId };
+    }
+
+    await setLeverage(symbol, lev);
+    const orderResp = await placeMarketOrderDetailed(symbol, hedgeSide, qty, false, hedgeIdx);
+    const errMsg = orderResp.ok ? null : `Bybit retCode=${orderResp.retCode ?? "?"} ${orderResp.retMsg}`;
+    const decisionId = await persistDecision({
+      type: "open_hedge",
+      symbol,
+      context: { input: context, validation: null, bybitTestnet: isTestnet(), positionIdx: hedgeIdx },
+      verdict: orderResp.ok ? "executed" : "rejected",
+      thesis: String(context.razon),
+      executed: orderResp.ok,
+      executionError: errMsg,
+      latencyMs: Date.now() - t0,
+    });
+    return {
+      ok: orderResp.ok,
+      verdict: orderResp.ok ? "executed" : "rejected",
+      side: hedgeSide,
+      orderId: orderResp.ok ? orderResp.orderId : null,
+      qty,
+      reason: errMsg,
+      decisionId,
+    };
+  },
+});
+
+// ─── CAMBIAR MODO DE POSICIÓN (one-way ↔ hedge) ─────────────────────────────
+
+export const cambiarModoPosicion = createTool({
+  id: "cambiar_modo_posicion",
+  description:
+    "Cambia el modo de posición de un símbolo en Bybit. modo='hedge' permite long y short simultáneos en el mismo símbolo (necesario para hedge bidireccional). modo='one_way' solo permite una dirección. Bybit requiere que NO haya posiciones abiertas en el símbolo para cambiar.",
+  inputSchema: z.object({
+    symbol: symbolSchema,
+    modo: z.string().describe("'hedge' o 'one_way'"),
+    razon: z.string().min(5),
+  }),
+  outputSchema: z.object({
+    ok: z.boolean(),
+    verdict: z.string(),
+    modo: z.string(),
+    reason: z.string().nullable(),
+    decisionId: z.number().nullable(),
+  }),
+  execute: async (rawInput: unknown) => {
+    const context = (rawInput && typeof rawInput === "object" && "context" in rawInput && rawInput.context && typeof rawInput.context === "object")
+      ? (rawInput as { context: Record<string, unknown> }).context
+      : (rawInput as Record<string, unknown>);
+    const t0 = Date.now();
+    const modoStr = String(context.modo).toLowerCase();
+    const mode: 0 | 3 = modoStr === "hedge" ? 3 : 0;
+    const ok = await switchPositionMode(String(context.symbol), mode);
+    const decisionId = await persistDecision({
+      type: "switch_position_mode",
+      symbol: String(context.symbol),
+      context: { input: context, validation: null, bybitTestnet: isTestnet() },
+      verdict: ok ? "executed" : "rejected",
+      thesis: String(context.razon),
+      executed: ok,
+      executionError: ok ? null : "Bybit rechazó el cambio de modo (probablemente hay posiciones abiertas en el símbolo).",
+      latencyMs: Date.now() - t0,
+    });
+    return {
+      ok,
+      verdict: ok ? "executed" : "rejected",
+      modo: mode === 3 ? "hedge" : "one_way",
+      reason: ok ? null : "Bybit rechazó. Cierra todas las posiciones del símbolo antes de cambiar modo.",
+      decisionId,
+    };
+  },
+});
+
 export const bybitWriteTools = {
   abrirLong,
   abrirShort,
@@ -847,4 +1006,6 @@ export const bybitWriteTools = {
   moverStops,
   cancelarTodasOrdenes,
   cambiarLeverage,
+  abrirHedge,
+  cambiarModoPosicion,
 };
