@@ -40,6 +40,7 @@ import { bybitPublic } from "../../lib/bybit-auth";
 import {
   validateOrder,
   auditEvent,
+  getRules,
   type ValidationResult,
 } from "../../lib/governance";
 import {
@@ -60,6 +61,27 @@ import {
  * la limita; pedirle a Luis que diga "sí autorizo" cada trade era un freno
  * mío, no de la tesis.
  */
+/**
+ * Check de kill_switch antes de cualquier write. Si está activo, NO se ejecuta
+ * y se loggea el intento. Único freno restante (Luis: 'cero frenos. Excepto este botón').
+ */
+async function killSwitchBlocked(actor: string, action: string, symbol: string | null): Promise<string | null> {
+  try {
+    const r = await getRules({ force: true });
+    if (!r.kill_switch_global) return null;
+    await auditEvent({
+      actor,
+      action,
+      reason: `BLOCKED por kill_switch_global activo. symbol=${symbol ?? "n/a"}`,
+      blocked: true,
+    });
+    return "kill_switch_global=true. Luis activó el botón de pánico. NO se ejecuta nada hasta que lo desactive.";
+  } catch (e) {
+    console.error("[killSwitchBlocked] error leyendo governance:", e);
+    return null; // si falla la lectura, no bloqueamos (fail-open para no romper el flujo)
+  }
+}
+
 async function autonomyAllowsDirectExecution(): Promise<boolean> {
   try {
     const cfg = await getAutonomyConfig({ force: false });
@@ -652,6 +674,21 @@ export const cerrarPosicion = createTool({
       return { ok: false, verdict: "needs_confirmation", reason: "Confirmación humana requerida.", decisionId, needs_confirmation_text: previewText };
     }
 
+    const ksBlock = await killSwitchBlocked("tanit-agent", "close_position", String(context.symbol));
+    if (ksBlock) {
+      const decisionId = await persistDecision({
+        type: "close_position",
+        symbol: String(context.symbol),
+        context: { input: context, validation: null, bybitTestnet: isTestnet() },
+        verdict: "blocked",
+        thesis: String(context.razon),
+        executed: false,
+        executionError: ksBlock,
+        latencyMs: Date.now() - t0,
+      });
+      return { ok: false, verdict: "blocked", reason: ksBlock, decisionId };
+    }
+
     const result = await closePositionDetailed(context.symbol, direction, size, posIdx);
     if (result.ok) {
       alertTradeClosed({
@@ -725,6 +762,21 @@ export const moverStops = createTool({
     const pos = positions.find((p: any) => p.symbol === context.symbol && parseFloat(p.size ?? "0") > 0);
     const posIdx = pos != null && typeof pos.positionIdx === "number" ? pos.positionIdx : 0;
 
+    const ksBlock = await killSwitchBlocked("tanit-agent", "set_stops", String(context.symbol));
+    if (ksBlock) {
+      const decisionId = await persistDecision({
+        type: "set_stops",
+        symbol: String(context.symbol),
+        context: { input: context, validation: null, bybitTestnet: isTestnet() },
+        verdict: "blocked",
+        thesis: String(context.razon),
+        executed: false,
+        executionError: ksBlock,
+        latencyMs: Date.now() - t0,
+      });
+      return { ok: false, verdict: "blocked", reason: ksBlock, decisionId };
+    }
+
     const result = await setTradingStopDetailed(
       String(context.symbol),
       context.stop_loss as number | undefined,
@@ -781,6 +833,20 @@ export const cancelarTodasOrdenes = createTool({
       });
       return { ok: false, verdict: "needs_confirmation", cancelled: 0, decisionId, needs_confirmation_text: previewText };
     }
+    const ksBlock = await killSwitchBlocked("tanit-agent", "cancel_all", null);
+    if (ksBlock) {
+      const decisionId = await persistDecision({
+        type: "cancel_all",
+        symbol: null,
+        context: { input: context, validation: null, bybitTestnet: isTestnet() },
+        verdict: "blocked",
+        thesis: String(context.razon),
+        executed: false,
+        executionError: ksBlock,
+        latencyMs: Date.now() - t0,
+      });
+      return { ok: false, verdict: "blocked", cancelled: 0, decisionId, needs_confirmation_text: ksBlock };
+    }
     const n = await cancelAllOpenOrders();
     const decisionId = await persistDecision({
       type: "cancel_all",
@@ -819,6 +885,20 @@ export const cambiarLeverage = createTool({
       : (rawInput as Record<string, unknown>);
     const t0 = Date.now();
     const lev = typeof context.leverage === "number" ? context.leverage : parseInt(String(context.leverage), 10);
+    const ksBlock = await killSwitchBlocked("tanit-agent", "set_leverage", String(context.symbol));
+    if (ksBlock) {
+      const decisionId = await persistDecision({
+        type: "set_leverage",
+        symbol: String(context.symbol),
+        context: { input: context, validation: null, bybitTestnet: isTestnet() },
+        verdict: "blocked",
+        thesis: String(context.razon ?? ""),
+        executed: false,
+        executionError: ksBlock,
+        latencyMs: Date.now() - t0,
+      });
+      return { ok: false, verdict: "blocked", leverage: lev, reason: ksBlock, decisionId };
+    }
     const result = await setLeverageDetailed(String(context.symbol), lev);
     const errMsg = result.ok ? null : `Bybit retCode=${result.retCode ?? "?"} ${result.retMsg}`;
     const decisionId = await persistDecision({
@@ -868,6 +948,21 @@ export const abrirHedge = createTool({
       : (rawInput as Record<string, unknown>);
     const t0 = Date.now();
     const symbol = String(context.symbol);
+
+    const ksBlock = await killSwitchBlocked("tanit-agent", "open_hedge", symbol);
+    if (ksBlock) {
+      const decisionId = await persistDecision({
+        type: "open_hedge",
+        symbol,
+        context: { input: context, validation: null, bybitTestnet: isTestnet() },
+        verdict: "blocked",
+        thesis: String(context.razon),
+        executed: false,
+        executionError: ksBlock,
+        latencyMs: Date.now() - t0,
+      });
+      return { ok: false, verdict: "blocked", side: "", orderId: null, qty: null, reason: ksBlock, decisionId };
+    }
 
     const positions = await getOpenPositions();
     const existing = positions.find((p: any) => p.symbol === symbol && parseFloat(p.size ?? "0") > 0);
@@ -978,6 +1073,20 @@ export const cambiarModoPosicion = createTool({
     const t0 = Date.now();
     const modoStr = String(context.modo).toLowerCase();
     const mode: 0 | 3 = modoStr === "hedge" ? 3 : 0;
+    const ksBlock = await killSwitchBlocked("tanit-agent", "switch_position_mode", String(context.symbol));
+    if (ksBlock) {
+      const decisionId = await persistDecision({
+        type: "switch_position_mode",
+        symbol: String(context.symbol),
+        context: { input: context, validation: null, bybitTestnet: isTestnet() },
+        verdict: "blocked",
+        thesis: String(context.razon),
+        executed: false,
+        executionError: ksBlock,
+        latencyMs: Date.now() - t0,
+      });
+      return { ok: false, verdict: "blocked", modo: mode === 3 ? "hedge" : "one_way", reason: ksBlock, decisionId };
+    }
     const ok = await switchPositionMode(String(context.symbol), mode);
     const decisionId = await persistDecision({
       type: "switch_position_mode",

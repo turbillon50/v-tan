@@ -9,7 +9,7 @@
 import { Router } from "express";
 import { pool } from "@workspace/db";
 import { updateAutonomyConfig, getAutonomyConfig } from "../lib/autonomy";
-import { updateRule, getRules } from "../lib/governance";
+import { updateRule, getRules, setKillSwitch } from "../lib/governance";
 import { logger } from "../lib/logger";
 
 const router = Router();
@@ -366,6 +366,64 @@ router.post("/admin/sync-thesis", async (req, res): Promise<void> => {
     });
   } catch (e) {
     logger.error({ err: e }, "[admin] sync-thesis failed");
+    res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
+/**
+ * GET /admin/kill-switch
+ * Devuelve el estado actual del kill_switch_global. Sin auth — Luis lee.
+ */
+router.get("/admin/kill-switch", async (_req, res): Promise<void> => {
+  try {
+    const r = await getRules({ force: true });
+    res.json({
+      ok: true,
+      active: r.kill_switch_global,
+      updated_at: r.updated_at,
+      updated_by: r.updated_by,
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
+/**
+ * POST /admin/kill-switch
+ * body: { on: boolean, reason?: string, secret?: string }
+ *
+ * Activa o desactiva el kill_switch_global. Cuando está activo:
+ *  - validateOrder() rechaza TODA write (open/close/stops/leverage/hedge)
+ *  - autonomous-loop salta cada tick sin operar
+ *  - alerta a Telegram (alertKillSwitch)
+ *
+ * Único freno restante (Luis: 'cero frenos. Excepto este botón').
+ */
+router.post("/admin/kill-switch", async (req, res): Promise<void> => {
+  const body = (req.body ?? {}) as { on?: unknown; reason?: unknown; secret?: unknown };
+  const guard = requireAdmin(body.secret, req.headers.origin);
+  if (guard) {
+    res.status(403).json({ ok: false, error: guard });
+    return;
+  }
+  if (typeof body.on !== "boolean") {
+    res.status(400).json({ ok: false, error: "body.on debe ser boolean" });
+    return;
+  }
+  const reason = typeof body.reason === "string" && body.reason.length > 0
+    ? body.reason
+    : (body.on ? "Luis activó botón de pánico" : "Luis desactivó botón de pánico");
+  try {
+    await setKillSwitch({ on: body.on, actor: "luis-app", reason });
+    const after = await getRules({ force: true });
+    res.json({
+      ok: true,
+      active: after.kill_switch_global,
+      reason,
+      updated_at: after.updated_at,
+    });
+  } catch (e) {
+    logger.error({ err: e }, "[admin] kill-switch failed");
     res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
   }
 });
