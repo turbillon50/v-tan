@@ -7,6 +7,7 @@
  * desde la línea de comandos del operador, no desde el frontend.
  */
 import { Router } from "express";
+import { pool } from "@workspace/db";
 import { updateAutonomyConfig, getAutonomyConfig } from "../lib/autonomy";
 import { updateRule, getRules } from "../lib/governance";
 import { logger } from "../lib/logger";
@@ -238,6 +239,39 @@ router.get("/admin/autonomy", async (req, res): Promise<void> => {
   }
   const cfg = await getAutonomyConfig({ force: true });
   res.json({ ok: true, autonomy: cfg });
+});
+
+/**
+ * POST /admin/autonomy/resume
+ * Limpia paused_until + pause_reason. Útil cuando Tanit se autopausó
+ * por una razón que ya no aplica (ej. bug que ya fixeamos).
+ */
+router.post("/admin/autonomy/resume", async (req, res): Promise<void> => {
+  const body = (req.body ?? {}) as { secret?: unknown };
+  const guard = requireAdmin(body.secret, req.headers.origin);
+  if (guard) {
+    res.status(403).json({ ok: false, error: guard });
+    return;
+  }
+  try {
+    await pool.query(
+      `UPDATE tanit_autonomy_config
+          SET paused_until = NULL,
+              pause_reason = NULL,
+              updated_at = now(),
+              updated_by = 'luis-app-resume'
+        WHERE id = 1`,
+    );
+    await pool.query(
+      `INSERT INTO tanit_autonomy_audit (actor, event, detail)
+       VALUES ($1, 'RESUME', $2)`,
+      ["luis-app", JSON.stringify({ reason: "manual resume from app" })],
+    );
+    const after = await getAutonomyConfig({ force: true });
+    res.json({ ok: true, autonomy: after });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+  }
 });
 
 /**

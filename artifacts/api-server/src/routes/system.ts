@@ -35,7 +35,7 @@ const router = Router();
  */
 // Marker hardcoded para verificar qué build está corriendo en producción.
 // Cambiar este valor en cada deploy para confirmar que Railway tomó el código.
-const BUILD_MARKER = "v13-positionidx-retry-2026-05-08T23:00:00Z";
+const BUILD_MARKER = "v14-resume-endpoint-2026-05-08T23:30:00Z";
 
 router.get("/tanit/tools-registered", (_req, res): void => {
   const buckets: Record<string, string[]> = {
