@@ -302,17 +302,16 @@ router.post("/admin/sync-thesis", async (req, res): Promise<void> => {
     const govBefore = await getRules({ force: true });
     const autoBefore = await getAutonomyConfig({ force: true });
 
-    // Governance — valores fieles a la tesis 5.1.
-    // Único freno real: kill_switch_global (el botón de pánico). El resto
-    // son sentinelas para que la tabla acepte valores ('sin tope' real-real
-    // sería NULL en BD pero el schema espera number > 0).
+    // Governance — Luis: 'cero frenos, ni uno'. Único freno: kill_switch.
+    // Todos los caps a valores efectivamente infinitos para que la tabla
+    // acepte valores positivos pero nunca rechace algo en validateOrder.
     const govTargets: Array<[keyof typeof govBefore, number | string[] | string]> = [
-      ["max_leverage", 100], // techo absoluto que la tesis menciona
-      ["max_position_size_usd", 1000000], // efectivo sin tope $
-      ["max_daily_loss_usd", 1000000], // circuit breaker -10% lo maneja la tesis, no $
-      ["max_concurrent_positions", 50], // sin freno efectivo
-      ["allowed_symbols", []], // [] = todos los símbolos permitidos
-      ["require_approval_above_usd", 1000000], // nunca pide aprobación
+      ["max_leverage", 200], // Bybit max es 100x perps; 200 = sin freno mío
+      ["max_position_size_usd", 100_000_000], // sin tope efectivo
+      ["max_daily_loss_usd", 100_000_000], // sin freno
+      ["max_concurrent_positions", 1000], // sin freno
+      ["allowed_symbols", []], // todos
+      ["require_approval_above_usd", 100_000_000], // jamás pide aprobación
     ];
     for (const [field, value] of govTargets) {
       const prev = (govBefore as unknown as Record<string, unknown>)[field as string];
@@ -326,15 +325,16 @@ router.post("/admin/sync-thesis", async (req, res): Promise<void> => {
       changes.push({ field: `governance.${field as string}`, previous: prev, new_value: value });
     }
 
-    // Autonomy — Tanit decide leverage gradual; quitamos topes míos
+    // Autonomy — cero frenos. Tanit es libre. Tesis es la única regla y la
+    // ejecuta ella, no governance.
     const autoTargets: Array<[Parameters<typeof updateAutonomyConfig>[0]["field"], number | string | boolean]> = [
       ["mode", "execute_with_governance"],
       ["enabled", true],
-      ["max_autonomous_size_usd", 100000], // sin tope $; gradual la maneja la tesis
-      ["max_autonomous_leverage", 100], // techo de la tesis
-      ["max_daily_trades", 10], // tesis dice ~3 expected, dejamos margen sano
-      ["cooldown_minutes_between_trades", 15],
-      ["require_thesis_citation", true], // la tesis SÍ exige citar el motor
+      ["max_autonomous_size_usd", 100_000_000],
+      ["max_autonomous_leverage", 200],
+      ["max_daily_trades", 10000],
+      ["cooldown_minutes_between_trades", 0],
+      ["require_thesis_citation", false],
     ];
     for (const [field, value] of autoTargets) {
       const prev = (autoBefore as unknown as Record<string, unknown>)[field as string];

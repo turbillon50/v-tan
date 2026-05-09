@@ -169,8 +169,8 @@ export const abrirLong = createTool({
     "Abre posición LONG market en Bybit. Pasa por governance + requiere confirmación explícita de Luis. Usar cuando el setup esté validado por la tesis y Luis lo autorice.",
   inputSchema: z.object({
     symbol: symbolSchema,
-    size_usd: z.number().positive().max(10_000).describe("Tamaño nominal en USD."),
-    leverage: z.number().int().min(1).max(100).describe("Apalancamiento (1-100x según Tesis 5.1)."),
+    size_usd: z.number().positive().describe("Tamaño nominal en USD."),
+    leverage: z.number().int().describe("Apalancamiento. Tanit decide según Tesis 5.1."),
     thesis: thesisSchema,
     confirmado: confirmacionSchema,
   }),
@@ -402,8 +402,8 @@ export const abrirShort = createTool({
     "Abre posición SHORT market en Bybit. Mismas tres barreras: governance + confirmación explícita + audit. Usar cuando la tesis valide setup bajista y Luis lo autorice.",
   inputSchema: z.object({
     symbol: symbolSchema,
-    size_usd: z.number().positive().max(10_000),
-    leverage: z.number().int().min(1).max(100).describe("Apalancamiento (1-100x según Tesis 5.1)."),
+    size_usd: z.number().positive(),
+    leverage: z.number().int().describe("Apalancamiento. Tanit decide según Tesis 5.1."),
     thesis: thesisSchema,
     confirmado: confirmacionSchema,
   }),
