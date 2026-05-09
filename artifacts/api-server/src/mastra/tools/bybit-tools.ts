@@ -542,10 +542,10 @@ export const backtestTesis = createTool({
     candles: z
       .number()
       .int()
-      .min(50)
+      .min(220)
       .max(1000)
       .default(500)
-      .describe("Cuántas velas históricas analizar"),
+      .describe("Cuántas velas históricas analizar (mínimo 220 para EMA200)"),
     initialCapital: z.number().positive().default(45),
     riskPctPerTrade: z
       .number()
@@ -899,10 +899,10 @@ export const backtestInteligente = createTool({
     candlesBack: z
       .number()
       .int()
-      .min(120)
+      .min(220)
       .max(1000)
       .default(300)
-      .describe("Cuántas velas históricas analizar"),
+      .describe("Cuántas velas históricas analizar (mínimo 220 para EMA200)"),
     decisionEvery: z
       .number()
       .int()
