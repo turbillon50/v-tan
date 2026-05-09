@@ -18,7 +18,6 @@ import { breakTools } from "./tools/break-tools";
 import { autonomyTools } from "./tools/autonomy-tools";
 import { memoryTools } from "./tools/memory-tools";
 import { selfEditTools } from "./tools/self-edit-tools";
-import { devopsTools } from "./tools/devops-tools";
 
 const GEMINI_API_KEY = process.env["GEMINI_API_KEY"];
 const DATABASE_URL = process.env["DATABASE_URL"];
@@ -87,7 +86,6 @@ export const tanitAgent = new Agent({
     ...autonomyTools,
     ...memoryTools,
     ...selfEditTools,
-    ...devopsTools,
   },
   instructions: async () => {
     const ctx = await loadBootstrap();

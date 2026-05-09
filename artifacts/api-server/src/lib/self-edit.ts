@@ -33,10 +33,6 @@ const BLACKLIST_EXACT = new Set<string>([
   // Su propia capacidad de auto-editar (no se desconecta sola)
   "artifacts/api-server/src/lib/self-edit.ts",
   "artifacts/api-server/src/mastra/tools/self-edit-tools.ts",
-  // DevOps clients (controlan Railway/Vercel — no se autosabotea)
-  "artifacts/api-server/src/lib/railway.ts",
-  "artifacts/api-server/src/lib/vercel.ts",
-  "artifacts/api-server/src/mastra/tools/devops-tools.ts",
   // El agent core (su esqueleto)
   "artifacts/api-server/src/mastra/agent-tanit.ts",
   "artifacts/api-server/src/mastra/index.ts",
