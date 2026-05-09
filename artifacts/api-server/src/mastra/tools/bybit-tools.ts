@@ -375,192 +375,140 @@ export const leerVelas = createTool({
 
 // ─── ESTRUCTURA TÉCNICA (resumen calculado) ──────────────────────────────────
 //
-// En lugar de pedirle a Tanit que cargue 200 velas y compute todo desde cero
-// cada vez, esta tool devuelve un resumen pre-calculado: EMAs, RSI, swing
-// highs/lows, volumen actual vs promedio, body/wick ratio. Le ahorra ciclos
-// y le da datos LIMPIOS para razonar.
+// VERSIÓN APLANADA: cero objetos anidados, cero defaults, cero optionals.
+// Schemas mínimos para evitar 'path4.includes is not a function' del
+// converter zod-to-json-schema. Todos los campos siempre presentes con
+// valores numéricos (0 cuando no aplica). String 'ok' o 'error: msg'.
 export const leerEstructuraTecnica = createTool({
   id: "leer_estructura_tecnica",
   description:
-    "Lee estructura técnica resumida de un símbolo en un timeframe: EMAs (20/50/200), RSI(14), volumen actual vs promedio 20, swing highs/lows recientes, body/wick ratio de la última vela cerrada. Útil para confirmar momentum y estructura sin cargar todas las velas crudas.",
+    "Lee estructura técnica de un símbolo en un timeframe. Devuelve EMAs (20/50/200), RSI(14), volRatio, swingHigh/Low de últimas 50 velas, body% y wicks de la última vela, y structure (bullish/bearish/range). interval admite '5'/'15'/'60'/'240'/'D'.",
   inputSchema: z.object({
     symbol: z.string(),
-    interval: z
-      .string()
-      .default("240")
-      .describe("'5'=5m, '15'=15m, '60'=1h, '240'=4h, 'D'=diario"),
+    interval: z.string(),
   }),
   outputSchema: z.object({
-    ok: z.boolean(),
+    status: z.string(),
     symbol: z.string(),
     interval: z.string(),
-    last: z
-      .object({
-        time: z.number(),
-        open: z.number(),
-        high: z.number(),
-        low: z.number(),
-        close: z.number(),
-        volume: z.number(),
-        bodyPct: z.number(),
-        upperWickPct: z.number(),
-        lowerWickPct: z.number(),
-      })
-      .optional(),
-    ema20: z.number().optional(),
-    ema50: z.number().optional(),
-    ema200: z.number().optional(),
-    rsi14: z.number().optional(),
-    volRatio: z.number().optional(),
-    swingHigh: z
-      .object({ price: z.number(), barsAgo: z.number() })
-      .optional(),
-    swingLow: z
-      .object({ price: z.number(), barsAgo: z.number() })
-      .optional(),
-    structure: z.string().optional(),
-    error: z.string().optional(),
+    lastClose: z.number(),
+    lastVolume: z.number(),
+    bodyPct: z.number(),
+    upperWickPct: z.number(),
+    lowerWickPct: z.number(),
+    ema20: z.number(),
+    ema50: z.number(),
+    ema200: z.number(),
+    rsi14: z.number(),
+    volRatio: z.number(),
+    swingHighPrice: z.number(),
+    swingHighBarsAgo: z.number(),
+    swingLowPrice: z.number(),
+    swingLowBarsAgo: z.number(),
+    structure: z.string(),
   }),
   execute: async (rawInput: unknown) => {
     const ctx = (rawInput && typeof rawInput === "object" && "context" in rawInput
       ? (rawInput as { context: { symbol: string; interval: string } }).context
       : (rawInput as { symbol: string; interval: string }));
+    const symbol = ctx.symbol ?? "BTCUSDT";
+    const interval = ctx.interval ?? "240";
+    const empty = {
+      status: "error: no data",
+      symbol, interval,
+      lastClose: 0, lastVolume: 0, bodyPct: 0, upperWickPct: 0, lowerWickPct: 0,
+      ema20: 0, ema50: 0, ema200: 0, rsi14: 0, volRatio: 0,
+      swingHighPrice: 0, swingHighBarsAgo: 0,
+      swingLowPrice: 0, swingLowBarsAgo: 0,
+      structure: "unknown",
+    };
     try {
       const data = await bybitPublic("/v5/market/kline", {
         category: "linear",
-        symbol: ctx.symbol,
-        interval: ctx.interval,
+        symbol,
+        interval,
         limit: "210",
       });
       const list = (data?.result?.list ?? []) as string[][];
-      const candles = list
-        .slice()
-        .reverse()
-        .map((c) => ({
-          time: Math.floor(parseInt(c[0]!, 10) / 1000),
-          open: parseFloat(c[1]!),
-          high: parseFloat(c[2]!),
-          low: parseFloat(c[3]!),
-          close: parseFloat(c[4]!),
-          volume: parseFloat(c[5]!),
-        }));
-      if (candles.length < 20) {
-        return {
-          ok: false,
-          symbol: ctx.symbol,
-          interval: ctx.interval,
-          error: "no hay suficientes velas para análisis",
-        };
-      }
+      const candles = list.slice().reverse().map((c) => ({
+        time: Math.floor(parseInt(c[0]!, 10) / 1000),
+        open: parseFloat(c[1]!),
+        high: parseFloat(c[2]!),
+        low: parseFloat(c[3]!),
+        close: parseFloat(c[4]!),
+        volume: parseFloat(c[5]!),
+      }));
+      if (candles.length < 20) return { ...empty, status: "error: pocas velas" };
+
       const closes = candles.map((c) => c.close);
       const last = candles[candles.length - 1]!;
       const range = Math.max(0.0000001, last.high - last.low);
       const bodyPct = (Math.abs(last.close - last.open) / range) * 100;
-      const upperWickPct =
-        ((last.high - Math.max(last.open, last.close)) / range) * 100;
-      const lowerWickPct =
-        ((Math.min(last.open, last.close) - last.low) / range) * 100;
+      const upperWickPct = ((last.high - Math.max(last.open, last.close)) / range) * 100;
+      const lowerWickPct = ((Math.min(last.open, last.close) - last.low) / range) * 100;
 
-      const ema = (arr: number[], period: number): number | null => {
-        if (arr.length < period) return null;
+      const ema = (period: number): number => {
+        if (closes.length < period) return 0;
         const k = 2 / (period + 1);
-        let val = arr.slice(0, period).reduce((a, b) => a + b, 0) / period;
-        for (let i = period; i < arr.length; i++) {
-          val = arr[i]! * k + val * (1 - k);
-        }
-        return val;
+        let v = closes.slice(0, period).reduce((a, b) => a + b, 0) / period;
+        for (let i = period; i < closes.length; i++) v = closes[i]! * k + v * (1 - k);
+        return v;
       };
-      const ema20 = ema(closes, 20);
-      const ema50 = ema(closes, 50);
-      const ema200 = ema(closes, 200);
+      const ema20 = ema(20), ema50 = ema(50), ema200 = ema(200);
 
-      // RSI(14)
-      const rsi = (arr: number[], period = 14): number | null => {
-        if (arr.length < period + 1) return null;
-        let gains = 0;
-        let losses = 0;
+      const rsi = (period = 14): number => {
+        if (closes.length < period + 1) return 0;
+        let g = 0, l = 0;
         for (let i = 1; i <= period; i++) {
-          const d = arr[i]! - arr[i - 1]!;
-          if (d >= 0) gains += d;
-          else losses -= d;
+          const d = closes[i]! - closes[i - 1]!;
+          if (d >= 0) g += d; else l -= d;
         }
-        let avgG = gains / period;
-        let avgL = losses / period;
-        for (let i = period + 1; i < arr.length; i++) {
-          const d = arr[i]! - arr[i - 1]!;
+        let avgG = g / period, avgL = l / period;
+        for (let i = period + 1; i < closes.length; i++) {
+          const d = closes[i]! - closes[i - 1]!;
           avgG = (avgG * (period - 1) + Math.max(d, 0)) / period;
           avgL = (avgL * (period - 1) + Math.max(-d, 0)) / period;
         }
         if (avgL === 0) return 100;
-        const rs = avgG / avgL;
-        return 100 - 100 / (1 + rs);
+        return 100 - 100 / (1 + avgG / avgL);
       };
-      const rsi14 = rsi(closes, 14);
+      const rsi14 = rsi(14);
 
-      // Volumen ratio
       const recentVol = candles.slice(-20).reduce((s, c) => s + c.volume, 0) / 20;
-      const volRatio = recentVol > 0 ? last.volume / recentVol : null;
+      const volRatio = recentVol > 0 ? last.volume / recentVol : 0;
 
-      // Swing high / low en últimas 50 velas
       const swingWindow = candles.slice(-50);
-      let highIdx = 0;
-      let lowIdx = 0;
+      let hi = 0, lo = 0;
       for (let i = 1; i < swingWindow.length; i++) {
-        if (swingWindow[i]!.high > swingWindow[highIdx]!.high) highIdx = i;
-        if (swingWindow[i]!.low < swingWindow[lowIdx]!.low) lowIdx = i;
+        if (swingWindow[i]!.high > swingWindow[hi]!.high) hi = i;
+        if (swingWindow[i]!.low < swingWindow[lo]!.low) lo = i;
       }
-      const swingHigh = {
-        price: swingWindow[highIdx]!.high,
-        barsAgo: swingWindow.length - 1 - highIdx,
-      };
-      const swingLow = {
-        price: swingWindow[lowIdx]!.low,
-        barsAgo: swingWindow.length - 1 - lowIdx,
-      };
 
-      // Estructura por EMAs
-      let structure: "bullish" | "bearish" | "range" | "unknown" = "unknown";
-      if (ema20 != null && ema50 != null && ema200 != null) {
-        if (ema20 > ema50 && ema50 > ema200 && last.close > ema20) {
-          structure = "bullish";
-        } else if (ema20 < ema50 && ema50 < ema200 && last.close < ema20) {
-          structure = "bearish";
-        } else {
-          structure = "range";
-        }
-      }
+      let structure = "range";
+      if (ema20 > ema50 && ema50 > ema200 && last.close > ema20) structure = "bullish";
+      else if (ema20 < ema50 && ema50 < ema200 && last.close < ema20) structure = "bearish";
 
       return {
-        ok: true,
-        symbol: ctx.symbol,
-        interval: ctx.interval,
-        last: {
-          time: last.time,
-          open: last.open,
-          high: last.high,
-          low: last.low,
-          close: last.close,
-          volume: last.volume,
-          bodyPct: parseFloat(bodyPct.toFixed(2)),
-          upperWickPct: parseFloat(upperWickPct.toFixed(2)),
-          lowerWickPct: parseFloat(lowerWickPct.toFixed(2)),
-        },
-        ema20,
-        ema50,
-        ema200,
-        rsi14,
-        volRatio: volRatio != null ? parseFloat(volRatio.toFixed(2)) : null,
-        swingHigh,
-        swingLow,
+        status: "ok",
+        symbol, interval,
+        lastClose: last.close,
+        lastVolume: last.volume,
+        bodyPct: parseFloat(bodyPct.toFixed(2)),
+        upperWickPct: parseFloat(upperWickPct.toFixed(2)),
+        lowerWickPct: parseFloat(lowerWickPct.toFixed(2)),
+        ema20: parseFloat(ema20.toFixed(2)),
+        ema50: parseFloat(ema50.toFixed(2)),
+        ema200: parseFloat(ema200.toFixed(2)),
+        rsi14: parseFloat(rsi14.toFixed(2)),
+        volRatio: parseFloat(volRatio.toFixed(2)),
+        swingHighPrice: swingWindow[hi]!.high,
+        swingHighBarsAgo: swingWindow.length - 1 - hi,
+        swingLowPrice: swingWindow[lo]!.low,
+        swingLowBarsAgo: swingWindow.length - 1 - lo,
         structure,
       };
     } catch (e) {
-      return {
-        ok: false,
-        symbol: ctx.symbol,
-        interval: ctx.interval,
-        error: e instanceof Error ? e.message : String(e),
-      };
+      return { ...empty, status: `error: ${e instanceof Error ? e.message : String(e)}` };
     }
   },
 });
@@ -1388,76 +1336,65 @@ export const backtestInteligente = createTool({
 // Bybit guarda el historial completo de funding por símbolo. Tanit lo usa para
 // detectar overcrowded longs (funding muy positivo persistente = estado caro
 // que suele revertir) o overcrowded shorts (negativo = compresión).
+// VERSIÓN APLANADA: en lugar de array de objects (que rompe converter),
+// devolvemos las series como JSON string + los agregados ya calculados.
+// Tanit puede parsear el JSON si quiere los puntos individuales.
 export const leerFundingHistorico = createTool({
   id: "leer_funding_historico",
   description:
-    "Lee el historial de funding rate de un símbolo en Bybit. Útil para detectar overcrowded longs/shorts (Wyckoff, contrarian setups, fade extremos).",
+    "Lee historial de funding rate de un símbolo en Bybit. Devuelve agregados (avg7d, avg30d, último) + serie completa como JSON string parseable. Detecta overcrowded longs/shorts. limit típico 30-100.",
   inputSchema: z.object({
     symbol: z.string(),
-    limit: z.number().int().min(1).max(200).default(50),
+    limit: z.number().int(),
   }),
   outputSchema: z.object({
-    ok: z.boolean(),
+    status: z.string(),
     symbol: z.string(),
     count: z.number(),
-    rates: z.array(
-      z.object({
-        time: z.string(),
-        fundingRate: z.number().describe("rate como fracción (ej. 0.0001 = 0.01%)"),
-        fundingRatePct: z.number().describe("rate como % (ej. 0.01)"),
-      }),
-    ),
-    avg7d: z.number().optional(),
-    avg30d: z.number().optional(),
-    error: z.string().optional(),
+    latestRate: z.number(),
+    latestRatePct: z.number(),
+    avg7d: z.number(),
+    avg30d: z.number(),
+    avgAllPct: z.number(),
+    seriesJson: z.string(),
   }),
   execute: async (rawInput: unknown) => {
     const ctx = (rawInput && typeof rawInput === "object" && "context" in rawInput
       ? (rawInput as { context: any }).context
       : (rawInput as any)) as { symbol: string; limit: number };
+    const symbol = ctx.symbol ?? "BTCUSDT";
+    const limit = Math.max(1, Math.min(200, ctx.limit ?? 50));
+    const empty = {
+      status: "error: no data", symbol, count: 0,
+      latestRate: 0, latestRatePct: 0,
+      avg7d: 0, avg30d: 0, avgAllPct: 0, seriesJson: "[]",
+    };
     try {
       const r = await bybitPublic("/v5/market/funding/history", {
-        category: "linear",
-        symbol: ctx.symbol,
-        limit: String(ctx.limit),
+        category: "linear", symbol, limit: String(limit),
       });
-      const list = (r?.result?.list ?? []) as Array<{
-        symbol: string;
-        fundingRate: string;
-        fundingRateTimestamp: string;
-      }>;
-      const rates = list
-        .slice()
-        .reverse()
-        .map((x) => ({
-          time: new Date(parseInt(x.fundingRateTimestamp, 10)).toISOString(),
-          fundingRate: parseFloat(x.fundingRate),
-          fundingRatePct: parseFloat(x.fundingRate) * 100,
-        }));
-      const last7 = rates.slice(-21); // 21 funding events ≈ 7 días (3 por día)
+      const list = (r?.result?.list ?? []) as Array<{ fundingRate: string; fundingRateTimestamp: string }>;
+      const rates = list.slice().reverse().map((x) => ({
+        t: new Date(parseInt(x.fundingRateTimestamp, 10)).toISOString().slice(0, 16),
+        r: parseFloat(x.fundingRate),
+      }));
+      if (rates.length === 0) return empty;
+      const last7 = rates.slice(-21);
       const last30 = rates.slice(-90);
-      const avg7d = last7.length
-        ? last7.reduce((s, r) => s + r.fundingRate, 0) / last7.length
-        : null;
-      const avg30d = last30.length
-        ? last30.reduce((s, r) => s + r.fundingRate, 0) / last30.length
-        : null;
+      const avg7d = last7.reduce((s, x) => s + x.r, 0) / last7.length;
+      const avg30d = last30.reduce((s, x) => s + x.r, 0) / last30.length;
+      const avgAll = rates.reduce((s, x) => s + x.r, 0) / rates.length;
+      const latest = rates[rates.length - 1]!;
       return {
-        ok: true,
-        symbol: ctx.symbol,
-        count: rates.length,
-        rates,
-        avg7d,
-        avg30d,
+        status: "ok", symbol, count: rates.length,
+        latestRate: latest.r,
+        latestRatePct: latest.r * 100,
+        avg7d, avg30d,
+        avgAllPct: avgAll * 100,
+        seriesJson: JSON.stringify(rates),
       };
     } catch (e) {
-      return {
-        ok: false,
-        symbol: ctx.symbol,
-        count: 0,
-        rates: [],
-        error: e instanceof Error ? e.message : String(e),
-      };
+      return { ...empty, status: `error: ${e instanceof Error ? e.message : String(e)}` };
     }
   },
 });
@@ -1471,80 +1408,56 @@ export const leerOpenInterestHistorico = createTool({
     "Lee histórico de Open Interest (cantidad de contratos abiertos) de un símbolo en Bybit. Confirmación Wyckoff y detección de squeezes.",
   inputSchema: z.object({
     symbol: z.string(),
-    intervalTime: z
-      .string()
-      .default("4h")
-      .describe("válidos: '5min', '15min', '30min', '1h', '4h', '1d'"),
-    limit: z.number().int().min(1).max(200).default(50),
+    intervalTime: z.string(),
+    limit: z.number().int(),
   }),
   outputSchema: z.object({
-    ok: z.boolean(),
+    status: z.string(),
     symbol: z.string(),
     intervalTime: z.string(),
     count: z.number(),
-    series: z.array(
-      z.object({
-        time: z.string(),
-        openInterest: z.number(),
-      }),
-    ),
-    delta24h: z.number().optional(),
-    delta7d: z.number().optional(),
-    error: z.string().optional(),
+    latestOI: z.number(),
+    delta24hPct: z.number(),
+    delta7dPct: z.number(),
+    seriesJson: z.string(),
   }),
   execute: async (rawInput: unknown) => {
     const ctx = (rawInput && typeof rawInput === "object" && "context" in rawInput
       ? (rawInput as { context: any }).context
       : (rawInput as any)) as { symbol: string; intervalTime: string; limit: number };
+    const symbol = ctx.symbol ?? "BTCUSDT";
+    const intervalTime = ctx.intervalTime ?? "4h";
+    const limit = Math.max(1, Math.min(200, ctx.limit ?? 50));
+    const empty = {
+      status: "error: no data", symbol, intervalTime, count: 0,
+      latestOI: 0, delta24hPct: 0, delta7dPct: 0, seriesJson: "[]",
+    };
     try {
       const r = await bybitPublic("/v5/market/open-interest", {
-        category: "linear",
-        symbol: ctx.symbol,
-        intervalTime: ctx.intervalTime,
-        limit: String(ctx.limit),
+        category: "linear", symbol, intervalTime, limit: String(limit),
       });
-      const list = (r?.result?.list ?? []) as Array<{
-        openInterest: string;
-        timestamp: string;
-      }>;
-      const series = list
-        .slice()
-        .reverse()
-        .map((x) => ({
-          time: new Date(parseInt(x.timestamp, 10)).toISOString(),
-          openInterest: parseFloat(x.openInterest),
-        }));
-      const last = series[series.length - 1];
-      const buckets24h = ctx.intervalTime === "4h" ? 6 : ctx.intervalTime === "1h" ? 24 : 1;
+      const list = (r?.result?.list ?? []) as Array<{ openInterest: string; timestamp: string }>;
+      const series = list.slice().reverse().map((x) => ({
+        t: new Date(parseInt(x.timestamp, 10)).toISOString().slice(0, 16),
+        oi: parseFloat(x.openInterest),
+      }));
+      if (series.length === 0) return empty;
+      const last = series[series.length - 1]!;
+      const buckets24h = intervalTime === "4h" ? 6 : intervalTime === "1h" ? 24 : 1;
       const buckets7d = buckets24h * 7;
       const ref24h = series[Math.max(0, series.length - 1 - buckets24h)];
       const ref7d = series[Math.max(0, series.length - 1 - buckets7d)];
-      const delta24h =
-        last && ref24h && ref24h.openInterest > 0
-          ? ((last.openInterest - ref24h.openInterest) / ref24h.openInterest) * 100
-          : null;
-      const delta7d =
-        last && ref7d && ref7d.openInterest > 0
-          ? ((last.openInterest - ref7d.openInterest) / ref7d.openInterest) * 100
-          : null;
+      const d24 = ref24h && ref24h.oi > 0 ? ((last.oi - ref24h.oi) / ref24h.oi) * 100 : 0;
+      const d7 = ref7d && ref7d.oi > 0 ? ((last.oi - ref7d.oi) / ref7d.oi) * 100 : 0;
       return {
-        ok: true,
-        symbol: ctx.symbol,
-        intervalTime: ctx.intervalTime,
-        count: series.length,
-        series,
-        delta24h: delta24h != null ? parseFloat(delta24h.toFixed(2)) : null,
-        delta7d: delta7d != null ? parseFloat(delta7d.toFixed(2)) : null,
+        status: "ok", symbol, intervalTime, count: series.length,
+        latestOI: last.oi,
+        delta24hPct: parseFloat(d24.toFixed(2)),
+        delta7dPct: parseFloat(d7.toFixed(2)),
+        seriesJson: JSON.stringify(series),
       };
     } catch (e) {
-      return {
-        ok: false,
-        symbol: ctx.symbol,
-        intervalTime: ctx.intervalTime,
-        count: 0,
-        series: [],
-        error: e instanceof Error ? e.message : String(e),
-      };
+      return { ...empty, status: `error: ${e instanceof Error ? e.message : String(e)}` };
     }
   },
 });
@@ -1557,102 +1470,67 @@ export const leerOrderbookProfundo = createTool({
     "Lee orderbook profundo (hasta 200 niveles bid/ask). Detecta paredes de liquidez, depth imbalance, spoofing potencial.",
   inputSchema: z.object({
     symbol: z.string(),
-    levels: z.number().int().min(25).max(200).default(50),
+    levels: z.number().int(),
   }),
   outputSchema: z.object({
-    ok: z.boolean(),
+    status: z.string(),
     symbol: z.string(),
-    bids: z.array(z.object({ price: z.number(), size: z.number() })),
-    asks: z.array(z.object({ price: z.number(), size: z.number() })),
+    bestBid: z.number(),
+    bestAsk: z.number(),
+    spread: z.number(),
     bidTotal: z.number(),
     askTotal: z.number(),
-    imbalance: z.number().describe("ratio bidTotal/askTotal — >1 más bids"),
-    bestBid: z.number().optional(),
-    bestAsk: z.number().optional(),
-    spread: z.number().optional(),
-    biggestBidWall: z.object({ price: z.number(), size: z.number() }).optional(),
-    biggestAskWall: z.object({ price: z.number(), size: z.number() }).optional(),
-    error: z.string().optional(),
+    imbalance: z.number(),
+    biggestBidWallPrice: z.number(),
+    biggestBidWallSize: z.number(),
+    biggestAskWallPrice: z.number(),
+    biggestAskWallSize: z.number(),
+    bidsJson: z.string(),
+    asksJson: z.string(),
   }),
   execute: async (rawInput: unknown) => {
     const ctx = (rawInput && typeof rawInput === "object" && "context" in rawInput
       ? (rawInput as { context: any }).context
       : (rawInput as any)) as { symbol: string; levels: number };
+    const symbol = ctx.symbol ?? "BTCUSDT";
+    const levels = Math.max(25, Math.min(200, ctx.levels ?? 50));
+    const empty = {
+      status: "error: no data", symbol,
+      bestBid: 0, bestAsk: 0, spread: 0, bidTotal: 0, askTotal: 0, imbalance: 0,
+      biggestBidWallPrice: 0, biggestBidWallSize: 0,
+      biggestAskWallPrice: 0, biggestAskWallSize: 0,
+      bidsJson: "[]", asksJson: "[]",
+    };
     try {
       const r = await bybitPublic("/v5/market/orderbook", {
-        category: "linear",
-        symbol: ctx.symbol,
-        limit: String(ctx.levels),
+        category: "linear", symbol, limit: String(levels),
       });
       const ob = r?.result;
-      if (!ob || !ob.b || !ob.a) {
-        return {
-          ok: false,
-          symbol: ctx.symbol,
-          bids: [],
-          asks: [],
-          bidTotal: 0,
-          askTotal: 0,
-          imbalance: 0,
-          bestBid: null,
-          bestAsk: null,
-          spread: null,
-          biggestBidWall: null,
-          biggestAskWall: null,
-          error: "Bybit no devolvió orderbook",
-        };
-      }
-      const bids = (ob.b as string[][]).map((x) => ({
-        price: parseFloat(x[0]!),
-        size: parseFloat(x[1]!),
-      }));
-      const asks = (ob.a as string[][]).map((x) => ({
-        price: parseFloat(x[0]!),
-        size: parseFloat(x[1]!),
-      }));
+      if (!ob || !ob.b || !ob.a) return empty;
+      const bids = (ob.b as string[][]).map((x) => ({ price: parseFloat(x[0]!), size: parseFloat(x[1]!) }));
+      const asks = (ob.a as string[][]).map((x) => ({ price: parseFloat(x[0]!), size: parseFloat(x[1]!) }));
       const bidTotal = bids.reduce((s, b) => s + b.size, 0);
       const askTotal = asks.reduce((s, a) => s + a.size, 0);
-      const bestBid = bids[0]?.price ?? null;
-      const bestAsk = asks[0]?.price ?? null;
-      const spread = bestBid && bestAsk ? bestAsk - bestBid : null;
-      const biggestBidWall = bids.reduce<{ price: number; size: number } | null>(
-        (max, b) => (!max || b.size > max.size ? b : max),
-        null,
-      );
-      const biggestAskWall = asks.reduce<{ price: number; size: number } | null>(
-        (max, a) => (!max || a.size > max.size ? a : max),
-        null,
-      );
+      const bestBid = bids[0]?.price ?? 0;
+      const bestAsk = asks[0]?.price ?? 0;
+      const spread = bestBid && bestAsk ? bestAsk - bestBid : 0;
+      const bidWall = bids.reduce((max, b) => (b.size > max.size ? b : max), { price: 0, size: 0 });
+      const askWall = asks.reduce((max, a) => (a.size > max.size ? a : max), { price: 0, size: 0 });
       return {
-        ok: true,
-        symbol: ctx.symbol,
-        bids,
-        asks,
+        status: "ok", symbol,
+        bestBid, bestAsk, spread,
         bidTotal: parseFloat(bidTotal.toFixed(4)),
         askTotal: parseFloat(askTotal.toFixed(4)),
         imbalance: askTotal > 0 ? parseFloat((bidTotal / askTotal).toFixed(3)) : 0,
-        bestBid,
-        bestAsk,
-        spread,
-        biggestBidWall,
-        biggestAskWall,
+        biggestBidWallPrice: bidWall.price,
+        biggestBidWallSize: bidWall.size,
+        biggestAskWallPrice: askWall.price,
+        biggestAskWallSize: askWall.size,
+        bidsJson: JSON.stringify(bids.slice(0, 20)),
+        asksJson: JSON.stringify(asks.slice(0, 20)),
       };
     } catch (e) {
-      return {
-        ok: false,
-        symbol: ctx.symbol,
-        bids: [],
-        asks: [],
-        bidTotal: 0,
-        askTotal: 0,
-        imbalance: 0,
-        bestBid: null,
-        bestAsk: null,
-        spread: null,
-        biggestBidWall: null,
-        biggestAskWall: null,
-        error: e instanceof Error ? e.message : String(e),
-      };
+      return { ...empty, status: `error: ${e instanceof Error ? e.message : String(e)}` };
     }
   },
 });
