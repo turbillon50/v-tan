@@ -783,39 +783,72 @@ export const backtestTesis = createTool({
         if (!pos) {
           const e20 = ema(20, i);
           const e50 = ema(50, i);
-          const e200 = ema(200, i);
-          if (e20 == null || e50 == null || e200 == null) continue;
+          if (e20 == null || e50 == null) continue;
           const r = rsi(i);
           if (r == null) continue;
           const vol = avgVol20(i);
           if (vol === 0) continue;
           const volRatio = c.volume / vol;
-          if (volRatio < 1.0) continue;
 
-          const bullish = e20 > e50 && e50 > e200 && c.close > e20;
-          const bearish = e20 < e50 && e50 < e200 && c.close < e20;
-
-          if (allowLong && bullish && r >= 40 && r <= 70) {
-            const sl = swingLow(i, 20);
-            if (sl >= c.close) continue; // SL inválido
+          // Helper para abrir posición con SL del swing y TP por RR 1:2
+          const openLong = (slOverride?: number) => {
+            const sl = slOverride ?? swingLow(i, 20);
+            if (sl >= c.close) return false;
             const risk = c.close - sl;
             const tp = c.close + 2 * risk;
             const riskUsd = (equity * ctx.riskPctPerTrade) / 100;
-            const sizeUsdNotional = (riskUsd / (risk / c.close)) * 1; // notional = riskUsd / riskFraction
-            // Cap notional por leverage
-            const maxNotional = equity * ctx.leverage;
-            const notional = Math.min(sizeUsdNotional, maxNotional);
+            const notional = Math.min(riskUsd / (risk / c.close), equity * ctx.leverage);
             pos = { side: "long", entryIdx: i, entryPrice: c.close, sl, tp, sizeUsdNotional: notional };
-          } else if (allowShort && bearish && r >= 30 && r <= 60) {
-            const sl = swingHigh(i, 20);
-            if (sl <= c.close) continue;
+            return true;
+          };
+          const openShort = (slOverride?: number) => {
+            const sl = slOverride ?? swingHigh(i, 20);
+            if (sl <= c.close) return false;
             const risk = sl - c.close;
             const tp = c.close - 2 * risk;
             const riskUsd = (equity * ctx.riskPctPerTrade) / 100;
-            const sizeUsdNotional = (riskUsd / (risk / c.close)) * 1;
-            const maxNotional = equity * ctx.leverage;
-            const notional = Math.min(sizeUsdNotional, maxNotional);
+            const notional = Math.min(riskUsd / (risk / c.close), equity * ctx.leverage);
             pos = { side: "short", entryIdx: i, entryPrice: c.close, sl, tp, sizeUsdNotional: notional };
+            return true;
+          };
+
+          // SETUP A — Momentum direccional (Motor 1, relajado)
+          // LONG: close > ema20 + volumen no anémico + RSI sano
+          if (allowLong && c.close > e20 && volRatio > 0.7 && r > 35 && r < 78) {
+            if (openLong()) continue;
+          }
+          // SHORT espejo
+          if (allowShort && c.close < e20 && volRatio > 0.7 && r < 65 && r > 22) {
+            if (openShort()) continue;
+          }
+
+          // SETUP B — Caza de liquidez (Motor 5)
+          // LONG: vela toca swingLow reciente y rebota (wick inferior)
+          //   precio actual cerca del low del rango pero close por arriba del open
+          if (allowLong && i >= 21) {
+            const sLow = swingLow(i - 1, 20);
+            const tested = c.low <= sLow * 1.002 && c.close > c.open && volRatio > 0.8;
+            if (tested) {
+              if (openLong(c.low * 0.997)) continue; // SL ligeramente bajo el wick
+            }
+          }
+          // SHORT espejo: vela toca swingHigh y rechaza
+          if (allowShort && i >= 21) {
+            const sHigh = swingHigh(i - 1, 20);
+            const tested = c.high >= sHigh * 0.998 && c.close < c.open && volRatio > 0.8;
+            if (tested) {
+              if (openShort(c.high * 1.003)) continue;
+            }
+          }
+
+          // SETUP C — Mean reversion en oversold/overbought
+          // LONG: RSI < 32 y precio toca o por debajo de ema50 (rebote esperado)
+          if (allowLong && r < 32 && c.close < e50 * 1.005 && volRatio > 0.6) {
+            if (openLong()) continue;
+          }
+          // SHORT espejo
+          if (allowShort && r > 68 && c.close > e50 * 0.995 && volRatio > 0.6) {
+            if (openShort()) continue;
           }
         }
       }
