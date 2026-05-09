@@ -911,7 +911,8 @@ export const cambiarLeverage = createTool({
   inputSchema: z.object({
     symbol: symbolSchema,
     leverage: z.number().int().min(1).describe("Nuevo leverage. Tanit decide cuánto según la tesis activa."),
-    razon: z.string().min(5).describe("Por qué cambia el leverage ahora."),
+    razon: z.string().min(5).describe("Por qué cambia el leverage ahora.
+"),
   }),
   outputSchema: z.object({
     ok: z.boolean(),
