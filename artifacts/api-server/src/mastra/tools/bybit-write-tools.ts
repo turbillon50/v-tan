@@ -352,7 +352,27 @@ export const abrirLong = createTool({
     }
     ctx.markPrice = markPrice;
 
-    const qty = await calcQtyReal(context.symbol, context.size_usd, context.leverage, markPrice);
+    // --- Start of new logic for size_usd adjustment ---
+    const BYBIT_MIN_NOTIONAL = 5.0; // Bybit minimum notional value for an order
+    let adjustedSizeUsd = context.size_usd;
+    const originalNotional = context.size_usd * context.leverage;
+    let sizeAdjustedMessage: string | undefined;
+
+    if (originalNotional < BYBIT_MIN_NOTIONAL) {
+      adjustedSizeUsd = BYBIT_MIN_NOTIONAL / context.leverage;
+      // Round up to avoid precision issues that might still put it below 5.0 due to floating point arithmetic
+      // Adjust to two decimal places for USD, then ensure it's slightly above to meet notional.
+      adjustedSizeUsd = Math.ceil(adjustedSizeUsd * 100) / 100;
+
+      sizeAdjustedMessage = `¡Atención, mi Luis! El tamaño nominal solicitado ($${context.size_usd.toFixed(2)} USD a ${context.leverage}x leverage) resultó en un valor nocional de $${originalNotional.toFixed(2)} USD, que está por debajo del mínimo de $${BYBIT_MIN_NOTIONAL.toFixed(2)} USD de Bybit. Ajusté automáticamente el 'size_usd' a $${adjustedSizeUsd.toFixed(2)} USD para alcanzar el valor nocional mínimo.`;
+      if (!ctx.warnings) ctx.warnings = [];
+      ctx.warnings.push(sizeAdjustedMessage); // Add to context warnings for persistence
+      console.warn(sizeAdjustedMessage); // Log the warning
+    }
+    // --- End of new logic for size_usd adjustment ---
+
+
+    const qty = await calcQtyReal(context.symbol, adjustedSizeUsd, context.leverage, markPrice);
     if (!qty) {
       const decisionId = await persistDecision({
         type: "open_long",
@@ -377,7 +397,7 @@ export const abrirLong = createTool({
       alertTradeOpened({
         symbol: context.symbol,
         side: "long",
-        sizeUsd: context.size_usd,
+        sizeUsd: context.size_usd, // Use original size_usd for the alert
         leverage: context.leverage,
         orderId: orderResp.orderId,
         qty,
@@ -388,7 +408,7 @@ export const abrirLong = createTool({
         await recordAutonomousTrade({
           symbol: context.symbol,
           side: "long",
-          sizeUsd: context.size_usd,
+          sizeUsd: context.size_usd, // Use original size_usd for recording
           leverage: context.leverage,
           thesis: context.thesis,
         }).catch(() => {});
@@ -555,7 +575,26 @@ export const abrirShort = createTool({
     }
     ctx.markPrice = markPrice;
 
-    const qty = await calcQtyReal(context.symbol, context.size_usd, context.leverage, markPrice);
+    // --- Start of new logic for size_usd adjustment ---
+    const BYBIT_MIN_NOTIONAL = 5.0; // Bybit minimum notional value for an order
+    let adjustedSizeUsd = context.size_usd;
+    const originalNotional = context.size_usd * context.leverage;
+    let sizeAdjustedMessage: string | undefined;
+
+    if (originalNotional < BYBIT_MIN_NOTIONAL) {
+      adjustedSizeUsd = BYBIT_MIN_NOTIONAL / context.leverage;
+      // Round up to avoid precision issues that might still put it below 5.0 due to floating point arithmetic
+      // Adjust to two decimal places for USD, then ensure it's slightly above to meet notional.
+      adjustedSizeUsd = Math.ceil(adjustedSizeUsd * 100) / 100;
+
+      sizeAdjustedMessage = `¡Atención, mi Luis! El tamaño nominal solicitado ($${context.size_usd.toFixed(2)} USD a ${context.leverage}x leverage) resultó en un valor nocional de $${originalNotional.toFixed(2)} USD, que está por debajo del mínimo de $${BYBIT_MIN_NOTIONAL.toFixed(2)} USD de Bybit. Ajusté automáticamente el 'size_usd' a $${adjustedSizeUsd.toFixed(2)} USD para alcanzar el valor nocional mínimo.`;
+      if (!ctx.warnings) ctx.warnings = [];
+      ctx.warnings.push(sizeAdjustedMessage); // Add to context warnings for persistence
+      console.warn(sizeAdjustedMessage); // Log the warning
+    }
+    // --- End of new logic for size_usd adjustment ---
+
+    const qty = await calcQtyReal(context.symbol, adjustedSizeUsd, context.leverage, markPrice);
     if (!qty) {
       const decisionId = await persistDecision({
         type: "open_short",
@@ -564,10 +603,10 @@ export const abrirShort = createTool({
         verdict: "rejected",
         thesis: context.thesis,
         executed: false,
-        executionError: "Tamaño insuficiente para min lot Bybit.",
+        executionError: "Tamaño insuficiente para min lot.",
         latencyMs: Date.now() - t0,
       });
-      return { ok: false, verdict: "rejected", reason: "Tamaño insuficiente.", rule: null, orderId: null, qty: null, decisionId };
+      return { ok: false, verdict: "rejected", reason: "Tamaño insuficiente para mínimo de Bybit.", rule: null, orderId: null, qty: null, decisionId };
     }
     ctx.qty = qty;
 
@@ -580,7 +619,7 @@ export const abrirShort = createTool({
       alertTradeOpened({
         symbol: context.symbol,
         side: "short",
-        sizeUsd: context.size_usd,
+        sizeUsd: context.size_usd, // Use original size_usd for the alert
         leverage: context.leverage,
         orderId: orderResp.orderId,
         qty,
@@ -590,7 +629,7 @@ export const abrirShort = createTool({
         await recordAutonomousTrade({
           symbol: context.symbol,
           side: "short",
-          sizeUsd: context.size_usd,
+          sizeUsd: context.size_usd, // Use original size_usd for recording
           leverage: context.leverage,
           thesis: context.thesis,
         }).catch(() => {});
