@@ -170,7 +170,7 @@ export const abrirLong = createTool({
   inputSchema: z.object({
     symbol: symbolSchema,
     size_usd: z.number().positive().max(10_000).describe("Tamaño nominal en USD."),
-    leverage: z.number().int().min(1).max(20).describe("Apalancamiento."),
+    leverage: z.number().int().min(1).max(100).describe("Apalancamiento (1-100x según Tesis 5.1)."),
     thesis: thesisSchema,
     confirmado: confirmacionSchema,
   }),
@@ -403,7 +403,7 @@ export const abrirShort = createTool({
   inputSchema: z.object({
     symbol: symbolSchema,
     size_usd: z.number().positive().max(10_000),
-    leverage: z.number().int().min(1).max(20),
+    leverage: z.number().int().min(1).max(100).describe("Apalancamiento (1-100x según Tesis 5.1)."),
     thesis: thesisSchema,
     confirmado: confirmacionSchema,
   }),

@@ -46,26 +46,21 @@ export const consultarGovernance = createTool({
   },
 });
 
-const editableFieldEnum = z.enum([
-  "max_position_size_usd",
-  "max_leverage",
-  "max_daily_loss_usd",
-  "max_concurrent_positions",
-  "allowed_symbols",
-  "operating_hours_utc",
-  "require_approval_above_usd",
-  "notes",
-]);
-
 export const ajustarGovernance = createTool({
   id: "ajustar_governance",
   description:
     "Modifica una regla de gobernanza. Requiere aprobación explícita del humano. Usar cuando Luis te pida cambiar un límite (ej. subir leverage máximo a 10x, agregar XRPUSDT a símbolos permitidos, ajustar pérdida diaria). Tú propones el cambio, Mastra le pide a Luis que lo confirme.",
   inputSchema: z.object({
-    field: editableFieldEnum.describe("Nombre exacto del campo a modificar."),
+    field: z
+      .string()
+      .describe(
+        "Nombre exacto del campo a modificar. Válidos: max_position_size_usd (number), max_leverage (number), max_daily_loss_usd (number), max_concurrent_positions (number), allowed_symbols (lista de strings separados por coma o JSON), operating_hours_utc (string), require_approval_above_usd (number), notes (string).",
+      ),
     new_value: z
-      .union([z.number(), z.string(), z.array(z.string()), z.boolean()])
-      .describe("Nuevo valor. Tipo según el campo (number, string, string[], bool)."),
+      .string()
+      .describe(
+        "Nuevo valor como string. Si es número usa el número como string ('25'). Si es lista de símbolos usa JSON ['BTCUSDT','ETHUSDT'] o coma 'BTCUSDT,ETHUSDT'. Si es bool 'true'/'false'.",
+      ),
     reason: z
       .string()
       .min(5)
@@ -84,9 +79,61 @@ export const ajustarGovernance = createTool({
     const context = (rawInput && typeof rawInput === "object" && "context" in rawInput && rawInput.context && typeof rawInput.context === "object")
       ? (rawInput as { context: Record<string, unknown> }).context
       : (rawInput as Record<string, unknown>);
+    // Coerción del new_value (que viene siempre como string desde el LLM)
+    // al tipo real que la BD espera, según el field.
+    const field = context.field as keyof GovernanceRules;
+    const raw = context.new_value;
+    const numFields = new Set([
+      "max_position_size_usd",
+      "max_leverage",
+      "max_daily_loss_usd",
+      "max_concurrent_positions",
+      "require_approval_above_usd",
+    ]);
+    const arrayFields = new Set(["allowed_symbols"]);
+    let coerced: number | string | string[] | boolean;
+    if (numFields.has(field as string)) {
+      coerced = typeof raw === "number" ? raw : Number(raw);
+      if (!Number.isFinite(coerced)) {
+        return {
+          ok: false,
+          field: context.field,
+          previous: null,
+          new_value: raw,
+        };
+      }
+    } else if (arrayFields.has(field as string)) {
+      if (Array.isArray(raw)) {
+        coerced = raw.map((x) => String(x));
+      } else if (typeof raw === "string") {
+        // Acepta JSON o csv
+        const trimmed = raw.trim();
+        if (trimmed.startsWith("[")) {
+          try {
+            const parsed = JSON.parse(trimmed);
+            coerced = Array.isArray(parsed) ? parsed.map((x) => String(x)) : [trimmed];
+          } catch {
+            coerced = trimmed.split(",").map((s) => s.trim()).filter(Boolean);
+          }
+        } else {
+          coerced = trimmed
+            ? trimmed.split(",").map((s) => s.trim()).filter(Boolean)
+            : [];
+        }
+      } else {
+        coerced = [];
+      }
+    } else if (typeof raw === "boolean") {
+      coerced = raw;
+    } else if (raw === "true" || raw === "false") {
+      coerced = raw === "true";
+    } else {
+      coerced = String(raw ?? "");
+    }
+
     const result = await updateRule({
-      field: context.field as keyof GovernanceRules,
-      newValue: context.new_value as number | string | string[] | boolean,
+      field,
+      newValue: coerced,
       actor: "luis",
       reason: context.reason,
     });
@@ -94,7 +141,7 @@ export const ajustarGovernance = createTool({
       ok: result.ok,
       field: context.field,
       previous: result.previous,
-      new_value: context.new_value,
+      new_value: coerced,
     };
   },
 });

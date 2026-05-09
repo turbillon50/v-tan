@@ -60,17 +60,15 @@ export const ajustarAutonomia = createTool({
     "Modifica un campo de tu configuración de autonomía. Requiere autorización explícita de Luis en chat. Campos editables: enabled, mode, max_autonomous_size_usd, max_autonomous_leverage, max_daily_trades, cooldown_minutes_between_trades, require_thesis_citation. Valores válidos para mode: 'observe_only', 'propose_for_approval', 'execute_with_governance'.",
   inputSchema: z.object({
     field: z
-      .enum([
-        "enabled",
-        "mode",
-        "max_autonomous_size_usd",
-        "max_autonomous_leverage",
-        "max_daily_trades",
-        "cooldown_minutes_between_trades",
-        "require_thesis_citation",
-      ])
-      .describe("Campo a modificar."),
-    value: z.union([z.number(), z.string(), z.boolean()]).describe("Nuevo valor."),
+      .string()
+      .describe(
+        "Campo a modificar. Válidos: 'enabled' (bool), 'mode' (string: observe_only|propose_for_approval|execute_with_governance), 'max_autonomous_size_usd' (number), 'max_autonomous_leverage' (number), 'max_daily_trades' (number), 'cooldown_minutes_between_trades' (number), 'require_thesis_citation' (bool), 'loop_active' (bool), 'loop_interval_minutes' (number).",
+      ),
+    value: z
+      .string()
+      .describe(
+        "Nuevo valor como string. Si es booleano usa 'true'/'false'. Si es número escribe el número como string ('25'). Si es enum mode usa una de las 3 opciones literalmente.",
+      ),
     reason: z.string().min(5).describe("Por qué Luis quiere este cambio."),
     confirmado: z
       .boolean()
@@ -90,9 +88,46 @@ export const ajustarAutonomia = createTool({
         : (rawInput as Record<string, unknown>);
 
     const field = context.field as AutonomyEditableField;
-    const value = context.value as number | string | boolean;
+    const rawValue = context.value;
     const reason = context.reason as string;
     const confirmado = context.confirmado as boolean;
+
+    // Coerción del value (que viene siempre como string desde el LLM) al
+    // tipo real que la BD espera, según el field.
+    const boolFields = new Set([
+      "enabled",
+      "require_thesis_citation",
+      "loop_active",
+    ]);
+    const numFields = new Set([
+      "max_autonomous_size_usd",
+      "max_autonomous_leverage",
+      "max_daily_trades",
+      "cooldown_minutes_between_trades",
+      "loop_interval_minutes",
+    ]);
+    let value: number | string | boolean;
+    if (boolFields.has(field as string)) {
+      value =
+        rawValue === true ||
+        rawValue === "true" ||
+        rawValue === "1" ||
+        rawValue === 1;
+    } else if (numFields.has(field as string)) {
+      value = typeof rawValue === "number" ? rawValue : Number(rawValue);
+      if (!Number.isFinite(value)) {
+        return {
+          ok: false,
+          field,
+          previous: null,
+          new_value: rawValue as number | string | boolean,
+          needs_confirmation_text: `Error: '${rawValue}' no es número válido para ${field}.`,
+        };
+      }
+    } else {
+      // string libre (mode, etc)
+      value = String(rawValue);
+    }
 
     if (!confirmado) {
       const previewText = `¿Confirmas cambiar autonomía: ${field} → ${JSON.stringify(value)}? Razón: "${reason}". Si sí, dímelo y reinvoco con confirmado=true.`;
