@@ -105,7 +105,7 @@ export const buscarMemoria = createTool({
         id: z.number(),
         category: z.string(),
         content: z.string(),
-        importance: z.string().nullable().optional(),
+        importance: z.string().optional(),
         createdAt: z.string(),
       }),
     ),

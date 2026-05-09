@@ -309,7 +309,7 @@ export const leerVelas = createTool({
       .describe(
         "timeframe — válidos: '1' (1m), '3', '5', '15', '30', '60' (1h), '120', '240' (4h), '360', '720', 'D' (diario), 'W' (semanal), 'M' (mensual)",
       ),
-    limit: z.number().int().min(10).max(500).default(100),
+    limit: z.number().int().min(1).max(500).default(100),
   }),
   outputSchema: z.object({
     ok: z.boolean(),
@@ -407,23 +407,18 @@ export const leerEstructuraTecnica = createTool({
         lowerWickPct: z.number(),
       })
       .optional(),
-    ema20: z.number().nullable().optional(),
-    ema50: z.number().nullable().optional(),
-    ema200: z.number().nullable().optional(),
-    rsi14: z.number().nullable().optional(),
-    volRatio: z.number().nullable().optional().describe("vol última / vol promedio 20"),
+    ema20: z.number().optional(),
+    ema50: z.number().optional(),
+    ema200: z.number().optional(),
+    rsi14: z.number().optional(),
+    volRatio: z.number().optional(),
     swingHigh: z
       .object({ price: z.number(), barsAgo: z.number() })
-      .nullable()
       .optional(),
     swingLow: z
       .object({ price: z.number(), barsAgo: z.number() })
-      .nullable()
       .optional(),
-    structure: z
-      .enum(["bullish", "bearish", "range", "unknown"])
-      .optional()
-      .describe("estructura por orden de EMAs y posición del precio"),
+    structure: z.string().optional(),
     error: z.string().optional(),
   }),
   execute: async (rawInput: unknown) => {
@@ -1412,8 +1407,8 @@ export const leerFundingHistorico = createTool({
         fundingRatePct: z.number().describe("rate como % (ej. 0.01)"),
       }),
     ),
-    avg7d: z.number().nullable().optional(),
-    avg30d: z.number().nullable().optional(),
+    avg7d: z.number().optional(),
+    avg30d: z.number().optional(),
     error: z.string().optional(),
   }),
   execute: async (rawInput: unknown) => {
@@ -1493,8 +1488,8 @@ export const leerOpenInterestHistorico = createTool({
         openInterest: z.number(),
       }),
     ),
-    delta24h: z.number().nullable().optional(),
-    delta7d: z.number().nullable().optional(),
+    delta24h: z.number().optional(),
+    delta7d: z.number().optional(),
     error: z.string().optional(),
   }),
   execute: async (rawInput: unknown) => {
@@ -1572,11 +1567,11 @@ export const leerOrderbookProfundo = createTool({
     bidTotal: z.number(),
     askTotal: z.number(),
     imbalance: z.number().describe("ratio bidTotal/askTotal — >1 más bids"),
-    bestBid: z.number().nullable(),
-    bestAsk: z.number().nullable(),
-    spread: z.number().nullable(),
-    biggestBidWall: z.object({ price: z.number(), size: z.number() }).nullable(),
-    biggestAskWall: z.object({ price: z.number(), size: z.number() }).nullable(),
+    bestBid: z.number().optional(),
+    bestAsk: z.number().optional(),
+    spread: z.number().optional(),
+    biggestBidWall: z.object({ price: z.number(), size: z.number() }).optional(),
+    biggestAskWall: z.object({ price: z.number(), size: z.number() }).optional(),
     error: z.string().optional(),
   }),
   execute: async (rawInput: unknown) => {
@@ -1676,9 +1671,9 @@ export const leerLiquidaciones = createTool({
   outputSchema: z.object({
     ok: z.boolean(),
     symbol: z.string(),
-    longsLiquidatedUsd24h: z.number().nullable().optional(),
-    shortsLiquidatedUsd24h: z.number().nullable().optional(),
-    netFlow: z.number().nullable().optional().describe("longsLiq - shortsLiq"),
+    longsLiquidatedUsd24h: z.number().optional(),
+    shortsLiquidatedUsd24h: z.number().optional(),
+    netFlow: z.number().optional(),
     dominantSide: z.enum(["longs", "shorts", "balanced"]).optional(),
     cascadeRisk: z
       .enum(["low", "medium", "high"])

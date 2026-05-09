@@ -679,8 +679,8 @@ export const moverStops = createTool({
     "Setea o mueve stop loss y/o take profit de una posición existente. Confirmación explícita requerida.",
   inputSchema: z.object({
     symbol: symbolSchema,
-    stop_loss: z.number().positive().nullable().describe("Precio del SL. null para no cambiar."),
-    take_profit: z.number().positive().nullable().describe("Precio del TP. null para no cambiar."),
+    stop_loss: z.number().positive().optional().describe("Precio del SL. omite para no cambiar."),
+    take_profit: z.number().positive().optional().describe("Precio del TP. omite para no cambiar."),
     razon: z.string().min(5),
     confirmado: confirmacionSchema,
   }),
@@ -696,7 +696,7 @@ export const moverStops = createTool({
       ? (rawInput as { context: Record<string, unknown> }).context
       : (rawInput as Record<string, unknown>);
     const t0 = Date.now();
-    if (context.stop_loss === null && context.take_profit === null) {
+    if (context.stop_loss == null && context.take_profit == null) {
       return { ok: false, verdict: "rejected", reason: "Pasa al menos stop_loss o take_profit.", decisionId: null };
     }
     if (!context.confirmado) {
