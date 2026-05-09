@@ -30,6 +30,8 @@ import {
   setLeverage,
   setLeverageDetailed,
   switchPositionMode,
+  addPositionMargin,
+  switchMarginMode,
   calcQtyReal,
   cancelAllOpenOrders,
   getOpenPositions,
@@ -866,7 +868,7 @@ export const cancelarTodasOrdenes = createTool({
 export const cambiarLeverage = createTool({
   id: "cambiar_leverage",
   description:
-    "Cambia el leverage de un símbolo en Bybit (sube o baja). Aplica tanto a posiciones existentes como a nuevas. No requiere cerrar la posición. Tanit decide el leverage según Tesis 5.1.",
+    "Cambia el leverage de un símbolo en Bybit. SUBIR leverage en posición isolated suele funcionar siempre. BAJAR leverage en posición isolated puede fallar con 'not enough for new leverage' porque Bybit exige que el margen YA bloqueado en la posición sea suficiente para el nuevo leverage menor. Si falla al bajar: usa agregar_margen primero (mete más USD a la posición isolated), o usa cambiar_modo_margen a 'cross' (cross usa todo el margen disponible automático).",
   inputSchema: z.object({
     symbol: symbolSchema,
     leverage: z.number().int().min(1).describe("Nuevo leverage. Tanit decide cuánto según la tesis activa."),
@@ -1108,6 +1110,129 @@ export const cambiarModoPosicion = createTool({
   },
 });
 
+// ─── AGREGAR MARGEN A POSICIÓN ISOLATED ─────────────────────────────────────
+
+export const agregarMargen = createTool({
+  id: "agregar_margen",
+  description:
+    "Agrega o quita margen manualmente a una posición isolated. Usar cuando bajar_leverage falla con 'not enough for new leverage' — añade el delta de margen requerido y luego reintenta. monto_usd positivo = añade margen, negativo = quita. Lee positionIdx real de la posición.",
+  inputSchema: z.object({
+    symbol: symbolSchema,
+    monto_usd: z.number().describe("Cantidad de USD a añadir (positivo) o quitar (negativo)."),
+    razon: z.string().min(5),
+  }),
+  outputSchema: z.object({
+    ok: z.boolean(),
+    verdict: z.string(),
+    monto_usd: z.number(),
+    reason: z.string().nullable(),
+    decisionId: z.number().nullable(),
+  }),
+  execute: async (rawInput: unknown) => {
+    const context = (rawInput && typeof rawInput === "object" && "context" in rawInput && rawInput.context && typeof rawInput.context === "object")
+      ? (rawInput as { context: Record<string, unknown> }).context
+      : (rawInput as Record<string, unknown>);
+    const t0 = Date.now();
+    const symbol = String(context.symbol);
+    const monto = Number(context.monto_usd);
+
+    const ksBlock = await killSwitchBlocked("tanit-agent", "add_margin", symbol);
+    if (ksBlock) {
+      const decisionId = await persistDecision({
+        type: "add_margin", symbol,
+        context: { input: context, validation: null, bybitTestnet: isTestnet() },
+        verdict: "blocked", thesis: String(context.razon),
+        executed: false, executionError: ksBlock,
+        latencyMs: Date.now() - t0,
+      });
+      return { ok: false, verdict: "blocked", monto_usd: monto, reason: ksBlock, decisionId };
+    }
+
+    const positions = await getOpenPositions();
+    const pos = positions.find((p: any) => p.symbol === symbol && parseFloat(p.size ?? "0") > 0);
+    const posIdx = pos != null && typeof pos.positionIdx === "number" ? pos.positionIdx : 0;
+
+    const result = await addPositionMargin(symbol, monto, posIdx);
+    const errMsg = result.ok ? null : `Bybit retCode=${result.retCode ?? "?"} ${result.retMsg}`;
+    const decisionId = await persistDecision({
+      type: "add_margin",
+      symbol,
+      context: { input: context, validation: null, bybitTestnet: isTestnet(), positionIdx: posIdx },
+      verdict: result.ok ? "executed" : "rejected",
+      thesis: String(context.razon),
+      executed: result.ok,
+      executionError: errMsg,
+      latencyMs: Date.now() - t0,
+    });
+    return { ok: result.ok, verdict: result.ok ? "executed" : "rejected", monto_usd: monto, reason: errMsg, decisionId };
+  },
+});
+
+// ─── CAMBIAR MODO DE MARGEN (cross ↔ isolated) ──────────────────────────────
+
+export const cambiarModoMargen = createTool({
+  id: "cambiar_modo_margen",
+  description:
+    "Cambia el modo de margen de un símbolo en Bybit. modo='cross' usa TODO el margen disponible automáticamente (resuelve 'not enough for new leverage' al bajar leverage). modo='isolated' usa solo el margen asignado a esa posición específica (más control de riesgo, menos elasticidad). Bybit exige setear leverage al mismo tiempo. Si hay posición abierta, primero cerrarla.",
+  inputSchema: z.object({
+    symbol: symbolSchema,
+    modo: z.string().describe("'cross' o 'isolated'"),
+    leverage: z.number().int().min(1).describe("Leverage nuevo (Bybit lo requiere al cambiar modo)."),
+    razon: z.string().min(5),
+  }),
+  outputSchema: z.object({
+    ok: z.boolean(),
+    verdict: z.string(),
+    modo: z.string(),
+    leverage: z.number(),
+    reason: z.string().nullable(),
+    decisionId: z.number().nullable(),
+  }),
+  execute: async (rawInput: unknown) => {
+    const context = (rawInput && typeof rawInput === "object" && "context" in rawInput && rawInput.context && typeof rawInput.context === "object")
+      ? (rawInput as { context: Record<string, unknown> }).context
+      : (rawInput as Record<string, unknown>);
+    const t0 = Date.now();
+    const symbol = String(context.symbol);
+    const lev = Number(context.leverage);
+    const modoStr = String(context.modo).toLowerCase();
+    const mode: 0 | 1 = modoStr === "cross" ? 0 : 1;
+
+    const ksBlock = await killSwitchBlocked("tanit-agent", "switch_margin_mode", symbol);
+    if (ksBlock) {
+      const decisionId = await persistDecision({
+        type: "switch_margin_mode", symbol,
+        context: { input: context, validation: null, bybitTestnet: isTestnet() },
+        verdict: "blocked", thesis: String(context.razon),
+        executed: false, executionError: ksBlock,
+        latencyMs: Date.now() - t0,
+      });
+      return { ok: false, verdict: "blocked", modo: mode === 0 ? "cross" : "isolated", leverage: lev, reason: ksBlock, decisionId };
+    }
+
+    const result = await switchMarginMode(symbol, mode, lev);
+    const errMsg = result.ok ? null : `Bybit retCode=${result.retCode ?? "?"} ${result.retMsg}`;
+    const decisionId = await persistDecision({
+      type: "switch_margin_mode",
+      symbol,
+      context: { input: context, validation: null, bybitTestnet: isTestnet() },
+      verdict: result.ok ? "executed" : "rejected",
+      thesis: String(context.razon),
+      executed: result.ok,
+      executionError: errMsg,
+      latencyMs: Date.now() - t0,
+    });
+    return {
+      ok: result.ok,
+      verdict: result.ok ? "executed" : "rejected",
+      modo: mode === 0 ? "cross" : "isolated",
+      leverage: lev,
+      reason: errMsg,
+      decisionId,
+    };
+  },
+});
+
 export const bybitWriteTools = {
   abrirLong,
   abrirShort,
@@ -1117,4 +1242,6 @@ export const bybitWriteTools = {
   cambiarLeverage,
   abrirHedge,
   cambiarModoPosicion,
+  agregarMargen,
+  cambiarModoMargen,
 };

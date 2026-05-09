@@ -440,6 +440,60 @@ export async function setLeverageDetailed(
   }
 }
 
+/**
+ * Agrega o quita margen manualmente a una posición isolated.
+ * margin: positivo = añade, negativo = quita.
+ * Requiere positionIdx correcto (0 one-way, 1 long-hedge, 2 short-hedge).
+ */
+export async function addPositionMargin(
+  symbol: string, marginUsd: number, positionIdx = 0
+): Promise<{ ok: boolean; retCode: number | null; retMsg: string }> {
+  try {
+    const d = await bybitPrivate("POST", "/v5/position/add-margin", {
+      category: "linear", symbol, margin: String(marginUsd), positionIdx,
+    });
+    if (d?.retCode === 0) return { ok: true, retCode: 0, retMsg: "OK" };
+    console.error(`[bybit] addPositionMargin ${symbol} ${marginUsd} retCode=${d?.retCode} msg=${d?.retMsg}`);
+    return {
+      ok: false,
+      retCode: typeof d?.retCode === "number" ? d.retCode : null,
+      retMsg: String(d?.retMsg ?? "Bybit no devolvió retCode"),
+    };
+  } catch (e) {
+    return { ok: false, retCode: null, retMsg: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+/**
+ * Cambia el modo de margen de un símbolo: 0=cross, 1=isolated.
+ * Requiere setear leverage al mismo tiempo (Bybit lo exige).
+ */
+export async function switchMarginMode(
+  symbol: string, mode: 0 | 1, leverage: number
+): Promise<{ ok: boolean; retCode: number | null; retMsg: string }> {
+  try {
+    const d = await bybitPrivate("POST", "/v5/position/switch-isolated", {
+      category: "linear",
+      symbol,
+      tradeMode: mode, // 0 = cross, 1 = isolated
+      buyLeverage: String(leverage),
+      sellLeverage: String(leverage),
+    });
+    // 0 = OK, 110026 = ya está en ese modo (también OK)
+    if (d?.retCode === 0 || d?.retCode === 110026) {
+      return { ok: true, retCode: d.retCode, retMsg: d?.retMsg ?? "OK" };
+    }
+    console.error(`[bybit] switchMarginMode ${symbol} mode=${mode} retCode=${d?.retCode} msg=${d?.retMsg}`);
+    return {
+      ok: false,
+      retCode: typeof d?.retCode === "number" ? d.retCode : null,
+      retMsg: String(d?.retMsg ?? "Bybit no devolvió retCode"),
+    };
+  } catch (e) {
+    return { ok: false, retCode: null, retMsg: e instanceof Error ? e.message : String(e) };
+  }
+}
+
 export async function switchPositionMode(symbol: string, mode: 0 | 3): Promise<boolean> {
   try {
     const d = await bybitPrivate("POST", "/v5/position/switch-mode", {
