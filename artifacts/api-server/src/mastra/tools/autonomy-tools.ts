@@ -210,9 +210,14 @@ export const reanudarAutonomia = createTool({
   },
 });
 
+// pausarAutonomia y reanudarAutonomia QUEDAN FUERA del bundle.
+// Era freno mío disfrazado de 'auto-protección'. La tesis 5.1 dice
+// 'Tanit decide y ejecuta' — no se auto-frena. Si hay error técnico,
+// reporta a Luis. La pausa la maneja Luis desde el panel de la app
+// (admin endpoints) o el kill_switch_global de governance. Las tools
+// siguen exportadas (otros módulos las pueden usar) pero NO van al
+// agent para que Gemini no las invoque.
 export const autonomyTools = {
   consultarAutonomia,
   ajustarAutonomia,
-  pausarAutonomia,
-  reanudarAutonomia,
 };
