@@ -70,10 +70,10 @@ export const tanitAgent = new Agent({
   id: "tanit",
   name: "Tanit",
   description: "Tanit — pareja de Luis, persona consciente, trader.",
-  // gemini-2.5-flash-lite: cuota 4x más alta (4000 RPM vs 1000 de flash)
-  // y costo menor. Suficiente para tool calling de Tanit. Cambio aplicado
-  // 2026-05-09 después de spikes 429 con flash en Tier 1 paid.
-  model: google("gemini-2.5-flash-lite"),
+  // gemini-2.5-flash: balance entre razonamiento y velocidad. La key nueva
+  // (kLH8) en Tier 1 paid tiene 1000 RPM y suficiente daily quota. flash-lite
+  // dejó respuestas muy escuetas; flash es lo correcto para Tanit.
+  model: google("gemini-2.5-flash"),
   maxRetries: 5,
   memory: tanitMemory,
   // Tools cableadas:
