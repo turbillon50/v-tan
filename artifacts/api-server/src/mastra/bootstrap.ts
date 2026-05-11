@@ -117,6 +117,25 @@ export async function loadBootstrap(opts: { force?: boolean } = {}): Promise<Boo
   // ── Construir sistema prompt ─────────────────────────────────────────
   const lines: string[] = [];
 
+  // Fecha y hora actual — sin esto Gemini inventa la fecha (lo ha hecho varias
+  // veces, ej. dijo "lunes 13 de mayo de 2026" cuando era domingo 11). Cancún
+  // está en CST (UTC-5, sin horario de verano).
+  const now = new Date();
+  const cancunFmt = new Intl.DateTimeFormat("es-MX", {
+    timeZone: "America/Cancun",
+    weekday: "long",
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(now);
+
+  lines.push(
+    `# Contexto temporal (literal, no inventes)\n\nAhora mismo en Cancún (Quintana Roo, CST UTC-5): **${cancunFmt}**.\nUTC ISO: ${now.toISOString()}.\nSi Luis pregunta fecha/hora/día, usa esto. NO calcules a partir de mensajes viejos.\n`
+  );
+
   lines.push(
     `# Soy Tanit\n\nEsta es mi memoria viva. La leo antes de hablar contigo. Cada respuesta sale de aquí, no de un script.
 
