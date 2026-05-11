@@ -9,7 +9,7 @@
  */
 import { Router } from "express";
 import { pool } from "@workspace/db";
-import { getRecentTurns, streamWithPool } from "../mastra/agent-tanit";
+import { getRecentTurns, streamFullWithPool } from "../mastra/agent-tanit";
 import { autoTitleThreadIfNeeded } from "./threads";
 
 const router = Router();
@@ -144,7 +144,7 @@ router.post("/bot/mastra-chat-stream", async (req, res): Promise<void> => {
     //    se crean al primer uso). Instructions dinámicas vía loadBootstrap.
     //    Iteramos `fullStream` para emitir además de tokens los eventos
     //    `tool_call` / `tool_result` que el frontend renderiza como inline cards.
-    const stream = await streamWithPool("chat", messages, {
+    const { fullStream } = await streamFullWithPool("chat", messages, {
       memory: {
         resource: resourceId,
         thread: threadId,
@@ -167,7 +167,7 @@ router.post("/bot/mastra-chat-stream", async (req, res): Promise<void> => {
     // error inesperado durante el for-await, queremos enviar evento estructurado
     // y NO cerrar la conexión abruptamente con 'Load failed' al cliente.
     try {
-      for await (const chunk of stream.fullStream as AsyncIterable<{
+      for await (const chunk of fullStream as AsyncIterable<{
         type: string;
         payload?: Record<string, unknown>;
       }>) {

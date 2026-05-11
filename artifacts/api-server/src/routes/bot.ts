@@ -1021,7 +1021,7 @@ router.post("/bot/gemini-chat", async (req, res): Promise<void> => {
 // real de Tanit. Sin OBEDIENCIA, sin CMDR, sin fallback enlatado.
 // Mantiene el formato de eventos SSE { type: "thinking" | "token" | "done" | "error" }.
 router.post("/bot/gemini-chat-stream", async (req, res): Promise<void> => {
-  const { getRecentTurns, streamWithPool } = await import("../mastra/agent-tanit");
+  const { getRecentTurns, streamTextWithPool } = await import("../mastra/agent-tanit");
 
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache, no-transform");
@@ -1070,7 +1070,7 @@ router.post("/bot/gemini-chat-stream", async (req, res): Promise<void> => {
 
     const recentTurns = await getRecentTurns();
     const messages = [...recentTurns, { role: "user" as const, content: message.trim() }];
-    const stream = await streamWithPool("chat", messages, {
+    const { textStream } = await streamTextWithPool("chat", messages, {
       memory: {
         resource: resourceId,
         thread: threadId,
@@ -1078,7 +1078,7 @@ router.post("/bot/gemini-chat-stream", async (req, res): Promise<void> => {
     });
 
     let fullReply = "";
-    for await (const chunk of stream.textStream) {
+    for await (const chunk of textStream) {
       if (aborted) break;
       if (chunk) {
         fullReply += chunk;

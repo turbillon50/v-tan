@@ -17,7 +17,7 @@
  * latidos de ~3-5s y prompt corto. Con context cache de Mastra/Gemini si se
  * activa después: ~$5/día.
  */
-import { streamWithPool } from "../mastra/agent-tanit";
+import { streamTextWithPool } from "../mastra/agent-tanit";
 import {
   onPriceUpdate,
   getWsPrice,
@@ -166,13 +166,13 @@ async function runOneBeat(): Promise<void> {
   const prompt = promptParts.join("\n");
 
   try {
-    const stream = await streamWithPool(
+    const { textStream } = await streamTextWithPool(
       "live",
       [{ role: "user" as const, content: prompt }],
       { memory: { resource: RESOURCE_ID, thread: THREAD_ID } },
     );
     let reply = "";
-    for await (const chunk of stream.textStream) {
+    for await (const chunk of textStream) {
       if (chunk) reply += chunk;
     }
     if (reply.trim().length > 0) {

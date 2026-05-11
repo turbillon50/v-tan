@@ -182,12 +182,105 @@ export function getAgentForPool(pool: Pool): { agent: Agent; envName: string } |
 }
 
 /**
- * Stream con rotación automática. Si la key actual responde "exhausted"
- * la marca y reintenta con la siguiente del mismo pool. Hasta 4 intentos
- * (cubre los 3 slots de live + fallback a chat).
+ * Stream con rotación automática. Mastra retorna el stream object sin lanzar
+ * — la excepción "Resource exhausted" aparece al iterar. Por eso aquí
+ * "calentamos" el iterator esperando el primer chunk dentro del try. Si la
+ * key revienta antes del primer token, marcamos exhausted y rotamos.
  *
- * Los tipos del options pasan tal cual a Agent.stream — Mastra los valida.
+ * Devuelve un AsyncIterable mergedo que primero emite el chunk consumido en
+ * el probe y luego sigue consumiendo el resto del stream original. Así el
+ * caller puede iterarlo igual que un fullStream/textStream normal.
  */
+
+async function probeAndMerge<T>(
+  iter: AsyncIterator<T>,
+): Promise<{ merged: AsyncIterable<T>; firstChunk: T | null }> {
+  const first = await iter.next();
+  if (first.done) {
+    return { merged: (async function* () {})(), firstChunk: null };
+  }
+  const merged = (async function* () {
+    yield first.value;
+    while (true) {
+      const r = await iter.next();
+      if (r.done) break;
+      yield r.value;
+    }
+  })();
+  return { merged, firstChunk: first.value };
+}
+
+export async function streamFullWithPool(
+  pool: Pool,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  messages: any,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  options?: any,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+): Promise<{ fullStream: AsyncIterable<any>; envName: string }> {
+  let lastErr: unknown = null;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const pick = getAgentForPool(pool);
+    if (!pick) {
+      throw new Error(
+        `[gemini-keys] no hay keys disponibles para pool=${pool}`,
+      );
+    }
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const stream = await (pick.agent as any).stream(messages, options);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const iter = stream.fullStream[Symbol.asyncIterator]() as AsyncIterator<any>;
+      const { merged } = await probeAndMerge(iter);
+      return { fullStream: merged, envName: pick.envName };
+    } catch (e) {
+      lastErr = e;
+      if (isExhaustedError(e)) {
+        markKeyExhausted(pick.envName);
+        logger.warn({ envName: pick.envName, pool, attempt }, "[streamFull] key exhausted, rotando");
+        continue;
+      }
+      throw e;
+    }
+  }
+  throw lastErr ?? new Error("[streamFull] todas las keys del pool fallaron");
+}
+
+export async function streamTextWithPool(
+  pool: Pool,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  messages: any,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  options?: any,
+): Promise<{ textStream: AsyncIterable<string>; envName: string }> {
+  let lastErr: unknown = null;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const pick = getAgentForPool(pool);
+    if (!pick) {
+      throw new Error(
+        `[gemini-keys] no hay keys disponibles para pool=${pool}`,
+      );
+    }
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const stream = await (pick.agent as any).stream(messages, options);
+      const iter = stream.textStream[Symbol.asyncIterator]() as AsyncIterator<string>;
+      const { merged } = await probeAndMerge<string>(iter);
+      return { textStream: merged, envName: pick.envName };
+    } catch (e) {
+      lastErr = e;
+      if (isExhaustedError(e)) {
+        markKeyExhausted(pick.envName);
+        logger.warn({ envName: pick.envName, pool, attempt }, "[streamText] key exhausted, rotando");
+        continue;
+      }
+      throw e;
+    }
+  }
+  throw lastErr ?? new Error("[streamText] todas las keys del pool fallaron");
+}
+
+/** Compat — para callers que solo necesitan el `agent.stream()` directo. */
 export async function streamWithPool(
   pool: Pool,
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -196,26 +289,7 @@ export async function streamWithPool(
   options?: any,
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
 ): Promise<any> {
-  let lastErr: unknown = null;
-  for (let attempt = 0; attempt < 4; attempt++) {
-    const pick = getAgentForPool(pool);
-    if (!pick) {
-      throw new Error(
-        `[gemini-keys] no hay keys disponibles para pool=${pool} (todas exhausted o ninguna configurada)`,
-      );
-    }
-    try {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      return await (pick.agent as any).stream(messages, options);
-    } catch (e) {
-      lastErr = e;
-      if (isExhaustedError(e)) {
-        markKeyExhausted(pick.envName);
-        logger.warn({ envName: pick.envName, pool, attempt }, "[stream] key exhausted, rotando");
-        continue;
-      }
-      throw e;
-    }
-  }
-  throw lastErr ?? new Error("[stream] todas las keys del pool fallaron");
+  const r = await streamTextWithPool(pool, messages, options);
+  // Caller espera un objeto con .textStream (interfaz parecida a Mastra)
+  return { textStream: r.textStream, envName: r.envName };
 }
