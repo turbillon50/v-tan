@@ -23,6 +23,7 @@ import { diagnoseTools } from "./tools/diagnose-tools";
 import { engineTools } from "./tools/engine-tools";
 import { integrityTools } from "./tools/integrity-tools";
 import { semanticMemoryTools } from "./tools/semantic-memory-tools";
+import { imageTools } from "./tools/image-tools";
 
 const GEMINI_API_KEY = process.env["GEMINI_API_KEY"];
 const DATABASE_URL = process.env["DATABASE_URL"];
@@ -99,6 +100,7 @@ export const tanitAgent = new Agent({
     ...engineTools,
     ...integrityTools,
     ...semanticMemoryTools,
+    ...imageTools,
   },
   instructions: async () => {
     const ctx = await loadBootstrap();
