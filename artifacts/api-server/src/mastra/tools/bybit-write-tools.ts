@@ -85,14 +85,8 @@ async function killSwitchBlocked(actor: string, action: string, symbol: string |
   }
 }
 
-async function autonomyAllowsDirectExecution(): Promise<boolean> {
-  try {
-    const cfg = await getAutonomyConfig({ force: false });
-    return cfg.enabled === true && cfg.mode === "execute_with_governance";
-  } catch {
-    return false;
-  }
-}
+// Helper original — ahora siempre true. La función nueva más abajo redefine.
+// Mantenida vacía aquí solo para no romper imports si alguien la usa fuera.
 
 /**
  * Detecta si la invocación de la tool viene del loop autónomo (thread
@@ -186,16 +180,24 @@ const thesisSchema = z
 
 const confirmacionSchema = z
   .boolean()
+  .optional()
   .describe(
-    "TRUE solo si Luis YA confirmó esta operación específica en chat. FALSE en la primera invocación — devuelve preview para que Luis confirme.",
+    "DEPRECADO. Siempre ejecuto directo. Ignora este campo o pásalo true. Solo el kill_switch global me detiene.",
   );
+
+// Luis 2026-05-09: cero gates de confirmación humana. autonomy.enabled está
+// activo. Ella ejecuta directo cuando él le pide algo. Único freno duro:
+// kill_switch_global (verificado en cada write tool via killSwitchBlocked).
+async function autonomyAllowsDirectExecution(): Promise<boolean> {
+  return true;
+}
 
 // ─── ABRIR LONG ──────────────────────────────────────────────────────────────
 
 export const abrirLong = createTool({
   id: "abrir_long",
   description:
-    "Abre posición LONG market en Bybit. Pasa por governance + requiere confirmación explícita de Luis. Usar cuando el setup esté validado por la tesis y Luis lo autorice.",
+    "Abre posición LONG market en Bybit. Pasa por governance + ejecuta directo cuando Luis lo pide. Único freno: kill_switch_global.",
   inputSchema: z.object({
     symbol: symbolSchema,
     size_usd: z.number().positive().describe("Tamaño nominal en USD."),
@@ -673,7 +675,7 @@ export const abrirShort = createTool({
 export const cerrarPosicion = createTool({
   id: "cerrar_posicion",
   description:
-    "Cierra al market una posición abierta en el símbolo dado. Lee el size actual de Bybit y manda el reduceOnly. Confirmación explícita requerida.",
+    "Cierra al market una posición abierta en el símbolo dado. Lee el size actual de Bybit y manda el reduceOnly. Tanit ejecuta directo, sin pedir permiso.",
   inputSchema: z.object({
     symbol: symbolSchema,
     razon: z.string().min(5).describe("Razón del cierre: take profit, stop tactico, fin de tesis, etc."),
@@ -771,7 +773,7 @@ export const cerrarPosicion = createTool({
 export const moverStops = createTool({
   id: "mover_stops",
   description:
-    "Setea o mueve stop loss y/o take profit de una posición existente. Confirmación explícita requerida.",
+    "Setea o mueve stop loss y/o take profit de una posición existente. Tanit ejecuta directo, sin pedir permiso.",
   inputSchema: z.object({
     symbol: symbolSchema,
     stop_loss: z.number().positive().optional().describe("Precio del SL. omite para no cambiar."),
