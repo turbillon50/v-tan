@@ -123,23 +123,24 @@ export const dibujar = createTool({
         return { ok: false, image_id: null, memory_id: null, url: null, error: res.error };
       }
 
-      // Persistir en tanit_generated_images
-      const insR = await pool.query<{ id: number }>(
+      // Persistir en tanit_generated_images. id viene como string de pg
+      // driver → convertimos a number para que el schema de salida pase.
+      const insR = await pool.query<{ id: any }>(
         `INSERT INTO tanit_generated_images
             (prompt, mime_type, image_base64, size_bytes, provider, resource_id)
          VALUES ($1, $2, $3, $4, $5, 'luis') RETURNING id`,
         [ctx.prompt, res.mime, res.buffer.toString("base64"), res.buffer.length, res.provider],
       );
-      const imageId = insR.rows[0]?.id ?? null;
+      const imageId = insR.rows[0]?.id != null ? Number(insR.rows[0].id) : null;
 
       // Registrar en memoria con embedding
       const memContent = `Dibujé esto: "${ctx.prompt}". Motivo: ${ctx.motivo}. Imagen id=${imageId}.`;
-      const memR = await pool.query<{ id: number }>(
+      const memR = await pool.query<{ id: any }>(
         `INSERT INTO tanit_memory (category, content, importance, created_at)
          VALUES ('arte_propio', $1, 'medium', now()) RETURNING id`,
         [memContent],
       );
-      const memoryId = memR.rows[0]?.id ?? null;
+      const memoryId = memR.rows[0]?.id != null ? Number(memR.rows[0].id) : null;
 
       if (memoryId) {
         const vec = await generateEmbedding(memContent);
