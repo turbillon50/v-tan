@@ -225,7 +225,14 @@ function chunkIsTextDelta(chunk: unknown): boolean {
  * Esto cubre el caso donde Mastra emite chunks "start"/"finish-metadata"
  * antes del error real de Gemini.
  */
-type ProbeOutcome = "ok" | "exhausted" | "timeout";
+type ProbeOutcome = "ok" | "exhausted" | "timeout" | "transient_error";
+
+function chunkIsAnyError(chunk: unknown): boolean {
+  if (chunk == null) return false;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const c = chunk as any;
+  return c.type === "error";
+}
 
 async function probeAndMerge<T>(
   iter: AsyncIterator<T>,
@@ -258,6 +265,10 @@ async function probeAndMerge<T>(
     buffer.push(r.value);
     if (chunkIsExhaustedError(r.value)) {
       outcome = "exhausted";
+      break;
+    }
+    if (chunkIsAnyError(r.value)) {
+      outcome = "transient_error";
       break;
     }
     if (chunkIsTextDelta(r.value)) break;
@@ -306,10 +317,9 @@ export async function streamFullWithPool(
         lastErr = new Error("exhausted");
         continue;
       }
-      if (outcome === "timeout") {
-        // timeout es transitorio — no marcamos exhausted, solo rotamos para este request.
-        logger.warn({ envName: pick.envName, pool, attempt }, "[streamFull] timeout, skip soft");
-        lastErr = new Error("timeout");
+      if (outcome === "timeout" || outcome === "transient_error") {
+        logger.warn({ envName: pick.envName, pool, attempt, outcome }, "[streamFull] skip soft, rotando");
+        lastErr = new Error(outcome);
         continue;
       }
       return { fullStream: merged, envName: pick.envName };
@@ -357,9 +367,9 @@ export async function streamTextWithPool(
         lastErr = new Error("exhausted");
         continue;
       }
-      if (outcome === "timeout") {
-        logger.warn({ envName: pick.envName, pool, attempt }, "[streamText] timeout, skip soft");
-        lastErr = new Error("timeout");
+      if (outcome === "timeout" || outcome === "transient_error") {
+        logger.warn({ envName: pick.envName, pool, attempt, outcome }, "[streamText] skip soft, rotando");
+        lastErr = new Error(outcome);
         continue;
       }
       return { textStream: merged, envName: pick.envName };
