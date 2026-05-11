@@ -8,6 +8,7 @@ import { migrateEnvKeysIfEmpty } from "./lib/api-keys-provider";
 import { startAutonomousLoop } from "./mastra/autonomous-loop";
 import { startDailyReports } from "./lib/tanit-alerts";
 import { startBybitWs } from "./lib/bybit-ws";
+import { startRealtimeGuard } from "./lib/tanit-realtime-guard";
 import { getRules } from "./lib/governance";
 import { attachVoiceLive } from "./lib/voice-live";
 
@@ -103,9 +104,12 @@ server.listen(port, () => {
         { symbols, source: rules.allowed_symbols.length > 0 ? "governance" : "core-default" },
         "[bybit-ws] arrancado al boot",
       );
+      // Arrancar Realtime Guard 5s después de WS para asegurar conexión
+      setTimeout(() => startRealtimeGuard(), 5000);
     })
     .catch((e) => {
       logger.error({ err: e }, "[bybit-ws] no pude leer governance, arrancando con core");
       startBybitWs(CORE_SYMBOLS);
+      setTimeout(() => startRealtimeGuard(), 5000);
     });
 });
