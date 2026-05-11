@@ -416,7 +416,7 @@ async function managePositions(): Promise<ManagedDecision[]> {
   const positions = await getOpenPositions();
   if (positions.length === 0) return decisions;
 
-  // Solo gestionamos posiciones que el motor abrió (están en tanit_setup_plan)
+  // Plan de hoy (posiciones que abrió el motor)
   const planR = await pool.query<{
     id: number;
     symbol: string;
@@ -432,8 +432,42 @@ async function managePositions(): Promise<ManagedDecision[]> {
   const planBySymbol = new Map(planR.rows.map((r) => [r.symbol, r]));
 
   for (const pos of positions) {
-    const plan = planBySymbol.get(pos.symbol);
-    if (!plan) continue; // posición no del motor (manual de Luis), no la tocamos
+    let plan = planBySymbol.get(pos.symbol);
+
+    // ADOPTAR posiciones huérfanas: si una posición existe en Bybit pero NO
+    // está en tanit_setup_plan, el motor la adopta — le pone SL/TP automático
+    // y la registra como plan de hoy con motor='adopted'. Así no queda en el
+    // aire sin protección.
+    if (!plan) {
+      const entry = parseFloat(pos.avgPrice ?? "0");
+      const isLong = pos.side === "Buy";
+      const positionIdx = typeof pos.positionIdx === "number" ? pos.positionIdx : 0;
+      // SL 2% TP 3% por default
+      const sl = isLong ? entry * 0.98 : entry * 1.02;
+      const tp = isLong ? entry * 1.03 : entry * 0.97;
+      try {
+        await setTradingStopDetailed(pos.symbol, sl, tp, positionIdx);
+      } catch {}
+      const ins = await pool.query<{ id: number }>(
+        `INSERT INTO tanit_setup_plan (trading_day, symbol, direction, motor, score, rationale, size_usd, leverage, sl_pct, tp_pct, status, order_id, executed_at)
+         VALUES (CURRENT_DATE, $1, $2, 'adopted', 0, 'Posición huérfana adoptada por el motor — sin SL/TP previo, ahora protegida.',
+                 NULL, NULL, 2, 3, 'executed', $3, now()) RETURNING id`,
+        [pos.symbol, pos.side, "adopted-" + pos.symbol],
+      );
+      plan = {
+        id: ins.rows[0]!.id,
+        symbol: pos.symbol,
+        direction: pos.side,
+        motor: "adopted",
+        executed_at: new Date(),
+        sl_pct: 2,
+      };
+      decisions.push({
+        symbol: pos.symbol,
+        action: "trail_sl",
+        reason: `Adoptada: SL ${sl.toFixed(4)} TP ${tp.toFixed(4)} (huérfana sin protección, ahora gestionada)`,
+      });
+    }
 
     const entry = parseFloat(pos.avgPrice ?? "0");
     const mark = parseFloat(pos.markPrice ?? "0");

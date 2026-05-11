@@ -162,6 +162,27 @@ async function runOneTick(): Promise<void> {
  * Arranca el loop. Idempotente — si ya está corriendo, no hace nada.
  * El primer tick corre 30s después del start (hot-cold buffer).
  */
+// Handler aparte para el manageLoop (cada 90s) — protege posiciones más rápido
+// que el scanner principal (cada 15min). Solo gestiona, NO escanea ni abre.
+let _manageHandle: NodeJS.Timeout | null = null;
+let _manageRunning = false;
+
+async function runManageOnly(): Promise<void> {
+  if (_manageRunning) return;
+  _manageRunning = true;
+  try {
+    const { runEngineTick } = await import("../lib/tanit-trading-engine");
+    // runEngineTick incluye managePositions; el advisory lock evita choque
+    // con el scanner cuando coincida. Pero como el scanner solo corre cada
+    // 15min, casi siempre el manage tick tiene el lock libre.
+    await runEngineTick();
+  } catch (e) {
+    logger.error({ err: e }, "[manage-loop] tick error");
+  } finally {
+    _manageRunning = false;
+  }
+}
+
 export function startAutonomousLoop(intervalMinutes: number = 15): void {
   if (_intervalHandle !== null) {
     logger.warn("[autonomous-loop] startAutonomousLoop llamado pero ya está corriendo");
@@ -185,6 +206,18 @@ export function startAutonomousLoop(intervalMinutes: number = 15): void {
       );
     }, intervalMs);
   }, 30_000);
+
+  // Loop de gestión activa cada 90s — trailing SL, cierres por inversión,
+  // adopt posiciones huérfanas. NO escanea (eso lo hace el scanner cada 15min).
+  if (_manageHandle === null) {
+    setTimeout(() => {
+      runManageOnly().catch(() => {});
+      _manageHandle = setInterval(() => {
+        runManageOnly().catch(() => {});
+      }, 90_000);
+      logger.info("[manage-loop] arrancado cada 90s");
+    }, 45_000);
+  }
 }
 
 export function stopAutonomousLoop(): void {
@@ -192,6 +225,11 @@ export function stopAutonomousLoop(): void {
     clearInterval(_intervalHandle);
     _intervalHandle = null;
     logger.info("[autonomous-loop] detenido");
+  }
+  if (_manageHandle !== null) {
+    clearInterval(_manageHandle);
+    _manageHandle = null;
+    logger.info("[manage-loop] detenido");
   }
 }
 
