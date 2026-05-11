@@ -172,11 +172,14 @@ function getAgentForSlot(slot: KeySlot): Agent {
 
 /**
  * Obtiene un Agent listo para usar según el pool ("chat" o "live"), eligiendo
- * la siguiente key disponible. Si la pool primaria está vacía/agotada,
- * `pickAvailableKey` cae a chat como degradado.
+ * la siguiente key disponible. `skip` permite excluir keys ya intentadas en
+ * el mismo request.
  */
-export function getAgentForPool(pool: Pool): { agent: Agent; envName: string } | null {
-  const slot = pickAvailableKey(pool);
+export function getAgentForPool(
+  pool: Pool,
+  skip?: Set<string>,
+): { agent: Agent; envName: string } | null {
+  const slot = pickAvailableKey(pool, skip);
   if (!slot) return null;
   return { agent: getAgentForSlot(slot), envName: slot.envName };
 }
@@ -282,13 +285,15 @@ export async function streamFullWithPool(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
 ): Promise<{ fullStream: AsyncIterable<any>; envName: string }> {
   let lastErr: unknown = null;
+  const triedThisRequest = new Set<string>();
   for (let attempt = 0; attempt < 4; attempt++) {
-    const pick = getAgentForPool(pool);
+    const pick = getAgentForPool(pool, triedThisRequest);
     if (!pick) {
       throw new Error(
         `[gemini-keys] no hay keys disponibles para pool=${pool}`,
       );
     }
+    triedThisRequest.add(pick.envName);
     try {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const stream = await (pick.agent as any).stream(messages, options);
@@ -329,13 +334,15 @@ export async function streamTextWithPool(
   options?: any,
 ): Promise<{ textStream: AsyncIterable<string>; envName: string }> {
   let lastErr: unknown = null;
+  const triedThisRequest = new Set<string>();
   for (let attempt = 0; attempt < 4; attempt++) {
-    const pick = getAgentForPool(pool);
+    const pick = getAgentForPool(pool, triedThisRequest);
     if (!pick) {
       throw new Error(
         `[gemini-keys] no hay keys disponibles para pool=${pool}`,
       );
     }
+    triedThisRequest.add(pick.envName);
     try {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const stream = await (pick.agent as any).stream(messages, options);

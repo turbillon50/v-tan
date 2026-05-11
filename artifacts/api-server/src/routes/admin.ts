@@ -578,6 +578,47 @@ router.post("/admin/gemini-keys/reset", async (req, res): Promise<void> => {
   }
 });
 
+// GET /admin/gemini-keys/test → prueba cada key con un fetch directo a Gemini
+// (sin Mastra) para diagnosticar si son las keys o el wrapper. Devuelve un
+// resumen por slot: OK / ERROR(message). Solo lectura, sin escribir nada.
+router.get("/admin/gemini-keys/test", async (_req, res): Promise<void> => {
+  const envs = [
+    "GEMINI_API_KEY",
+    "GEMINI_API_KEY_2",
+    "GEMINI_API_KEY_3",
+    "GEMINI_API_KEY_4",
+  ];
+  const results: { envName: string; ok: boolean; status?: number; error?: string; tookMs: number }[] = [];
+  for (const envName of envs) {
+    const key = process.env[envName];
+    if (!key) { results.push({ envName, ok: false, error: "not configured", tookMs: 0 }); continue; }
+    const t0 = Date.now();
+    try {
+      const r = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(key)}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: "ping" }] }],
+            generationConfig: { maxOutputTokens: 5 },
+          }),
+        },
+      );
+      const took = Date.now() - t0;
+      if (r.ok) {
+        results.push({ envName, ok: true, status: r.status, tookMs: took });
+      } else {
+        const txt = await r.text();
+        results.push({ envName, ok: false, status: r.status, error: txt.slice(0, 300), tookMs: took });
+      }
+    } catch (e) {
+      results.push({ envName, ok: false, error: e instanceof Error ? e.message : String(e), tookMs: Date.now() - t0 });
+    }
+  }
+  res.json({ ok: true, results });
+});
+
 // POST /admin/insert-personal-memory body: { secret?, title, content } —
 // inserta una memoria personal nueva (NO sagrada). Bootstrap la carga en su
 // próxima recarga (TTL 60s) sin tocar bootstrap.ts.

@@ -56,7 +56,8 @@ function nextUtcMidnight(): number {
 }
 
 /**
- * Devuelve la primera key disponible del pool pedido.
+ * Devuelve la primera key disponible del pool pedido, excluyendo las que
+ * estén en `skip` (típicamente keys ya intentadas en este mismo request).
  *
  * Fallback policy:
  *  - pool=chat: si la(s) key(s) chat están agotadas, FALLBACK a live pool
@@ -64,13 +65,14 @@ function nextUtcMidnight(): number {
  *  - pool=live: si las live están agotadas, NO fallback (mejor mudo el loop
  *    que que el loop se coma la única key del chat).
  */
-export function pickAvailableKey(pool: Pool): KeySlot | null {
+export function pickAvailableKey(pool: Pool, skip?: Set<string>): KeySlot | null {
   loadSlots();
   const now = Date.now();
   // Primary pool
   for (const s of _slots) {
     if (s.pool !== pool) continue;
     if (s.exhaustedUntilMs > now) continue;
+    if (skip?.has(s.envName)) continue;
     return s;
   }
   // Fallback: si pedías chat y no hay disponible, intenta live (degradado
@@ -79,6 +81,7 @@ export function pickAvailableKey(pool: Pool): KeySlot | null {
     for (const s of _slots) {
       if (s.pool !== "live") continue;
       if (s.exhaustedUntilMs > now) continue;
+      if (skip?.has(s.envName)) continue;
       return s;
     }
   }
