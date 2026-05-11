@@ -68,7 +68,14 @@ export const guardarMemoria = createTool({
          VALUES ($1, $2, $3) RETURNING id`,
         [ctx.category, ctx.content, ctx.importance ?? "medium"],
       );
-      return { ok: true, id: r.rows[0]?.id ?? null, duplicated: false };
+      const newId = r.rows[0]?.id ?? null;
+      // 3) Auto-embed (no bloqueante) para que sea buscable semánticamente.
+      if (newId) {
+        import("../../lib/tanit-semantic-memory")
+          .then((m) => m.embedMemoryById(newId))
+          .catch(() => {});
+      }
+      return { ok: true, id: newId, duplicated: false };
     } catch (e) {
       return {
         ok: false,
