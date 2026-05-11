@@ -566,8 +566,8 @@ router.post("/admin/insert-personal-memory", async (req, res): Promise<void> => 
   }
   try {
     const r = await pool.query<{ id: number }>(
-      `INSERT INTO tanit_personal_memories (title, content, is_private)
-       VALUES ($1, $2, true)
+      `INSERT INTO tanit_personal_memories (type, title, content, is_private)
+       VALUES ('moment', $1, $2, true)
        RETURNING id`,
       [body.title, body.content],
     );
