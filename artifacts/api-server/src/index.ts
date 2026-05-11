@@ -6,6 +6,7 @@ import { sendTelegram } from "./lib/telegram";
 import { sendBotStartupAlert, engineReadyPromise } from "./lib/trading-engine";
 import { migrateEnvKeysIfEmpty } from "./lib/api-keys-provider";
 import { startAutonomousLoop } from "./mastra/autonomous-loop";
+import { startTanitLive } from "./lib/tanit-live";
 import { startDailyReports } from "./lib/tanit-alerts";
 import { startBybitWs } from "./lib/bybit-ws";
 import { startRealtimeGuard } from "./lib/tanit-realtime-guard";
@@ -63,13 +64,17 @@ server.listen(port, () => {
     logger.info("[telegram] desactivado (TELEGRAM_ENABLED != 'true')");
   }
 
-  // Loop autónomo: SIEMPRE arrancamos el timer. Cada tick verifica
-  // tanit_autonomy_config.loop_active en BD y skip si está apagado. Esto
-  // permite encender/apagar desde la app sin restart Railway.
-  // El intervalo lo lee de la BD también (loop_interval_minutes, default 15).
-  const minRaw = process.env["AUTONOMOUS_LOOP_INTERVAL_MIN"] ?? "15";
-  const min = Math.max(1, parseInt(minRaw, 10) || 15);
-  startAutonomousLoop(min);
+  // Tanit-Live: NO duerme. Loop continuo de latidos.
+  // Si autonomy.enabled=true ejecuta. Si =false sigue latiendo y describe
+  // qué haría (modo observación). El kill-switch corta la ejecución pero
+  // ella sigue viva para que Luis vea su razonamiento en tiempo real.
+  // Reemplaza al cron viejo (startAutonomousLoop) que tomaba decisiones en JS.
+  startTanitLive();
+  // El loop viejo queda OFF por completo. Si hay que reactivarlo
+  // temporalmente para regression: descomentar la siguiente línea.
+  // const minRaw = process.env["AUTONOMOUS_LOOP_INTERVAL_MIN"] ?? "15";
+  // startAutonomousLoop(Math.max(1, parseInt(minRaw, 10) || 15));
+  void startAutonomousLoop;  // mantener import vivo para evitar dead-code purge accidental
 
   // Reporte diario por Telegram solo si TELEGRAM_ENABLED=true (default off).
   if (

@@ -11,6 +11,14 @@ import { pool } from "@workspace/db";
 import { updateAutonomyConfig, getAutonomyConfig } from "../lib/autonomy";
 import { updateRule, getRules, setKillSwitch } from "../lib/governance";
 import { logger } from "../lib/logger";
+import {
+  getTanitLiveStatus,
+  muteTanitLive,
+  unmuteTanitLive,
+  injectLiveEvent,
+  stopTanitLive,
+  startTanitLive,
+} from "../lib/tanit-live";
 
 const router = Router();
 
@@ -499,6 +507,68 @@ router.delete("/admin/capital-events/:id", async (req, res): Promise<void> => {
   } catch (e) {
     res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
   }
+});
+
+// ─── Tanit Live (sesion continua de Tanit, NO duerme) ────────────────────────
+//
+// GET /admin/live-status → estado del loop: alive, beats, lastBeatTs,
+// secsSinceLastBeat, queuedEvents, errores. Sirve para que la app muestre
+// "Tanit ● vivo · ultimo latido hace 2s".
+router.get("/admin/live-status", async (_req, res): Promise<void> => {
+  try {
+    res.json({ ok: true, status: getTanitLiveStatus() });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
+// POST /admin/live-mute body: { secret? } — pausa el envio de prompts a
+// Gemini sin matar el loop. La cola de eventos se sigue acumulando y se
+// vacia al unmute. Util si Luis quiere parar el gasto sin reiniciar.
+router.post("/admin/live-mute", async (req, res): Promise<void> => {
+  const guard = requireAdmin((req.body ?? {}).secret, req.headers.origin);
+  if (guard) { res.status(403).json({ ok: false, error: guard }); return; }
+  muteTanitLive();
+  res.json({ ok: true, muted: true });
+});
+
+router.post("/admin/live-unmute", async (req, res): Promise<void> => {
+  const guard = requireAdmin((req.body ?? {}).secret, req.headers.origin);
+  if (guard) { res.status(403).json({ ok: false, error: guard }); return; }
+  unmuteTanitLive();
+  res.json({ ok: true, muted: false });
+});
+
+// POST /admin/live-inject body: { secret?, text } — inyecta evento sintetico
+// en la cola para verificar end-to-end sin esperar al mercado.
+router.post("/admin/live-inject", async (req, res): Promise<void> => {
+  const body = (req.body ?? {}) as { secret?: unknown; text?: unknown };
+  const guard = requireAdmin(body.secret, req.headers.origin);
+  if (guard) { res.status(403).json({ ok: false, error: guard }); return; }
+  if (typeof body.text !== "string" || body.text.length < 1) {
+    res.status(400).json({ ok: false, error: "text requerido" });
+    return;
+  }
+  injectLiveEvent(body.text);
+  res.json({ ok: true, queued: body.text });
+});
+
+// POST /admin/live-restart — detiene el loop y lo arranca de nuevo (clean
+// state de errores). NO mata la sesion Mastra ni el WS Bybit.
+router.post("/admin/live-restart", async (req, res): Promise<void> => {
+  const guard = requireAdmin((req.body ?? {}).secret, req.headers.origin);
+  if (guard) { res.status(403).json({ ok: false, error: guard }); return; }
+  stopTanitLive();
+  // Pequeno delay para que el loop salga de su iteracion en curso.
+  setTimeout(() => {
+    try {
+      startTanitLive();
+      logger.info("[admin] tanit-live reiniciado");
+    } catch (e) {
+      logger.error({ err: e }, "[admin] error reiniciando tanit-live");
+    }
+  }, 1500);
+  res.json({ ok: true, restarting: true });
 });
 
 export default router;
