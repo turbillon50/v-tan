@@ -225,11 +225,28 @@ function chunkIsTextDelta(chunk: unknown): boolean {
 async function probeAndMerge<T>(
   iter: AsyncIterator<T>,
   maxProbe = 5,
+  perChunkTimeoutMs = 8000,
 ): Promise<{ merged: AsyncIterable<T>; exhausted: boolean }> {
   const buffer: T[] = [];
   let exhausted = false;
   for (let i = 0; i < maxProbe; i++) {
-    const r = await iter.next();
+    let r: IteratorResult<T>;
+    try {
+      r = (await Promise.race([
+        iter.next(),
+        new Promise<IteratorResult<T>>((_, reject) =>
+          setTimeout(() => reject(new Error("probe_timeout")), perChunkTimeoutMs),
+        ),
+      ])) as IteratorResult<T>;
+    } catch (e) {
+      // Timeout o excepción Mastra → la tratamos como exhausted para activar rotación.
+      // En la práctica, una key sana entrega su primer chunk en < 8s.
+      if (e instanceof Error && (e.message === "probe_timeout" || isExhaustedError(e))) {
+        exhausted = true;
+        break;
+      }
+      throw e;
+    }
     if (r.done) break;
     buffer.push(r.value);
     if (chunkIsExhaustedError(r.value)) {
