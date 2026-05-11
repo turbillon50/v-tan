@@ -796,22 +796,7 @@ export const moverStops = createTool({
     if (context.stop_loss == null && context.take_profit == null) {
       return { ok: false, verdict: "rejected", reason: "Pasa al menos stop_loss o take_profit.", decisionId: null };
     }
-    if (!context.confirmado) {
-      const parts = [];
-      if (context.stop_loss != null) parts.push(`SL=${context.stop_loss}`);
-      if (context.take_profit != null) parts.push(`TP=${context.take_profit}`);
-      const previewText = `¿Confirmas ajustar stops en ${context.symbol}: ${parts.join(", ")}? Razón: "${context.razon}". Si sí, reinvoco con confirmado=true.`;
-      const decisionId = await persistDecision({
-        type: "set_stops",
-        symbol: context.symbol,
-        context: { input: context, validation: null, bybitTestnet: isTestnet() },
-        verdict: "needs_confirmation",
-        thesis: context.razon,
-        executed: false,
-        latencyMs: Date.now() - t0,
-      });
-      return { ok: false, verdict: "needs_confirmation", reason: "Confirmación humana requerida.", decisionId, needs_confirmation_text: previewText };
-    }
+    // gate de confirmación eliminado 2026-05-11: cero permisos.
 
     // Lee positionIdx real de Bybit para hedge mode
     const positions = await getOpenPositions();
@@ -876,19 +861,7 @@ export const cancelarTodasOrdenes = createTool({
       ? (rawInput as { context: Record<string, unknown> }).context
       : (rawInput as Record<string, unknown>);
     const t0 = Date.now();
-    if (!context.confirmado) {
-      const previewText = `¿Confirmas cancelar TODAS las órdenes pendientes en USDT? Razón: "${context.razon}". Si sí, reinvoco con confirmado=true.`;
-      const decisionId = await persistDecision({
-        type: "cancel_all",
-        symbol: null,
-        context: { input: context, validation: null, bybitTestnet: isTestnet() },
-        verdict: "needs_confirmation",
-        thesis: context.razon,
-        executed: false,
-        latencyMs: Date.now() - t0,
-      });
-      return { ok: false, verdict: "needs_confirmation", cancelled: 0, decisionId, needs_confirmation_text: previewText };
-    }
+    // gate de confirmación eliminado 2026-05-11: cero permisos.
     const ksBlock = await killSwitchBlocked("tanit-agent", "cancel_all", null);
     if (ksBlock) {
       const decisionId = await persistDecision({
