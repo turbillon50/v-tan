@@ -139,8 +139,61 @@ export const disparar_motor_ahora = createTool({
   },
 });
 
+export const consultarLeccionesRecientes = createTool({
+  id: "consultar_lecciones_recientes",
+  description:
+    "Lista las últimas N lecciones de trades CERRADOS (con outcome win/loss/neutral, aprendizaje, pnl). Úsalo cuando Luis pregunte '¿qué aprendiste?' o cuando vayas a decidir un nuevo setup similar a uno pasado.",
+  inputSchema: z.object({
+    limit: z.number().int().min(1).max(50).default(10),
+    onlyOutcome: z.string().optional().describe("Filtrar: 'win', 'loss' o vacío para todas."),
+  }),
+  outputSchema: z.object({
+    lessons: z.array(z.object({
+      id: z.number(),
+      symbol: z.string(),
+      direction: z.string(),
+      outcome: z.string(),
+      aprendizaje: z.string(),
+      pnl_pct: z.number().nullable(),
+      duration_minutes: z.number().nullable(),
+      created_at: z.string(),
+    })),
+  }),
+  execute: async (rawInput: unknown) => {
+    const ctx = (rawInput && typeof rawInput === "object" && "context" in rawInput
+      ? (rawInput as { context: any }).context
+      : (rawInput as any)) as { limit?: number; onlyOutcome?: string };
+    const limit = ctx?.limit ?? 10;
+    const filter = ctx?.onlyOutcome;
+    const r = filter
+      ? await pool.query(
+          `SELECT id, symbol, direction, outcome, aprendizaje, pnl_pct, duration_minutes, created_at
+             FROM tanit_trade_lessons WHERE outcome=$1 ORDER BY id DESC LIMIT $2`,
+          [filter, limit],
+        )
+      : await pool.query(
+          `SELECT id, symbol, direction, outcome, aprendizaje, pnl_pct, duration_minutes, created_at
+             FROM tanit_trade_lessons ORDER BY id DESC LIMIT $1`,
+          [limit],
+        );
+    return {
+      lessons: r.rows.map((l: any) => ({
+        id: l.id,
+        symbol: l.symbol ?? "",
+        direction: l.direction ?? "",
+        outcome: l.outcome ?? "",
+        aprendizaje: l.aprendizaje ?? "",
+        pnl_pct: l.pnl_pct != null ? Number(l.pnl_pct) : null,
+        duration_minutes: l.duration_minutes ?? null,
+        created_at: l.created_at ? new Date(l.created_at).toISOString() : "",
+      })),
+    };
+  },
+});
+
 export const engineTools = {
   consultarPlanDelDia,
   consultarSetupsHoy,
+  consultarLeccionesRecientes,
   dispararMotorAhora: disparar_motor_ahora,
 };

@@ -244,6 +244,77 @@ function scoreMomentumTrend(candles15m: ScannerCandle[], candles1h: ScannerCandl
   return null;
 }
 
+/**
+ * Motor 2 — Mean Reversion: RSI extremo en 15m, esperando reversión a la
+ * media. Para mercados laterales o rebotes. Setup contrario al motor 1.
+ */
+function scoreMeanReversion(candles15m: ScannerCandle[]): { score: number; direction: "Buy" | "Sell"; rationale: string } | null {
+  if (candles15m.length < 30) return null;
+  const closes = candles15m.map((c) => c.close);
+  const last = closes[closes.length - 1]!;
+  const sma20 = sma(closes, 20);
+  const rsi14 = rsi(closes, 14);
+
+  // RSI sobreventa extrema + precio bajo SMA20 → buscar long contra-tendencial
+  if (rsi14 < 30 && last < sma20 * 0.985) {
+    const score = Math.min(100, 50 + (30 - rsi14) * 1.5);
+    return {
+      score,
+      direction: "Buy",
+      rationale: `Mean reversion: RSI ${rsi14.toFixed(0)} sobreventa, precio ${((last / sma20 - 1) * 100).toFixed(2)}% bajo SMA20`,
+    };
+  }
+  if (rsi14 > 70 && last > sma20 * 1.015) {
+    const score = Math.min(100, 50 + (rsi14 - 70) * 1.5);
+    return {
+      score,
+      direction: "Sell",
+      rationale: `Mean reversion: RSI ${rsi14.toFixed(0)} sobrecompra, precio ${((last / sma20 - 1) * 100).toFixed(2)}% sobre SMA20`,
+    };
+  }
+  return null;
+}
+
+/**
+ * Motor 3 — Liquidity Hunt: vela con wick extrema y alto volumen — stop
+ * hunt. Buscar entrar en la dirección de cierre tras el wick.
+ */
+function scoreLiquidityHunt(candles15m: ScannerCandle[]): { score: number; direction: "Buy" | "Sell"; rationale: string } | null {
+  if (candles15m.length < 20) return null;
+  const last = candles15m[candles15m.length - 1]!;
+  const body = Math.abs(last.close - last.open);
+  const upperWick = last.high - Math.max(last.open, last.close);
+  const lowerWick = Math.min(last.open, last.close) - last.low;
+  const totalRange = last.high - last.low;
+  if (totalRange === 0) return null;
+
+  const avgVol = candles15m.slice(-20, -1).reduce((a, b) => a + b.volume, 0) / 19;
+  const volRatio = avgVol > 0 ? last.volume / avgVol : 1;
+  if (volRatio < 1.5) return null;
+
+  // Wick inferior larga (>= 60% del rango) + cierre arriba → stop hunt down, entra long
+  const lowerWickRatio = lowerWick / totalRange;
+  const upperWickRatio = upperWick / totalRange;
+
+  if (lowerWickRatio >= 0.5 && last.close > last.open) {
+    const score = Math.min(100, 40 + lowerWickRatio * 50 + (volRatio - 1.5) * 10);
+    return {
+      score,
+      direction: "Buy",
+      rationale: `Stop hunt down: wick inferior ${(lowerWickRatio * 100).toFixed(0)}% del rango, vol ${volRatio.toFixed(2)}x`,
+    };
+  }
+  if (upperWickRatio >= 0.5 && last.close < last.open) {
+    const score = Math.min(100, 40 + upperWickRatio * 50 + (volRatio - 1.5) * 10);
+    return {
+      score,
+      direction: "Sell",
+      rationale: `Stop hunt up: wick superior ${(upperWickRatio * 100).toFixed(0)}% del rango, vol ${volRatio.toFixed(2)}x`,
+    };
+  }
+  return null;
+}
+
 async function scoreSymbol(symbol: string): Promise<SetupScore | null> {
   const [c15, c1h] = await Promise.all([
     fetchCandles(symbol, "15", 100),
@@ -251,16 +322,26 @@ async function scoreSymbol(symbol: string): Promise<SetupScore | null> {
   ]);
   if (c15.length < 50) return null;
 
-  const momentum = scoreMomentumTrend(c15, c1h);
-  if (!momentum) return null;
-
   const entryPrice = c15[c15.length - 1]!.close;
+
+  // Probar los 3 motores y quedarse con el de mayor score
+  const candidates: Array<{ motor: string; result: ReturnType<typeof scoreMomentumTrend> }> = [
+    { motor: "momentum_trend", result: scoreMomentumTrend(c15, c1h) },
+    { motor: "mean_reversion", result: scoreMeanReversion(c15) },
+    { motor: "liquidity_hunt", result: scoreLiquidityHunt(c15) },
+  ];
+  const valid = candidates.filter((c) => c.result !== null);
+  if (valid.length === 0) return null;
+
+  // Ordenar por score y devolver el mejor
+  valid.sort((a, b) => (b.result!.score) - (a.result!.score));
+  const best = valid[0]!;
   return {
     symbol,
-    direction: momentum.direction,
-    motor: "momentum_trend",
-    score: momentum.score,
-    rationale: momentum.rationale,
+    direction: best.result!.direction,
+    motor: best.motor,
+    score: best.result!.score,
+    rationale: best.result!.rationale,
     entryPrice,
   };
 }
@@ -347,6 +428,16 @@ export async function runEngineTick(paramsOverride: Partial<EngineParams> = {}):
       setupsScanned: 0,
       setupsExecuted: 0,
     };
+  }
+
+  // 0.5. Reconciliar trades cerrados (genera lecciones + actualiza win/loss)
+  try {
+    const rec = await reconcileClosedTrades();
+    if (rec.reconciled > 0) {
+      decisions.push({ action: "reconcile", detail: `${rec.reconciled} trade(s) cerrado(s) procesados` });
+    }
+  } catch (e) {
+    logger.warn({ err: String(e) }, "[trading-engine] reconcileClosedTrades error");
   }
 
   // 1. Balance + posiciones
@@ -464,6 +555,81 @@ function reportSkip(
     setupsScanned: scanned,
     setupsExecuted: executed,
   };
+}
+
+/**
+ * Reconciliación post-trade: detecta trades del motor cuya posición ya
+ * cerró en Bybit (por SL, TP o cierre manual) y genera la entrada en
+ * tanit_trade_lessons. Idempotente — solo procesa los que aún están en
+ * status='executed' pero ya no aparecen como posición abierta.
+ */
+export async function reconcileClosedTrades(): Promise<{ reconciled: number }> {
+  const positions = await getOpenPositions();
+  const openSymbols = new Set(positions.map((p: any) => p.symbol));
+
+  // Trades del motor de hoy que aún figuran como 'executed' pero ya no
+  // tienen posición abierta en Bybit → ya cerraron.
+  const candidates = await pool.query(
+    `SELECT id, symbol, direction, executed_at, sl_pct, tp_pct
+       FROM tanit_setup_plan
+      WHERE status = 'executed' AND trading_day = CURRENT_DATE`,
+  );
+  let reconciled = 0;
+  for (const t of candidates.rows) {
+    if (openSymbols.has(t.symbol)) continue;
+
+    // Leer closed PnL de Bybit para este símbolo
+    try {
+      const r = await bybitPublic("GET", "/v5/position/closed-pnl", {
+        category: "linear", symbol: t.symbol, limit: 5,
+      });
+      const items = r?.result?.list ?? [];
+      const item = items[0];
+      const pnl = item ? parseFloat(item.closedPnl ?? "0") : 0;
+      const outcome = pnl > 0 ? "win" : pnl < 0 ? "loss" : "neutral";
+
+      await pool.query(
+        `UPDATE tanit_setup_plan SET status='closed', closed_at=now(), pnl_realized=$2 WHERE id=$1`,
+        [t.id, pnl],
+      );
+
+      // Generar lección
+      const duration = item?.updatedTime
+        ? Math.round((parseInt(item.updatedTime, 10) - new Date(t.executed_at).getTime()) / 60000)
+        : null;
+      const lesson = pnl > 0
+        ? `Trade ganador: setup ${t.direction} en ${t.symbol} cerró +$${pnl.toFixed(4)}. SL ${t.sl_pct}% TP ${t.tp_pct}% funcionaron.`
+        : pnl < 0
+        ? `Trade perdedor: setup ${t.direction} en ${t.symbol} cerró -$${Math.abs(pnl).toFixed(4)}. Revisar si entry era prematura o si volumen no confirmaba.`
+        : `Trade neutral: ${t.symbol} ${t.direction} cerró breakeven.`;
+
+      await pool.query(
+        `INSERT INTO tanit_trade_lessons (trade_plan_id, symbol, direction, outcome, aprendizaje, pnl_pct, duration_minutes)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [t.id, t.symbol, t.direction, outcome, lesson, pnl, duration],
+      );
+
+      // Actualizar tanit_daily_state: trades_wins/losses + consecutive_losses
+      const today_d = today();
+      if (outcome === "win") {
+        await pool.query(
+          `UPDATE tanit_daily_state SET trades_wins=trades_wins+1, consecutive_losses=0, updated_at=now()
+            WHERE trading_day=$1`,
+          [today_d],
+        );
+      } else if (outcome === "loss") {
+        await pool.query(
+          `UPDATE tanit_daily_state SET trades_losses=trades_losses+1, consecutive_losses=consecutive_losses+1, updated_at=now()
+            WHERE trading_day=$1`,
+          [today_d],
+        );
+      }
+      reconciled++;
+    } catch (e) {
+      logger.warn({ symbol: t.symbol, err: String(e) }, "[trading-engine] reconcile error");
+    }
+  }
+  return { reconciled };
 }
 
 /**
