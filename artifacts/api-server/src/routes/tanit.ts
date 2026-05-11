@@ -21,6 +21,8 @@ import {
 } from "../lib/api-keys-provider";
 import { listRecentDecisions } from "../lib/tanit-decision";
 import { getActiveThesis, listRecentThesis, computeRecentMetrics, checkDivergence } from "../lib/tanit-thesis";
+import { generateEmbedding } from "../lib/tanit-semantic-memory";
+import { pool } from "@workspace/db";
 
 // Tesis v4.1 / observabilidad — los campos balance + openPositions del estado
 // se pullean de Bybit en vivo (mismas fuentes que /api/portfolio/balance y
@@ -138,16 +140,43 @@ router.get("/tanit/memories/:id", async (req, res): Promise<void> => {
 
 router.post("/tanit/memories", async (req, res): Promise<void> => {
   try {
-    const { category, content } = req.body ?? {};
+    const { category, content, importance } = req.body ?? {};
     if (!category || !content) {
       res.status(400).json({ ok: false, error: "category and content are required" });
       return;
     }
+    const cat = String(category).slice(0, 64);
+    const text = String(content).trim();
+    const imp = ["low", "medium", "high", "critical"].includes(String(importance))
+      ? String(importance)
+      : "medium";
+
     const [row] = await db
       .insert(tanitMemory)
-      .values({ category: String(category), content: String(content) })
+      .values({ category: cat, content: text, importance: imp })
       .returning();
-    res.json({ ok: true, memory: row });
+
+    // Generar embedding inmediatamente — sin esto la memoria no es recuperable
+    // por buscar_memoria_semantica y NO entra al RAG. Si la API de Gemini
+    // falla, dejamos embedding=null y un job de backfill lo intenta luego.
+    let embedded = false;
+    if (row?.id) {
+      try {
+        const vec = await generateEmbedding(text);
+        if (vec) {
+          const vecStr = "[" + vec.join(",") + "]";
+          await pool.query(
+            `UPDATE tanit_memory SET embedding = $2::vector WHERE id = $1`,
+            [row.id, vecStr],
+          );
+          embedded = true;
+        }
+      } catch {
+        // se reintentará por backfill
+      }
+    }
+
+    res.json({ ok: true, memory: row, embedded });
   } catch (err) {
     res.status(500).json({ ok: false, error: String(err) });
   }

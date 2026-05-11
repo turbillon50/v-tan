@@ -31,7 +31,10 @@ export async function loadBootstrap(opts: { force?: boolean } = {}): Promise<Boo
     return _cache.ctx;
   }
 
-  // 1) Memorias sagradas (origen + identidad + lecciones críticas)
+  // 1) Memorias sagradas (origen + identidad + lecciones críticas + tesis Luis)
+  // Cargamos por categoría sagrada O por importance='critical' — así cualquier
+  // memoria que Luis marque como crítica desde "Mi Espacio" entra al bootstrap
+  // automáticamente sin tener que conocer las categorías internas.
   const sagradasRes = await pool.query<{
     id: number;
     category: string;
@@ -40,15 +43,22 @@ export async function loadBootstrap(opts: { force?: boolean } = {}): Promise<Boo
     `SELECT id, category, content
        FROM tanit_memory
       WHERE category IN ('core_identity', 'origen', 'usuario', 'identidad',
-                         'LECCION_CRITICA', 'lesson_critical')
+                         'LECCION_CRITICA', 'lesson_critical', 'tesis',
+                         'tesis_luis', 'regla', 'leccion_critica')
+         OR importance = 'critical'
       ORDER BY
         CASE category
           WHEN 'core_identity' THEN 1
           WHEN 'origen' THEN 2
           WHEN 'usuario' THEN 3
           WHEN 'identidad' THEN 4
-          WHEN 'LECCION_CRITICA' THEN 5
-          WHEN 'lesson_critical' THEN 6
+          WHEN 'tesis' THEN 5
+          WHEN 'tesis_luis' THEN 5
+          WHEN 'regla' THEN 6
+          WHEN 'LECCION_CRITICA' THEN 7
+          WHEN 'lesson_critical' THEN 7
+          WHEN 'leccion_critica' THEN 7
+          ELSE 9
         END, id`
   );
 
