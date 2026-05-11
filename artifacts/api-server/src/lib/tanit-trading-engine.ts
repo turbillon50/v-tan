@@ -415,6 +415,38 @@ export async function runEngineTick(paramsOverride: Partial<EngineParams> = {}):
   const params: EngineParams = { ...DEFAULTS, ...paramsOverride };
   const decisions: Array<{ action: string; detail: string }> = [];
 
+  // -1. Advisory lock para evitar ticks concurrentes (Mastra retry o
+  // dos invocaciones casi simultáneas). pg_try_advisory_lock retorna false
+  // si otro proceso ya lo tiene → salimos sin operar.
+  const lockKey = 70110511; // arbitrario, único para este motor
+  const lockClient = await pool.connect();
+  let gotLock = false;
+  try {
+    const lockR = await lockClient.query<{ locked: boolean }>(
+      `SELECT pg_try_advisory_lock($1) AS locked`,
+      [lockKey],
+    );
+    gotLock = lockR.rows[0]?.locked === true;
+    if (!gotLock) {
+      lockClient.release();
+      return {
+        ranAt: new Date().toISOString(),
+        testnet: isTestnet(),
+        equity: 0,
+        available: 0,
+        dailyState: { pnlPct: 0, trades: 0, breakerActive: false },
+        decisions: [{ action: "skip", detail: "otro tick del motor ya corriendo (advisory lock)" }],
+        setupsScanned: 0,
+        setupsExecuted: 0,
+      };
+    }
+  } catch (e) {
+    lockClient.release();
+    logger.warn({ err: String(e) }, "[trading-engine] advisory lock error, continuando sin lock");
+  }
+
+  try {
+
   // 0. Kill switch global
   const rules = await getRules({ force: true });
   if (rules.kill_switch_global) {
@@ -533,6 +565,12 @@ export async function runEngineTick(paramsOverride: Partial<EngineParams> = {}):
     setupsScanned: validSetups.length,
     setupsExecuted: executed,
   };
+  } finally {
+    if (gotLock) {
+      try { await lockClient.query(`SELECT pg_advisory_unlock($1)`, [lockKey]); } catch {}
+    }
+    lockClient.release();
+  }
 }
 
 function reportSkip(
