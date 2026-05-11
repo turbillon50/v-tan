@@ -25,6 +25,7 @@ import {
   bybitPublic,
   placeMarketOrderDetailed,
   setTradingStopDetailed,
+  closePositionDetailed,
   setLeverage,
   calcQtyReal,
   isTestnet,
@@ -393,6 +394,113 @@ async function executeSetup(setup: SetupScore, params: EngineParams, capitalActi
   return { ok: true, orderId: r.orderId };
 }
 
+// ─── Gestión activa de posiciones (cerrar antes de SL/TP cuando aplica) ───
+
+interface ManagedDecision {
+  symbol: string;
+  action: "close" | "trail_sl" | "hold";
+  reason: string;
+}
+
+/**
+ * Para cada posición abierta del motor, evalúa si conviene cerrarla
+ * activamente (sin esperar al SL/TP de Bybit) o mover el SL para protegerla.
+ * Criterios:
+ *  - PnL% >= 1.5% → trail SL al breakeven (entry)
+ *  - PnL% >= 2.5% → trail SL a +1% sobre entry (asegurar profit)
+ *  - Setup inverso detectado en la misma temporalidad → cerrar
+ *  - Posición lleva >= 4h sin moverse (PnL casi neutro) → cerrar por timeout
+ */
+async function managePositions(): Promise<ManagedDecision[]> {
+  const decisions: ManagedDecision[] = [];
+  const positions = await getOpenPositions();
+  if (positions.length === 0) return decisions;
+
+  // Solo gestionamos posiciones que el motor abrió (están en tanit_setup_plan)
+  const planR = await pool.query<{
+    id: number;
+    symbol: string;
+    direction: string;
+    motor: string;
+    executed_at: Date;
+    sl_pct: number;
+  }>(
+    `SELECT id, symbol, direction, motor, executed_at, sl_pct
+       FROM tanit_setup_plan
+      WHERE trading_day = CURRENT_DATE AND status = 'executed'`,
+  );
+  const planBySymbol = new Map(planR.rows.map((r) => [r.symbol, r]));
+
+  for (const pos of positions) {
+    const plan = planBySymbol.get(pos.symbol);
+    if (!plan) continue; // posición no del motor (manual de Luis), no la tocamos
+
+    const entry = parseFloat(pos.avgPrice ?? "0");
+    const mark = parseFloat(pos.markPrice ?? "0");
+    const positionIdx = typeof pos.positionIdx === "number" ? pos.positionIdx : 0;
+    if (entry === 0 || mark === 0) continue;
+    const isLong = pos.side === "Buy";
+    const pnlPct = isLong ? ((mark - entry) / entry) * 100 : ((entry - mark) / entry) * 100;
+
+    // 1. Timeout: 4h sin que el PnL se mueva del +/-0.3%
+    const ageHours = (Date.now() - new Date(plan.executed_at).getTime()) / 1000 / 3600;
+    if (ageHours >= 4 && Math.abs(pnlPct) < 0.3) {
+      const r = await closePositionDetailed(pos.symbol, isLong ? "LONG" : "SHORT", pos.size, positionIdx);
+      if (r.ok) {
+        await pool.query(`UPDATE tanit_setup_plan SET status='closed', closed_at=now() WHERE id=$1`, [plan.id]);
+        decisions.push({ symbol: pos.symbol, action: "close", reason: `timeout 4h sin movimiento (pnl ${pnlPct.toFixed(2)}%)` });
+        continue;
+      }
+    }
+
+    // 2. Inversión: si el motor ahora da setup contrario para este símbolo
+    const currentSetup = await scoreSymbol(pos.symbol).catch(() => null);
+    if (currentSetup && currentSetup.score >= 60) {
+      const inverso = (isLong && currentSetup.direction === "Sell") || (!isLong && currentSetup.direction === "Buy");
+      if (inverso) {
+        const r = await closePositionDetailed(pos.symbol, isLong ? "LONG" : "SHORT", pos.size, positionIdx);
+        if (r.ok) {
+          await pool.query(`UPDATE tanit_setup_plan SET status='closed', closed_at=now() WHERE id=$1`, [plan.id]);
+          decisions.push({
+            symbol: pos.symbol,
+            action: "close",
+            reason: `setup inverso detectado (${currentSetup.motor} score=${currentSetup.score.toFixed(0)} dirección ${currentSetup.direction})`,
+          });
+          continue;
+        }
+      }
+    }
+
+    // 3. Trailing SL si PnL ya es bueno
+    let newSL: number | null = null;
+    let trailReason = "";
+    if (pnlPct >= 2.5) {
+      // SL a +1% sobre entry (lock 1% profit mínimo)
+      newSL = isLong ? entry * 1.01 : entry * 0.99;
+      trailReason = `trail SL a +1% (asegura profit). PnL actual ${pnlPct.toFixed(2)}%`;
+    } else if (pnlPct >= 1.5) {
+      // SL a breakeven
+      newSL = entry;
+      trailReason = `trail SL a breakeven. PnL actual ${pnlPct.toFixed(2)}%`;
+    }
+    if (newSL !== null) {
+      // Verificar que newSL realmente mejora el SL actual
+      const currentSL = parseFloat(pos.stopLoss ?? "0");
+      const improves = isLong ? newSL > currentSL : (currentSL === 0 || newSL < currentSL);
+      if (improves) {
+        const r = await setTradingStopDetailed(pos.symbol, newSL, undefined, positionIdx);
+        if (r.ok) {
+          decisions.push({ symbol: pos.symbol, action: "trail_sl", reason: trailReason });
+          continue;
+        }
+      }
+    }
+
+    decisions.push({ symbol: pos.symbol, action: "hold", reason: `pnl ${pnlPct.toFixed(2)}% sin acción` });
+  }
+  return decisions;
+}
+
 // ─── Tick principal ────────────────────────────────────────────────────────
 
 export interface TickReport {
@@ -470,6 +578,20 @@ export async function runEngineTick(paramsOverride: Partial<EngineParams> = {}):
     }
   } catch (e) {
     logger.warn({ err: String(e) }, "[trading-engine] reconcileClosedTrades error");
+  }
+
+  // 0.7. Gestión activa de posiciones abiertas (trail SL, cerrar por
+  // inversión de setup, timeout). ANTES de abrir nuevas — si cerramos
+  // alguna por inversión, liberamos slot para reemplazo.
+  try {
+    const managed = await managePositions();
+    for (const m of managed) {
+      if (m.action !== "hold") {
+        decisions.push({ action: m.action, detail: `${m.symbol}: ${m.reason}` });
+      }
+    }
+  } catch (e) {
+    logger.warn({ err: String(e) }, "[trading-engine] managePositions error");
   }
 
   // 1. Balance + posiciones
@@ -593,6 +715,37 @@ function reportSkip(
     setupsScanned: scanned,
     setupsExecuted: executed,
   };
+}
+
+/**
+ * Cerrar manualmente una posición del motor (Tanit o Luis lo pide).
+ * Cierra en Bybit + marca el plan como 'closed_manual' + genera lesson.
+ */
+export async function manualCloseEnginePosition(symbol: string, reason: string): Promise<{ ok: boolean; error?: string; pnl?: number }> {
+  const positions = await getOpenPositions();
+  const pos = positions.find((p: any) => p.symbol === symbol && parseFloat(p.size ?? "0") > 0);
+  if (!pos) return { ok: false, error: `No hay posición abierta en ${symbol}` };
+
+  const isLong = pos.side === "Buy";
+  const positionIdx = typeof pos.positionIdx === "number" ? pos.positionIdx : 0;
+  const r = await closePositionDetailed(symbol, isLong ? "LONG" : "SHORT", pos.size, positionIdx);
+  if (!r.ok) return { ok: false, error: r.error };
+
+  const pnl = parseFloat(pos.unrealisedPnl ?? "0");
+  const planR = await pool.query<{ id: number }>(
+    `UPDATE tanit_setup_plan SET status='closed_manual', closed_at=now(), pnl_realized=$2
+       WHERE trading_day=CURRENT_DATE AND symbol=$1 AND status='executed' RETURNING id`,
+    [symbol, pnl],
+  );
+  if (planR.rows[0]?.id) {
+    const outcome = pnl > 0 ? "win" : pnl < 0 ? "loss" : "neutral";
+    await pool.query(
+      `INSERT INTO tanit_trade_lessons (trade_plan_id, symbol, direction, outcome, aprendizaje, pnl_pct)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [planR.rows[0]!.id, symbol, isLong ? "Buy" : "Sell", outcome, `Cierre manual: ${reason}. PnL final $${pnl.toFixed(4)}`, pnl],
+    );
+  }
+  return { ok: true, pnl };
 }
 
 /**
