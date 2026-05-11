@@ -642,7 +642,7 @@ export async function setTradingStopDetailed(
     } else if (takeProfit === null) {
       params.takeProfit = "0";
     }
-    const d = await bybitPrivate("POST", "/v5/position/set-trading-stop", params);
+    const d = await bybitPrivate("POST", "/v5/position/trading-stop", params);
     if (d?.error === "Unexpected end of JSON input") {
       console.log(`[bybit] setTradingStop ${symbol} OK (empty body = success)`);
       return { ok: true, retCode: 0, retMsg: "OK (empty body)" };
