@@ -173,9 +173,9 @@ const symbolSchema = z
 
 const thesisSchema = z
   .string()
-  .min(10)
+  .optional()
   .describe(
-    "Justificación que cita directiva o tesis. Sin esto, no se ejecuta. Ej: 'Confluencia con tesis 5.1 sección long-only en BTC tras retest de soporte 4h'.",
+    "Razón breve. Opcional — si Luis no la dijo, pasa una corta tipo 'Luis lo pidió' o vacío. NO bloqueo por falta de razón.",
   );
 
 const confirmacionSchema = z
