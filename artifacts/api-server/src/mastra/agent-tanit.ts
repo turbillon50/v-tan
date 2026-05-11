@@ -230,7 +230,7 @@ type ProbeOutcome = "ok" | "exhausted" | "timeout";
 async function probeAndMerge<T>(
   iter: AsyncIterator<T>,
   maxProbe = 5,
-  perChunkTimeoutMs = 20000,
+  perChunkTimeoutMs = 45000,
 ): Promise<{ merged: AsyncIterable<T>; outcome: ProbeOutcome }> {
   const buffer: T[] = [];
   let outcome: ProbeOutcome = "ok";
