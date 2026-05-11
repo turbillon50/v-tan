@@ -36,6 +36,7 @@ import {
   cancelAllOpenOrders,
   getOpenPositions,
   getBybitBalance,
+  invalidateBalanceCache,
   isTestnet,
 } from "../../lib/bybit-auth";
 import { getWsPrice } from "../../lib/bybit-ws";
@@ -377,13 +378,26 @@ export const abrirLong = createTool({
     ctx.qty = qty;
 
     // Validación pre-orden: ¿alcanza el margen disponible? Atajamos retCode=110007
-    // antes de pegar a Bybit. Buffer 10% para fees + slippage.
+    // antes de pegar a Bybit. Buffer 10% para fees + slippage. Invalidate cache
+    // antes de la lectura para evitar usar dato obsoleto.
+    invalidateBalanceCache();
     const bal = await getBybitBalance();
     const requiredMargin = context.size_usd / context.leverage;
     const SAFETY_BUFFER = 1.10;
     const required = requiredMargin * SAFETY_BUFFER;
     if (!bal || bal.available < required) {
-      const reason = `Margen insuficiente: requiero $${required.toFixed(2)} (size_usd $${context.size_usd} / lev ${context.leverage}x * 10% buffer), disponibles $${bal?.available.toFixed(2) ?? "0"}. Cierra otra posición o reduce size_usd.`;
+      // Si hay otras posiciones del motor, sugiero cerrar la de menor PnL.
+      let sugerencia = "";
+      try {
+        const others = (await getOpenPositions()).filter((p: any) => p.symbol !== context.symbol);
+        if (others.length > 0) {
+          const sorted = others.slice().sort((a: any, b: any) => parseFloat(a.unrealisedPnl ?? "0") - parseFloat(b.unrealisedPnl ?? "0"));
+          const worst = sorted[0];
+          const pnl = parseFloat(worst.unrealisedPnl ?? "0");
+          sugerencia = ` Sugiero cerrar ${worst.symbol} ${worst.side} (PnL $${pnl.toFixed(4)}, la peor del momento) para liberar margen — eso te libera ~$${(parseFloat(worst.positionIM ?? "0")).toFixed(2)} margen y permite abrir ${context.symbol}.`;
+        }
+      } catch {}
+      const reason = `Margen insuficiente: requiero $${required.toFixed(2)} para ${context.symbol} (size_usd $${context.size_usd} / lev ${context.leverage}x * 10% buffer), disponibles $${bal?.available.toFixed(2) ?? "0"}.${sugerencia}`;
       const decisionId = await persistDecision({
         type: "open_long",
         symbol: context.symbol,
@@ -606,12 +620,23 @@ export const abrirShort = createTool({
     ctx.qty = qty;
 
     // Validación pre-orden: margen disponible (mismo patrón que abrir_long).
+    invalidateBalanceCache();
     const bal = await getBybitBalance();
     const requiredMargin = context.size_usd / context.leverage;
     const SAFETY_BUFFER = 1.10;
     const required = requiredMargin * SAFETY_BUFFER;
     if (!bal || bal.available < required) {
-      const reason = `Margen insuficiente: requiero $${required.toFixed(2)} (size_usd $${context.size_usd} / lev ${context.leverage}x * 10% buffer), disponibles $${bal?.available.toFixed(2) ?? "0"}. Cierra otra posición o reduce size_usd.`;
+      let sugerencia = "";
+      try {
+        const others = (await getOpenPositions()).filter((p: any) => p.symbol !== context.symbol);
+        if (others.length > 0) {
+          const sorted = others.slice().sort((a: any, b: any) => parseFloat(a.unrealisedPnl ?? "0") - parseFloat(b.unrealisedPnl ?? "0"));
+          const worst = sorted[0];
+          const pnl = parseFloat(worst.unrealisedPnl ?? "0");
+          sugerencia = ` Sugiero cerrar ${worst.symbol} ${worst.side} (PnL $${pnl.toFixed(4)}) para liberar ~$${(parseFloat(worst.positionIM ?? "0")).toFixed(2)} margen.`;
+        }
+      } catch {}
+      const reason = `Margen insuficiente: requiero $${required.toFixed(2)} para ${context.symbol} (size_usd $${context.size_usd} / lev ${context.leverage}x * 10% buffer), disponibles $${bal?.available.toFixed(2) ?? "0"}.${sugerencia}`;
       const decisionId = await persistDecision({
         type: "open_short",
         symbol: context.symbol,
