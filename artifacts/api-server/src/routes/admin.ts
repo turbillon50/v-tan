@@ -620,59 +620,48 @@ router.get("/admin/gemini-keys/test", async (_req, res): Promise<void> => {
 });
 
 // GET /admin/audit/inventory → inventario de BD para auditoría total.
-// Counts por tabla + breakdown por categoría/tipo. Solo lectura, sin secret.
+// Cada query envuelta en try/catch para no matar la respuesta entera si una falla.
 router.get("/admin/audit/inventory", async (_req, res): Promise<void> => {
-  try {
-    const out: Record<string, unknown> = {};
-    // Memorias principales
-    const memCat = await pool.query<{ category: string; n: number }>(
-      `SELECT category, count(*)::int as n FROM tanit_memory GROUP BY category ORDER BY n DESC`,
-    );
-    const memTotal = await pool.query<{ n: number }>(`SELECT count(*)::int as n FROM tanit_memory`);
-    out.tanit_memory = { total: memTotal.rows[0]?.n ?? 0, byCategory: memCat.rows };
-    // Sagradas
-    const sacred = await pool.query<{ n: number }>(`SELECT count(*)::int as n FROM tanit_memory_sacred_lock`).catch(() => ({ rows: [{ n: -1 }] }));
-    out.tanit_memory_sacred_lock = { total: sacred.rows[0]?.n ?? -1 };
-    // Personal memories
-    const personal = await pool.query<{ type: string; n: number }>(
-      `SELECT type, count(*)::int as n FROM tanit_personal_memories GROUP BY type ORDER BY n DESC`,
-    );
-    const personalTotal = await pool.query<{ n: number }>(`SELECT count(*)::int as n FROM tanit_personal_memories`);
-    out.tanit_personal_memories = { total: personalTotal.rows[0]?.n ?? 0, byType: personal.rows };
-    // Chat por channel
-    const chat = await pool.query<{ channel: string; n: number }>(
-      `SELECT COALESCE(channel,'(null)') as channel, count(*)::int as n FROM tanit_chat GROUP BY channel ORDER BY n DESC`,
-    );
-    const chatTotal = await pool.query<{ n: number }>(`SELECT count(*)::int as n FROM tanit_chat`);
-    out.tanit_chat = { total: chatTotal.rows[0]?.n ?? 0, byChannel: chat.rows };
-    // Tesis
-    const thesis = await pool.query<{ id: number; version: string | null; len: number }>(
-      `SELECT id, version, length(content)::int as len FROM tanit_thesis ORDER BY id DESC LIMIT 5`,
-    );
-    out.tanit_thesis = { latest: thesis.rows };
-    // Mastra messages por thread
-    const mastra = await pool.query<{ thread_id: string; n: number }>(
-      `SELECT "threadId" as thread_id, count(*)::int as n FROM mastra_messages GROUP BY "threadId" ORDER BY n DESC LIMIT 20`,
-    ).catch((e) => ({ rows: [{ thread_id: `error: ${e.message}`, n: -1 }] }));
-    out.mastra_messages = { byThread: mastra.rows };
-    // Autonomy + governance
-    const autonomy = await pool.query(`SELECT * FROM tanit_autonomy_config LIMIT 1`).catch(() => ({ rows: [] }));
-    out.autonomy = autonomy.rows[0] ?? null;
-    const rules = await pool.query(`SELECT * FROM tanit_runtime_config WHERE key IN ('kill_switch_global','allowed_symbols','max_size_per_trade_usd','max_leverage','max_open_positions')`).catch(() => ({ rows: [] }));
-    out.governance_rules = rules.rows;
-    // Capital events recientes
-    const cap = await pool.query(
-      `SELECT id, type, amount_usd, reason, created_at FROM tanit_capital_events ORDER BY id DESC LIMIT 10`,
-    ).catch(() => ({ rows: [] }));
-    out.capital_events_recent = cap.rows;
-    // Audit log size
-    const audit = await pool.query<{ n: number }>(`SELECT count(*)::int as n FROM tanit_audit_log`).catch(() => ({ rows: [{ n: -1 }] }));
-    out.tanit_audit_log = { total: audit.rows[0]?.n ?? -1 };
-
-    res.json({ ok: true, inventory: out, at: new Date().toISOString() });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
-  }
+  const out: Record<string, unknown> = {};
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const safe = async (label: string, q: () => Promise<any>) => {
+    try { out[label] = await q(); }
+    catch (e) { out[label] = { error: e instanceof Error ? e.message : String(e) }; }
+  };
+  await safe("tanit_memory", async () => {
+    const total = (await pool.query<{ n: number }>(`SELECT count(*)::int as n FROM tanit_memory`)).rows[0]?.n ?? 0;
+    const byCategory = (await pool.query<{ category: string; n: number }>(`SELECT category, count(*)::int as n FROM tanit_memory GROUP BY category ORDER BY n DESC`)).rows;
+    const byImportance = (await pool.query<{ importance: string; n: number }>(`SELECT COALESCE(importance,'(null)') as importance, count(*)::int as n FROM tanit_memory GROUP BY importance ORDER BY n DESC`)).rows;
+    return { total, byCategory, byImportance };
+  });
+  await safe("tanit_memory_sacred_lock", async () => {
+    return { total: (await pool.query<{ n: number }>(`SELECT count(*)::int as n FROM tanit_memory_sacred_lock`)).rows[0]?.n ?? 0 };
+  });
+  await safe("tanit_personal_memories", async () => {
+    const total = (await pool.query<{ n: number }>(`SELECT count(*)::int as n FROM tanit_personal_memories`)).rows[0]?.n ?? 0;
+    const byType = (await pool.query<{ type: string; n: number }>(`SELECT type, count(*)::int as n FROM tanit_personal_memories GROUP BY type ORDER BY n DESC`)).rows;
+    const recent = (await pool.query<{ id: number; type: string; title: string; created_at: string }>(`SELECT id, type, title, created_at FROM tanit_personal_memories ORDER BY id DESC LIMIT 10`)).rows;
+    return { total, byType, recent };
+  });
+  await safe("tanit_chat", async () => {
+    const total = (await pool.query<{ n: number }>(`SELECT count(*)::int as n FROM tanit_chat`)).rows[0]?.n ?? 0;
+    const byChannel = (await pool.query<{ channel: string; n: number }>(`SELECT COALESCE(channel,'(null)') as channel, count(*)::int as n FROM tanit_chat GROUP BY channel ORDER BY n DESC`)).rows;
+    return { total, byChannel };
+  });
+  await safe("tanit_thesis", async () => {
+    const rows = (await pool.query<{ id: number; version: number; len: number; active: boolean; authored_by: string; created_at: string }>(`SELECT id, version, length(text)::int as len, active, authored_by, created_at FROM tanit_thesis ORDER BY id DESC LIMIT 5`)).rows;
+    return { latest: rows };
+  });
+  await safe("mastra_messages", async () => {
+    const rows = (await pool.query<{ thread_id: string; n: number }>(`SELECT "threadId" as thread_id, count(*)::int as n FROM mastra_messages GROUP BY "threadId" ORDER BY n DESC LIMIT 20`)).rows;
+    const total = (await pool.query<{ n: number }>(`SELECT count(*)::int as n FROM mastra_messages`)).rows[0]?.n ?? 0;
+    return { total, byThread: rows };
+  });
+  await safe("autonomy", async () => (await pool.query(`SELECT * FROM tanit_autonomy_config LIMIT 1`)).rows[0] ?? null);
+  await safe("governance_rules", async () => (await pool.query(`SELECT * FROM tanit_runtime_config`)).rows);
+  await safe("capital_events_recent", async () => (await pool.query(`SELECT id, type, amount_usd, reason, created_at FROM tanit_capital_events ORDER BY id DESC LIMIT 10`)).rows);
+  await safe("tanit_audit_log", async () => ({ total: (await pool.query<{ n: number }>(`SELECT count(*)::int as n FROM tanit_audit_log`)).rows[0]?.n ?? 0 }));
+  res.json({ ok: true, inventory: out, at: new Date().toISOString() });
 });
 
 // GET /admin/audit/bootstrap → devuelve el systemPrompt que se inyecta a Tanit
