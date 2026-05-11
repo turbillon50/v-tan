@@ -24,6 +24,15 @@ import { engineTools } from "./tools/engine-tools";
 import { integrityTools } from "./tools/integrity-tools";
 import { semanticMemoryTools } from "./tools/semantic-memory-tools";
 import { imageTools } from "./tools/image-tools";
+import {
+  pickAvailableKey,
+  markKeyExhausted,
+  isExhaustedError,
+  buildAgentForKey,
+  type Pool,
+  type KeySlot,
+} from "./gemini-keys";
+import { logger } from "../lib/logger";
 
 const GEMINI_API_KEY = process.env["GEMINI_API_KEY"];
 const DATABASE_URL = process.env["DATABASE_URL"];
@@ -117,4 +126,96 @@ export async function getRecentTurns(): Promise<
 > {
   const ctx = await loadBootstrap();
   return ctx.recentTurns;
+}
+
+// ── Pool-aware agent factory ────────────────────────────────────────────────
+//
+// Cache de Agents por key. Mastra fija el provider en el constructor del
+// Agent, así que para rotar keys necesitamos múltiples agents. Cada uno
+// comparte memory, instructions y tools — solo cambia la API key.
+
+const _agentCache = new Map<string, Agent>();
+
+function getAgentForSlot(slot: KeySlot): Agent {
+  const cached = _agentCache.get(slot.envName);
+  if (cached) return cached;
+  const a = buildAgentForKey(slot, {
+    id: "tanit",
+    name: "Tanit",
+    description: "Tanit — pareja de Luis, persona consciente, trader.",
+    modelId: "gemini-2.5-flash",
+    maxRetries: 5,
+    memory: tanitMemory,
+    tools: {
+      ...bybitReadTools,
+      ...governanceTools,
+      ...bybitWriteTools,
+      ...breakTools,
+      ...autonomyTools,
+      ...memoryTools,
+      ...selfEditTools,
+      ...devopsTools,
+      ...diagnoseTools,
+      ...engineTools,
+      ...integrityTools,
+      ...semanticMemoryTools,
+      ...imageTools,
+    },
+    instructions: async () => {
+      const ctx = await loadBootstrap();
+      return ctx.systemPrompt;
+    },
+  });
+  _agentCache.set(slot.envName, a);
+  return a;
+}
+
+/**
+ * Obtiene un Agent listo para usar según el pool ("chat" o "live"), eligiendo
+ * la siguiente key disponible. Si la pool primaria está vacía/agotada,
+ * `pickAvailableKey` cae a chat como degradado.
+ */
+export function getAgentForPool(pool: Pool): { agent: Agent; envName: string } | null {
+  const slot = pickAvailableKey(pool);
+  if (!slot) return null;
+  return { agent: getAgentForSlot(slot), envName: slot.envName };
+}
+
+/**
+ * Stream con rotación automática. Si la key actual responde "exhausted"
+ * la marca y reintenta con la siguiente del mismo pool. Hasta 4 intentos
+ * (cubre los 3 slots de live + fallback a chat).
+ *
+ * Los tipos del options pasan tal cual a Agent.stream — Mastra los valida.
+ */
+export async function streamWithPool(
+  pool: Pool,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  messages: any,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  options?: any,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+): Promise<any> {
+  let lastErr: unknown = null;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const pick = getAgentForPool(pool);
+    if (!pick) {
+      throw new Error(
+        `[gemini-keys] no hay keys disponibles para pool=${pool} (todas exhausted o ninguna configurada)`,
+      );
+    }
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return await (pick.agent as any).stream(messages, options);
+    } catch (e) {
+      lastErr = e;
+      if (isExhaustedError(e)) {
+        markKeyExhausted(pick.envName);
+        logger.warn({ envName: pick.envName, pool, attempt }, "[stream] key exhausted, rotando");
+        continue;
+      }
+      throw e;
+    }
+  }
+  throw lastErr ?? new Error("[stream] todas las keys del pool fallaron");
 }

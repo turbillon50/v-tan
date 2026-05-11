@@ -9,7 +9,7 @@
  */
 import { Router } from "express";
 import { pool } from "@workspace/db";
-import { tanitAgent, getRecentTurns } from "../mastra/agent-tanit";
+import { getRecentTurns, streamWithPool } from "../mastra/agent-tanit";
 import { autoTitleThreadIfNeeded } from "./threads";
 
 const router = Router();
@@ -144,7 +144,7 @@ router.post("/bot/mastra-chat-stream", async (req, res): Promise<void> => {
     //    se crean al primer uso). Instructions dinámicas vía loadBootstrap.
     //    Iteramos `fullStream` para emitir además de tokens los eventos
     //    `tool_call` / `tool_result` que el frontend renderiza como inline cards.
-    const stream = await tanitAgent.stream(messages, {
+    const stream = await streamWithPool("chat", messages, {
       memory: {
         resource: resourceId,
         thread: threadId,

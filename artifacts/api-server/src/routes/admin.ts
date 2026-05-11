@@ -553,6 +553,18 @@ router.post("/admin/live-inject", async (req, res): Promise<void> => {
   res.json({ ok: true, queued: body.text });
 });
 
+// GET /admin/gemini-keys → estado de los pools (cuántas keys activas, cuáles
+// agotadas y hasta cuándo). Solo lectura, no requiere admin secret porque
+// es info de salud del sistema.
+router.get("/admin/gemini-keys", async (_req, res): Promise<void> => {
+  try {
+    const { getKeysStatus } = await import("../mastra/gemini-keys");
+    res.json({ ok: true, status: getKeysStatus() });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
 // POST /admin/insert-personal-memory body: { secret?, title, content } —
 // inserta una memoria personal nueva (NO sagrada). Bootstrap la carga en su
 // próxima recarga (TTL 60s) sin tocar bootstrap.ts.
