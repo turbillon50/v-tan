@@ -137,7 +137,7 @@ async function updateDailyState(equityNow: number, state: DailyState): Promise<D
   const open = Number(state.equity_open ?? equityNow);
   const pnlUsd = equityNow - open;
   const pnlPct = open > 0 ? (pnlUsd / open) * 100 : 0;
-  const drawdown = Math.min(state.max_drawdown_pct ?? 0, pnlPct);
+  const drawdown = Math.min(Number(state.max_drawdown_pct ?? 0), pnlPct);
   const r = await pool.query<DailyState>(
     `UPDATE tanit_daily_state
        SET equity_current=$2, pnl_today_usd=$3, pnl_today_pct=$4,
@@ -394,9 +394,10 @@ export async function runEngineTick(paramsOverride: Partial<EngineParams> = {}):
     return reportSkip(decisions, equity, available, state, 0, 0);
   }
 
-  // 6. Escanear universo
+  // 6. Escanear universo. Umbral 50 (era 60) — más permisivo, el motor
+  // diversificará por símbolo y selectTopK ordena por score.
   const scanResults = await Promise.all(UNIVERSE.map((s) => scoreSymbol(s).catch(() => null)));
-  const validSetups = scanResults.filter((s): s is SetupScore => s !== null && s.score >= 60);
+  const validSetups = scanResults.filter((s): s is SetupScore => s !== null && s.score >= 50);
   const slots = params.maxConcurrentTrades - positions.length;
   const targetK = Math.min(slots, params.targetTradesPerDay - state.trades_total);
   if (targetK <= 0) {
@@ -430,9 +431,13 @@ export async function runEngineTick(paramsOverride: Partial<EngineParams> = {}):
   return {
     ranAt: new Date().toISOString(),
     testnet: isTestnet(),
-    equity,
-    available,
-    dailyState: { pnlPct: state.pnl_today_pct, trades: state.trades_total + executed, breakerActive: state.breaker_active },
+    equity: Number(equity),
+    available: Number(available),
+    dailyState: {
+      pnlPct: Number(state.pnl_today_pct ?? 0),
+      trades: (state.trades_total ?? 0) + executed,
+      breakerActive: Boolean(state.breaker_active),
+    },
     decisions,
     setupsScanned: validSetups.length,
     setupsExecuted: executed,

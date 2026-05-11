@@ -132,9 +132,9 @@ export const disparar_motor_ahora = createTool({
       setupsScanned: r.setupsScanned,
       setupsExecuted: r.setupsExecuted,
       decisions: r.decisions,
-      equity: r.equity,
-      pnlPct: r.dailyState.pnlPct,
-      breakerActive: r.dailyState.breakerActive,
+      equity: Number(r.equity ?? 0),
+      pnlPct: Number(r.dailyState.pnlPct ?? 0),
+      breakerActive: Boolean(r.dailyState.breakerActive),
     };
   },
 });
