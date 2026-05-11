@@ -95,6 +95,14 @@ export function markKeyExhausted(envName: string): void {
   );
 }
 
+/** Limpia las marcas exhausted. Para usar tras agregar keys nuevas o tras
+ * sospechar falsos positivos. Las cuotas reales de Google no cambian — solo
+ * permite que el sistema vuelva a intentarlas. */
+export function clearAllExhausted(): void {
+  for (const s of _slots) s.exhaustedUntilMs = 0;
+  logger.info("[gemini-keys] todas las marcas exhausted limpiadas");
+}
+
 export function getKeysStatus(): {
   total: number;
   activeChat: number;

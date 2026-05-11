@@ -565,6 +565,19 @@ router.get("/admin/gemini-keys", async (_req, res): Promise<void> => {
   }
 });
 
+// POST /admin/gemini-keys/reset → limpia las marcas exhausted (para retry).
+router.post("/admin/gemini-keys/reset", async (req, res): Promise<void> => {
+  const guard = requireAdmin((req.body ?? {}).secret, req.headers.origin);
+  if (guard) { res.status(403).json({ ok: false, error: guard }); return; }
+  try {
+    const { clearAllExhausted, getKeysStatus } = await import("../mastra/gemini-keys");
+    clearAllExhausted();
+    res.json({ ok: true, status: getKeysStatus() });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
 // POST /admin/insert-personal-memory body: { secret?, title, content } —
 // inserta una memoria personal nueva (NO sagrada). Bootstrap la carga en su
 // próxima recarga (TTL 60s) sin tocar bootstrap.ts.

@@ -222,13 +222,15 @@ function chunkIsTextDelta(chunk: unknown): boolean {
  * Esto cubre el caso donde Mastra emite chunks "start"/"finish-metadata"
  * antes del error real de Gemini.
  */
+type ProbeOutcome = "ok" | "exhausted" | "timeout";
+
 async function probeAndMerge<T>(
   iter: AsyncIterator<T>,
   maxProbe = 5,
-  perChunkTimeoutMs = 8000,
-): Promise<{ merged: AsyncIterable<T>; exhausted: boolean }> {
+  perChunkTimeoutMs = 20000,
+): Promise<{ merged: AsyncIterable<T>; outcome: ProbeOutcome }> {
   const buffer: T[] = [];
-  let exhausted = false;
+  let outcome: ProbeOutcome = "ok";
   for (let i = 0; i < maxProbe; i++) {
     let r: IteratorResult<T>;
     try {
@@ -239,10 +241,12 @@ async function probeAndMerge<T>(
         ),
       ])) as IteratorResult<T>;
     } catch (e) {
-      // Timeout o excepción Mastra → la tratamos como exhausted para activar rotación.
-      // En la práctica, una key sana entrega su primer chunk en < 8s.
-      if (e instanceof Error && (e.message === "probe_timeout" || isExhaustedError(e))) {
-        exhausted = true;
+      if (e instanceof Error && e.message === "probe_timeout") {
+        outcome = "timeout";
+        break;
+      }
+      if (isExhaustedError(e)) {
+        outcome = "exhausted";
         break;
       }
       throw e;
@@ -250,13 +254,13 @@ async function probeAndMerge<T>(
     if (r.done) break;
     buffer.push(r.value);
     if (chunkIsExhaustedError(r.value)) {
-      exhausted = true;
+      outcome = "exhausted";
       break;
     }
     if (chunkIsTextDelta(r.value)) break;
   }
-  if (exhausted) {
-    return { merged: (async function* () {})(), exhausted: true };
+  if (outcome !== "ok") {
+    return { merged: (async function* () {})(), outcome };
   }
   const merged = (async function* () {
     for (const c of buffer) yield c;
@@ -266,7 +270,7 @@ async function probeAndMerge<T>(
       yield r.value;
     }
   })();
-  return { merged, exhausted: false };
+  return { merged, outcome: "ok" };
 }
 
 export async function streamFullWithPool(
@@ -290,11 +294,17 @@ export async function streamFullWithPool(
       const stream = await (pick.agent as any).stream(messages, options);
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const iter = stream.fullStream[Symbol.asyncIterator]() as AsyncIterator<any>;
-      const { merged, exhausted } = await probeAndMerge(iter);
-      if (exhausted) {
+      const { merged, outcome } = await probeAndMerge(iter);
+      if (outcome === "exhausted") {
         markKeyExhausted(pick.envName);
-        logger.warn({ envName: pick.envName, pool, attempt }, "[streamFull] exhausted en probe, rotando");
-        lastErr = new Error("exhausted en probe");
+        logger.warn({ envName: pick.envName, pool, attempt }, "[streamFull] exhausted, marcando hasta reset");
+        lastErr = new Error("exhausted");
+        continue;
+      }
+      if (outcome === "timeout") {
+        // timeout es transitorio — no marcamos exhausted, solo rotamos para este request.
+        logger.warn({ envName: pick.envName, pool, attempt }, "[streamFull] timeout, skip soft");
+        lastErr = new Error("timeout");
         continue;
       }
       return { fullStream: merged, envName: pick.envName };
@@ -333,11 +343,16 @@ export async function streamTextWithPool(
       // Mastra debería lanzar al hacer next(). Pero por si la versión actual
       // emite un primer "" antes del error, también probamos a leer dos chunks.
       const iter = stream.textStream[Symbol.asyncIterator]() as AsyncIterator<string>;
-      const { merged, exhausted } = await probeAndMerge<string>(iter);
-      if (exhausted) {
+      const { merged, outcome } = await probeAndMerge<string>(iter);
+      if (outcome === "exhausted") {
         markKeyExhausted(pick.envName);
-        logger.warn({ envName: pick.envName, pool, attempt }, "[streamText] exhausted en probe, rotando");
-        lastErr = new Error("exhausted en probe");
+        logger.warn({ envName: pick.envName, pool, attempt }, "[streamText] exhausted, marcando hasta reset");
+        lastErr = new Error("exhausted");
+        continue;
+      }
+      if (outcome === "timeout") {
+        logger.warn({ envName: pick.envName, pool, attempt }, "[streamText] timeout, skip soft");
+        lastErr = new Error("timeout");
         continue;
       }
       return { textStream: merged, envName: pick.envName };
