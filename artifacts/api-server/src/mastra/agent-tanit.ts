@@ -210,6 +210,24 @@ async function probeAndMerge<T>(
   return { merged, firstChunk: first.value };
 }
 
+/**
+ * Detecta si un chunk de Mastra fullStream/textStream representa un error
+ * de Gemini "Resource exhausted". Mastra emite el error como chunk
+ * `{type: "error", payload: { error: "..." }}` en lugar de lanzar excepción,
+ * por eso necesitamos esta inspección.
+ */
+function chunkIsExhaustedError(chunk: unknown): boolean {
+  if (chunk == null) return false;
+  if (typeof chunk === "string") return isExhaustedError(chunk);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const c = chunk as any;
+  if (c.type === "error") {
+    const errVal = c.payload?.error ?? c.error;
+    return isExhaustedError(errVal ?? "");
+  }
+  return false;
+}
+
 export async function streamFullWithPool(
   pool: Pool,
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -231,13 +249,20 @@ export async function streamFullWithPool(
       const stream = await (pick.agent as any).stream(messages, options);
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const iter = stream.fullStream[Symbol.asyncIterator]() as AsyncIterator<any>;
-      const { merged } = await probeAndMerge(iter);
+      const { merged, firstChunk } = await probeAndMerge(iter);
+      // Si el primer chunk YA es un error de cuota, rotamos antes de mandar nada.
+      if (chunkIsExhaustedError(firstChunk)) {
+        markKeyExhausted(pick.envName);
+        logger.warn({ envName: pick.envName, pool, attempt }, "[streamFull] primer chunk exhausted, rotando");
+        lastErr = new Error("first chunk exhausted");
+        continue;
+      }
       return { fullStream: merged, envName: pick.envName };
     } catch (e) {
       lastErr = e;
       if (isExhaustedError(e)) {
         markKeyExhausted(pick.envName);
-        logger.warn({ envName: pick.envName, pool, attempt }, "[streamFull] key exhausted, rotando");
+        logger.warn({ envName: pick.envName, pool, attempt }, "[streamFull] excepcion exhausted, rotando");
         continue;
       }
       throw e;
@@ -264,14 +289,23 @@ export async function streamTextWithPool(
     try {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const stream = await (pick.agent as any).stream(messages, options);
+      // textStream solo emite strings — si la key falla con exhausted,
+      // Mastra debería lanzar al hacer next(). Pero por si la versión actual
+      // emite un primer "" antes del error, también probamos a leer dos chunks.
       const iter = stream.textStream[Symbol.asyncIterator]() as AsyncIterator<string>;
-      const { merged } = await probeAndMerge<string>(iter);
+      const { merged, firstChunk } = await probeAndMerge<string>(iter);
+      if (chunkIsExhaustedError(firstChunk)) {
+        markKeyExhausted(pick.envName);
+        logger.warn({ envName: pick.envName, pool, attempt }, "[streamText] primer chunk exhausted, rotando");
+        lastErr = new Error("first chunk exhausted");
+        continue;
+      }
       return { textStream: merged, envName: pick.envName };
     } catch (e) {
       lastErr = e;
       if (isExhaustedError(e)) {
         markKeyExhausted(pick.envName);
-        logger.warn({ envName: pick.envName, pool, attempt }, "[streamText] key exhausted, rotando");
+        logger.warn({ envName: pick.envName, pool, attempt }, "[streamText] excepcion exhausted, rotando");
         continue;
       }
       throw e;
