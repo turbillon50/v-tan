@@ -664,6 +664,30 @@ router.get("/admin/audit/inventory", async (_req, res): Promise<void> => {
   res.json({ ok: true, inventory: out, at: new Date().toISOString() });
 });
 
+// GET /admin/audit/memory/:id → devuelve contenido completo de una memoria
+// por id (de tanit_memory o tanit_personal_memories según prefix).
+router.get("/admin/audit/memory-fetch", async (req, res): Promise<void> => {
+  const type = (req.query.type ?? "memory").toString();
+  const id = parseInt((req.query.id ?? "0").toString(), 10);
+  try {
+    if (type === "personal") {
+      const r = await pool.query(`SELECT * FROM tanit_personal_memories WHERE id = $1`, [id]);
+      res.json({ ok: true, row: r.rows[0] ?? null });
+    } else if (type === "memory") {
+      const r = await pool.query(`SELECT * FROM tanit_memory WHERE id = $1`, [id]);
+      res.json({ ok: true, row: r.rows[0] ?? null });
+    } else if (type === "category") {
+      const cat = (req.query.category ?? "").toString();
+      const r = await pool.query(`SELECT id, category, importance, content, created_at FROM tanit_memory WHERE category = $1 ORDER BY id DESC LIMIT 20`, [cat]);
+      res.json({ ok: true, rows: r.rows });
+    } else {
+      res.status(400).json({ ok: false, error: "type debe ser memory|personal|category" });
+    }
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
 // GET /admin/audit/bootstrap → devuelve el systemPrompt que se inyecta a Tanit
 // ahora mismo (cache de 60s del loadBootstrap). Útil para ver qué la condiciona.
 router.get("/admin/audit/bootstrap", async (_req, res): Promise<void> => {
