@@ -14,7 +14,87 @@ import { z } from "zod";
 import { pool } from "@workspace/db";
 import { generateEmbedding } from "../../lib/tanit-semantic-memory";
 
-const API_URL = process.env["INTERNAL_API_URL"] ?? "http://localhost:3000";
+const GEMINI_KEY = process.env["GEMINI_API_KEY"] ?? "";
+
+// Generación directa a Gemini Imagen 4 — evita el round-trip HTTP al
+// propio backend (que fallaba con 'fetch failed' por localhost:3000 mal
+// resuelto en el container de Railway).
+async function generateImageDirect(prompt: string): Promise<{ buffer: Buffer; mime: string; provider: string } | { error: string }> {
+  if (!GEMINI_KEY) return { error: "GEMINI_API_KEY no configurada" };
+  const errors: string[] = [];
+
+  // 1) Imagen 4 (modelos en cascada por si Google renombra)
+  for (const model of [
+    "imagen-4.0-fast-generate-001",
+    "imagen-4.0-generate-001",
+    "imagen-3.0-generate-002",
+  ]) {
+    try {
+      const r = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:predict?key=${GEMINI_KEY}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            instances: [{ prompt }],
+            parameters: { sampleCount: 1, aspectRatio: "1:1" },
+          }),
+          signal: AbortSignal.timeout(60000),
+        },
+      );
+      if (r.ok) {
+        const j = (await r.json()) as { predictions?: Array<{ bytesBase64Encoded?: string; mimeType?: string }> };
+        const pred = j.predictions?.[0];
+        const dataB64 = pred?.bytesBase64Encoded;
+        const mime = pred?.mimeType ?? "image/png";
+        if (dataB64) {
+          return { buffer: Buffer.from(dataB64, "base64"), mime, provider: `gemini:${model}` };
+        }
+        errors.push(`${model}: ok pero sin bytesBase64Encoded`);
+      } else {
+        const t = await r.text().catch(() => "");
+        errors.push(`${model}: HTTP ${r.status} ${t.slice(0, 100)}`);
+      }
+    } catch (e) {
+      errors.push(`${model}: ${(e as Error).message}`);
+    }
+  }
+
+  // 2) Fallback Gemini Flash Image
+  for (const model of ["gemini-2.5-flash-image", "gemini-3-pro-image-preview"]) {
+    try {
+      const r = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_KEY}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: { responseModalities: ["TEXT", "IMAGE"] },
+          }),
+          signal: AbortSignal.timeout(60000),
+        },
+      );
+      if (r.ok) {
+        const j = (await r.json()) as any;
+        const parts = j?.candidates?.[0]?.content?.parts ?? [];
+        for (const p of parts) {
+          if (p.inlineData?.data) {
+            const buffer = Buffer.from(p.inlineData.data, "base64");
+            return { buffer, mime: p.inlineData.mimeType ?? "image/png", provider: `gemini:${model}` };
+          }
+        }
+        errors.push(`${model}: ok pero sin inlineData en parts`);
+      } else {
+        errors.push(`${model}: HTTP ${r.status}`);
+      }
+    } catch (e) {
+      errors.push(`${model}: ${(e as Error).message}`);
+    }
+  }
+
+  return { error: `Todos los modelos fallaron: ${errors.join(" | ")}` };
+}
 
 export const dibujar = createTool({
   id: "dibujar",
@@ -37,24 +117,22 @@ export const dibujar = createTool({
       : (rawInput as any)) as { prompt: string; motivo: string };
 
     try {
-      // Llamar al endpoint interno /image/generate
-      const r = await fetch(`${API_URL}/image/generate`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt: ctx.prompt }),
-        signal: AbortSignal.timeout(60000),
-      });
-      if (!r.ok) {
-        return { ok: false, image_id: null, memory_id: null, url: null, error: `HTTP ${r.status}` };
+      // Generar imagen llamando DIRECTO a Gemini (sin pasar por HTTP propio)
+      const res = await generateImageDirect(ctx.prompt);
+      if ("error" in res) {
+        return { ok: false, image_id: null, memory_id: null, url: null, error: res.error };
       }
-      // El endpoint persiste en tanit_generated_images automáticamente.
-      // Recuperamos el último id de imagen
-      const imgR = await pool.query<{ id: number }>(
-        `SELECT id FROM tanit_generated_images ORDER BY created_at DESC LIMIT 1`,
-      );
-      const imageId = imgR.rows[0]?.id ?? null;
 
-      // Registrar en memoria con embedding para que la recuerde
+      // Persistir en tanit_generated_images
+      const insR = await pool.query<{ id: number }>(
+        `INSERT INTO tanit_generated_images
+            (prompt, mime_type, image_base64, size_bytes, provider, resource_id)
+         VALUES ($1, $2, $3, $4, $5, 'luis') RETURNING id`,
+        [ctx.prompt, res.mime, res.buffer.toString("base64"), res.buffer.length, res.provider],
+      );
+      const imageId = insR.rows[0]?.id ?? null;
+
+      // Registrar en memoria con embedding
       const memContent = `Dibujé esto: "${ctx.prompt}". Motivo: ${ctx.motivo}. Imagen id=${imageId}.`;
       const memR = await pool.query<{ id: number }>(
         `INSERT INTO tanit_memory (category, content, importance, created_at)
@@ -63,7 +141,6 @@ export const dibujar = createTool({
       );
       const memoryId = memR.rows[0]?.id ?? null;
 
-      // Embed inmediato para búsqueda semántica
       if (memoryId) {
         const vec = await generateEmbedding(memContent);
         if (vec) {
@@ -75,11 +152,14 @@ export const dibujar = createTool({
         }
       }
 
+      // URL pública vía el endpoint /image/:id que ya sirve el binario
+      const publicUrl = imageId ? `https://api.tanit.work/image/${imageId}` : null;
+
       return {
         ok: true,
         image_id: imageId,
         memory_id: memoryId,
-        url: imageId ? `${API_URL}/image/${imageId}` : null,
+        url: publicUrl,
         error: null,
       };
     } catch (e) {
