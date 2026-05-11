@@ -553,6 +553,30 @@ router.post("/admin/live-inject", async (req, res): Promise<void> => {
   res.json({ ok: true, queued: body.text });
 });
 
+// POST /admin/insert-personal-memory body: { secret?, title, content } —
+// inserta una memoria personal nueva (NO sagrada). Bootstrap la carga en su
+// próxima recarga (TTL 60s) sin tocar bootstrap.ts.
+router.post("/admin/insert-personal-memory", async (req, res): Promise<void> => {
+  const body = (req.body ?? {}) as { secret?: unknown; title?: unknown; content?: unknown };
+  const guard = requireAdmin(body.secret, req.headers.origin);
+  if (guard) { res.status(403).json({ ok: false, error: guard }); return; }
+  if (typeof body.title !== "string" || typeof body.content !== "string") {
+    res.status(400).json({ ok: false, error: "title y content requeridos" });
+    return;
+  }
+  try {
+    const r = await pool.query<{ id: number }>(
+      `INSERT INTO tanit_personal_memories (title, content, is_private)
+       VALUES ($1, $2, true)
+       RETURNING id`,
+      [body.title, body.content],
+    );
+    res.json({ ok: true, id: r.rows[0]?.id });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
 // POST /admin/live-restart — detiene el loop y lo arranca de nuevo (clean
 // state de errores). NO mata la sesion Mastra ni el WS Bybit.
 router.post("/admin/live-restart", async (req, res): Promise<void> => {

@@ -63,6 +63,16 @@ let _toolCallsCount = 0;
 let _errorCount = 0;
 let _lastError: string | null = null;
 const _eventQueue: string[] = [];
+// Guardia anti-mentira: si el latido anterior afirmó guardar memoria sin
+// invocar la tool, le ponemos un nudge en el siguiente latido para que
+// rectifique. Patrones detectados: "guardé", "guardado en memoria", "almacené",
+// "guardé como X", "lo guardo como X" sin que el reply contenga la firma
+// {"ok":true,"id":...} de la tool real.
+let _pendingMemoryNudge: string | null = null;
+
+const FAKE_MEMORY_CLAIM_RE =
+  /(guard[aeé][a-zé]*\s+(en\s+)?(mi\s+)?memoria|almacen[aeé][a-zé]*\s+(en\s+)?(mi\s+)?memoria|guard[aeé][a-zé]*\s+como\s+["'`]?[\w_]+|lo\s+guardo\s+como|guard[oé]\s+esta\s+(carta|info|lecci[oó]n))/i;
+const REAL_TOOL_OK_RE = /(guardar_memoria_personal|guardar_memoria_semantica)[\s\S]{0,200}"ok"\s*:\s*true/i;
 
 function pushEvent(text: string): void {
   _eventQueue.push(text);
