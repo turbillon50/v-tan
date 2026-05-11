@@ -96,12 +96,41 @@ async function runOneTick(): Promise<void> {
       autonomy.enabled &&
       autonomy.mode === "execute_with_governance" &&
       (!autonomy.paused_until || Date.now() >= new Date(autonomy.paused_until).getTime());
-    const prompt = canExecute ? EXECUTE_PROMPT : OBSERVE_PROMPT;
 
     logger.info(
       { tick: _ticks, mode: autonomy.mode, canExecute, dailyCount: autonomy.daily_trade_count },
       "[autonomous-loop] tick start",
     );
+
+    // ─── MOTOR DE TRADING AUTÓNOMO ───────────────────────────────────────
+    // Si canExecute=true, primero corre el motor (scanner + selector +
+    // executor). Esto opera la Tesis 5.1 sin depender de Mastra/Tanit.
+    // Después invocamos al agent para que OBSERVE el resultado y reporte
+    // en su thread (no para que decida — el motor ya decidió).
+    let engineReport: import("../lib/tanit-trading-engine").TickReport | null = null;
+    if (canExecute) {
+      try {
+        const { runEngineTick } = await import("../lib/tanit-trading-engine");
+        engineReport = await runEngineTick();
+        logger.info(
+          {
+            tick: _ticks,
+            scanned: engineReport.setupsScanned,
+            executed: engineReport.setupsExecuted,
+            pnlPct: engineReport.dailyState.pnlPct,
+            breaker: engineReport.dailyState.breakerActive,
+          },
+          "[autonomous-loop] engine tick",
+        );
+      } catch (engErr) {
+        logger.error({ err: engErr, tick: _ticks }, "[autonomous-loop] engine error");
+      }
+    }
+
+    const promptBase = canExecute ? EXECUTE_PROMPT : OBSERVE_PROMPT;
+    const prompt = engineReport
+      ? `${promptBase}\n\nReporte del motor en este tick:\n${JSON.stringify(engineReport, null, 2)}\n\nReporta brevemente qué hizo el motor (1-2 lineas) y si algo merece atención de Luis. NO ejecutes trades aquí — el motor ya operó.`
+      : promptBase;
     const stream = await tanitAgent.stream(
       [{ role: "user" as const, content: prompt }],
       {
