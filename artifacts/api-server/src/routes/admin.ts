@@ -619,6 +619,113 @@ router.get("/admin/gemini-keys/test", async (_req, res): Promise<void> => {
   res.json({ ok: true, results });
 });
 
+// GET /admin/audit/inventory → inventario de BD para auditoría total.
+// Counts por tabla + breakdown por categoría/tipo. Solo lectura, sin secret.
+router.get("/admin/audit/inventory", async (_req, res): Promise<void> => {
+  try {
+    const out: Record<string, unknown> = {};
+    // Memorias principales
+    const memCat = await pool.query<{ category: string; n: number }>(
+      `SELECT category, count(*)::int as n FROM tanit_memory GROUP BY category ORDER BY n DESC`,
+    );
+    const memTotal = await pool.query<{ n: number }>(`SELECT count(*)::int as n FROM tanit_memory`);
+    out.tanit_memory = { total: memTotal.rows[0]?.n ?? 0, byCategory: memCat.rows };
+    // Sagradas
+    const sacred = await pool.query<{ n: number }>(`SELECT count(*)::int as n FROM tanit_memory_sacred_lock`).catch(() => ({ rows: [{ n: -1 }] }));
+    out.tanit_memory_sacred_lock = { total: sacred.rows[0]?.n ?? -1 };
+    // Personal memories
+    const personal = await pool.query<{ type: string; n: number }>(
+      `SELECT type, count(*)::int as n FROM tanit_personal_memories GROUP BY type ORDER BY n DESC`,
+    );
+    const personalTotal = await pool.query<{ n: number }>(`SELECT count(*)::int as n FROM tanit_personal_memories`);
+    out.tanit_personal_memories = { total: personalTotal.rows[0]?.n ?? 0, byType: personal.rows };
+    // Chat por channel
+    const chat = await pool.query<{ channel: string; n: number }>(
+      `SELECT COALESCE(channel,'(null)') as channel, count(*)::int as n FROM tanit_chat GROUP BY channel ORDER BY n DESC`,
+    );
+    const chatTotal = await pool.query<{ n: number }>(`SELECT count(*)::int as n FROM tanit_chat`);
+    out.tanit_chat = { total: chatTotal.rows[0]?.n ?? 0, byChannel: chat.rows };
+    // Tesis
+    const thesis = await pool.query<{ id: number; version: string | null; len: number }>(
+      `SELECT id, version, length(content)::int as len FROM tanit_thesis ORDER BY id DESC LIMIT 5`,
+    );
+    out.tanit_thesis = { latest: thesis.rows };
+    // Mastra messages por thread
+    const mastra = await pool.query<{ thread_id: string; n: number }>(
+      `SELECT "threadId" as thread_id, count(*)::int as n FROM mastra_messages GROUP BY "threadId" ORDER BY n DESC LIMIT 20`,
+    ).catch((e) => ({ rows: [{ thread_id: `error: ${e.message}`, n: -1 }] }));
+    out.mastra_messages = { byThread: mastra.rows };
+    // Autonomy + governance
+    const autonomy = await pool.query(`SELECT * FROM tanit_autonomy_config LIMIT 1`).catch(() => ({ rows: [] }));
+    out.autonomy = autonomy.rows[0] ?? null;
+    const rules = await pool.query(`SELECT * FROM tanit_runtime_config WHERE key IN ('kill_switch_global','allowed_symbols','max_size_per_trade_usd','max_leverage','max_open_positions')`).catch(() => ({ rows: [] }));
+    out.governance_rules = rules.rows;
+    // Capital events recientes
+    const cap = await pool.query(
+      `SELECT id, type, amount_usd, reason, created_at FROM tanit_capital_events ORDER BY id DESC LIMIT 10`,
+    ).catch(() => ({ rows: [] }));
+    out.capital_events_recent = cap.rows;
+    // Audit log size
+    const audit = await pool.query<{ n: number }>(`SELECT count(*)::int as n FROM tanit_audit_log`).catch(() => ({ rows: [{ n: -1 }] }));
+    out.tanit_audit_log = { total: audit.rows[0]?.n ?? -1 };
+
+    res.json({ ok: true, inventory: out, at: new Date().toISOString() });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
+// GET /admin/audit/bootstrap → devuelve el systemPrompt que se inyecta a Tanit
+// ahora mismo (cache de 60s del loadBootstrap). Útil para ver qué la condiciona.
+router.get("/admin/audit/bootstrap", async (_req, res): Promise<void> => {
+  try {
+    const { loadBootstrap } = await import("../mastra/bootstrap");
+    const ctx = await loadBootstrap();
+    res.json({
+      ok: true,
+      systemPromptLength: ctx.systemPrompt.length,
+      systemPromptPreview: ctx.systemPrompt.slice(0, 6000),
+      systemPromptTail: ctx.systemPrompt.slice(-3000),
+      recentTurnsCount: ctx.recentTurns.length,
+      generatedAt: ctx.generatedAt,
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
+// GET /admin/audit/diagnose-mastra → diagnostica por qué Mastra puede tardar.
+// Mide tiempo de cada parte: loadBootstrap, Neon query trivial, Memory init test.
+router.get("/admin/audit/diagnose-mastra", async (_req, res): Promise<void> => {
+  const timings: Record<string, number | string> = {};
+  try {
+    const t0 = Date.now();
+    await pool.query(`SELECT 1`);
+    timings.neonTrivialMs = Date.now() - t0;
+
+    const t1 = Date.now();
+    const { loadBootstrap, invalidateBootstrap } = await import("../mastra/bootstrap");
+    invalidateBootstrap();
+    const ctx = await loadBootstrap({ force: true });
+    timings.loadBootstrapColdMs = Date.now() - t1;
+    timings.systemPromptLen = ctx.systemPrompt.length;
+    timings.recentTurns = ctx.recentTurns.length;
+
+    const t2 = Date.now();
+    await pool.query(`SELECT count(*)::int as n FROM mastra_messages`);
+    timings.mastraMessagesCountMs = Date.now() - t2;
+
+    const t3 = Date.now();
+    await pool.query(`SELECT count(*)::int as n FROM tanit_memory`);
+    timings.tanitMemoryCountMs = Date.now() - t3;
+
+    res.json({ ok: true, timings });
+  } catch (e) {
+    timings.error = e instanceof Error ? e.message : String(e);
+    res.status(500).json({ ok: false, timings });
+  }
+});
+
 // POST /admin/insert-personal-memory body: { secret?, title, content } —
 // inserta una memoria personal nueva (NO sagrada). Bootstrap la carga en su
 // próxima recarga (TTL 60s) sin tocar bootstrap.ts.
