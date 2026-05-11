@@ -428,4 +428,77 @@ router.post("/admin/kill-switch", async (req, res): Promise<void> => {
   }
 });
 
+/**
+ * Eventos de capital — Luis marca cuando hace retiro/depósito/conversión
+ * que mueve el equity SIN ser PnL de trading. El gráfico usa estos eventos
+ * para NO mostrar esos movimientos como ganancia/pérdida del motor.
+ */
+router.get("/admin/capital-events", async (_req, res): Promise<void> => {
+  try {
+    const r = await pool.query(
+      `SELECT id, event_type, delta_usd, equity_before, equity_after, note, auto_detected, created_at
+         FROM tanit_capital_events ORDER BY created_at DESC LIMIT 100`,
+    );
+    res.json({ ok: true, events: r.rows });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
+router.post("/admin/capital-events", async (req, res): Promise<void> => {
+  const body = (req.body ?? {}) as {
+    event_type?: unknown;
+    delta_usd?: unknown;
+    note?: unknown;
+    secret?: unknown;
+  };
+  const guard = requireAdmin(body.secret, req.headers.origin);
+  if (guard) {
+    res.status(403).json({ ok: false, error: guard });
+    return;
+  }
+  const event_type = typeof body.event_type === "string" ? body.event_type : null;
+  const delta_usd = typeof body.delta_usd === "number" ? body.delta_usd : parseFloat(String(body.delta_usd ?? ""));
+  const note = typeof body.note === "string" ? body.note : null;
+  if (!event_type || !["deposit", "withdraw", "conversion", "adjustment"].includes(event_type)) {
+    res.status(400).json({ ok: false, error: "event_type debe ser deposit/withdraw/conversion/adjustment" });
+    return;
+  }
+  if (!isFinite(delta_usd)) {
+    res.status(400).json({ ok: false, error: "delta_usd numérico requerido" });
+    return;
+  }
+  try {
+    // Snapshot del equity actual para tener referencia
+    const balR = await pool.query<{ equity: string }>(
+      `SELECT equity FROM balance_snapshots ORDER BY created_at DESC LIMIT 1`,
+    );
+    const equityNow = balR.rows[0] ? parseFloat(balR.rows[0].equity) : 0;
+    const equityBefore = equityNow - delta_usd;
+
+    const r = await pool.query(
+      `INSERT INTO tanit_capital_events (event_type, delta_usd, equity_before, equity_after, note, auto_detected)
+       VALUES ($1, $2, $3, $4, $5, false) RETURNING id, created_at`,
+      [event_type, delta_usd, equityBefore, equityNow, note],
+    );
+    res.json({ ok: true, id: r.rows[0]?.id, created_at: r.rows[0]?.created_at });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
+router.delete("/admin/capital-events/:id", async (req, res): Promise<void> => {
+  const guard = requireAdmin((req.query.secret ?? req.body?.secret) as unknown, req.headers.origin);
+  if (guard) {
+    res.status(403).json({ ok: false, error: guard });
+    return;
+  }
+  try {
+    await pool.query(`DELETE FROM tanit_capital_events WHERE id = $1`, [req.params.id]);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
 export default router;
