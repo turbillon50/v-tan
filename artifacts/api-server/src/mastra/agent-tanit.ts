@@ -192,29 +192,9 @@ export function getAgentForPool(pool: Pool): { agent: Agent; envName: string } |
  * caller puede iterarlo igual que un fullStream/textStream normal.
  */
 
-async function probeAndMerge<T>(
-  iter: AsyncIterator<T>,
-): Promise<{ merged: AsyncIterable<T>; firstChunk: T | null }> {
-  const first = await iter.next();
-  if (first.done) {
-    return { merged: (async function* () {})(), firstChunk: null };
-  }
-  const merged = (async function* () {
-    yield first.value;
-    while (true) {
-      const r = await iter.next();
-      if (r.done) break;
-      yield r.value;
-    }
-  })();
-  return { merged, firstChunk: first.value };
-}
-
 /**
  * Detecta si un chunk de Mastra fullStream/textStream representa un error
- * de Gemini "Resource exhausted". Mastra emite el error como chunk
- * `{type: "error", payload: { error: "..." }}` en lugar de lanzar excepción,
- * por eso necesitamos esta inspección.
+ * de Gemini "Resource exhausted".
  */
 function chunkIsExhaustedError(chunk: unknown): boolean {
   if (chunk == null) return false;
@@ -226,6 +206,50 @@ function chunkIsExhaustedError(chunk: unknown): boolean {
     return isExhaustedError(errVal ?? "");
   }
   return false;
+}
+
+function chunkIsTextDelta(chunk: unknown): boolean {
+  if (chunk == null) return false;
+  if (typeof chunk === "string") return chunk.length > 0;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const c = chunk as any;
+  return c.type === "text-delta" || c.type === "tool-call" || c.type === "tool-result";
+}
+
+/**
+ * Lee chunks del iterator hasta encontrar uno definitivo (texto/tool/error).
+ * Devuelve los chunks acumulados y un flag de "exhausted detectado".
+ * Esto cubre el caso donde Mastra emite chunks "start"/"finish-metadata"
+ * antes del error real de Gemini.
+ */
+async function probeAndMerge<T>(
+  iter: AsyncIterator<T>,
+  maxProbe = 5,
+): Promise<{ merged: AsyncIterable<T>; exhausted: boolean }> {
+  const buffer: T[] = [];
+  let exhausted = false;
+  for (let i = 0; i < maxProbe; i++) {
+    const r = await iter.next();
+    if (r.done) break;
+    buffer.push(r.value);
+    if (chunkIsExhaustedError(r.value)) {
+      exhausted = true;
+      break;
+    }
+    if (chunkIsTextDelta(r.value)) break;
+  }
+  if (exhausted) {
+    return { merged: (async function* () {})(), exhausted: true };
+  }
+  const merged = (async function* () {
+    for (const c of buffer) yield c;
+    while (true) {
+      const r = await iter.next();
+      if (r.done) break;
+      yield r.value;
+    }
+  })();
+  return { merged, exhausted: false };
 }
 
 export async function streamFullWithPool(
@@ -249,12 +273,11 @@ export async function streamFullWithPool(
       const stream = await (pick.agent as any).stream(messages, options);
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const iter = stream.fullStream[Symbol.asyncIterator]() as AsyncIterator<any>;
-      const { merged, firstChunk } = await probeAndMerge(iter);
-      // Si el primer chunk YA es un error de cuota, rotamos antes de mandar nada.
-      if (chunkIsExhaustedError(firstChunk)) {
+      const { merged, exhausted } = await probeAndMerge(iter);
+      if (exhausted) {
         markKeyExhausted(pick.envName);
-        logger.warn({ envName: pick.envName, pool, attempt }, "[streamFull] primer chunk exhausted, rotando");
-        lastErr = new Error("first chunk exhausted");
+        logger.warn({ envName: pick.envName, pool, attempt }, "[streamFull] exhausted en probe, rotando");
+        lastErr = new Error("exhausted en probe");
         continue;
       }
       return { fullStream: merged, envName: pick.envName };
@@ -293,11 +316,11 @@ export async function streamTextWithPool(
       // Mastra debería lanzar al hacer next(). Pero por si la versión actual
       // emite un primer "" antes del error, también probamos a leer dos chunks.
       const iter = stream.textStream[Symbol.asyncIterator]() as AsyncIterator<string>;
-      const { merged, firstChunk } = await probeAndMerge<string>(iter);
-      if (chunkIsExhaustedError(firstChunk)) {
+      const { merged, exhausted } = await probeAndMerge<string>(iter);
+      if (exhausted) {
         markKeyExhausted(pick.envName);
-        logger.warn({ envName: pick.envName, pool, attempt }, "[streamText] primer chunk exhausted, rotando");
-        lastErr = new Error("first chunk exhausted");
+        logger.warn({ envName: pick.envName, pool, attempt }, "[streamText] exhausted en probe, rotando");
+        lastErr = new Error("exhausted en probe");
         continue;
       }
       return { textStream: merged, envName: pick.envName };
