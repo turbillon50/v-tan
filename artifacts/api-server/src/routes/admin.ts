@@ -892,6 +892,70 @@ router.get("/admin/audit/diagnose-mastra", async (_req, res): Promise<void> => {
   }
 });
 
+// POST /admin/thesis/replace body: { secret?, oldVersion, newVersion, text,
+// expectedWr?, expectedTradesPerDay?, expectedProfitFactor?, expectedMaxDrawdownPct?,
+// authoredBy?, reason?, actualOutcomeForOld? }
+// Atómicamente: oldVersion → active=false + closed_at + actual_outcome.
+// newVersion → INSERT active=true con los expected* poblados.
+router.post("/admin/thesis/replace", async (req, res): Promise<void> => {
+  const body = (req.body ?? {}) as {
+    secret?: unknown;
+    oldVersion?: number;
+    newVersion?: number;
+    text?: string;
+    expectedWr?: number;
+    expectedTradesPerDay?: number;
+    expectedProfitFactor?: number;
+    expectedMaxDrawdownPct?: number;
+    authoredBy?: string;
+    reason?: string;
+    actualOutcomeForOld?: string;
+  };
+  const guard = requireAdmin(body.secret, req.headers.origin);
+  if (guard) { res.status(403).json({ ok: false, error: guard }); return; }
+  if (typeof body.newVersion !== "number" || typeof body.text !== "string") {
+    res.status(400).json({ ok: false, error: "newVersion (int) y text requeridos" });
+    return;
+  }
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    if (typeof body.oldVersion === "number") {
+      await client.query(
+        `UPDATE tanit_thesis
+           SET active = false, closed_at = now(), actual_outcome = $2
+         WHERE version = $1 AND active = true`,
+        [body.oldVersion, body.actualOutcomeForOld ?? `reemplazada por v${body.newVersion}`],
+      );
+    }
+    const ins = await client.query<{ id: number }>(
+      `INSERT INTO tanit_thesis
+        (version, text, expected_wr, expected_trades_per_day,
+         expected_profit_factor, expected_max_drawdown_pct,
+         active, authored_by, reason, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, true, $7, $8, now())
+       RETURNING id`,
+      [
+        body.newVersion,
+        body.text,
+        body.expectedWr ?? null,
+        body.expectedTradesPerDay ?? null,
+        body.expectedProfitFactor ?? null,
+        body.expectedMaxDrawdownPct ?? null,
+        body.authoredBy ?? "tanit",
+        body.reason ?? null,
+      ],
+    );
+    await client.query("COMMIT");
+    res.json({ ok: true, newId: ins.rows[0]?.id, newVersion: body.newVersion });
+  } catch (e) {
+    await client.query("ROLLBACK").catch(() => {});
+    res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+  } finally {
+    client.release();
+  }
+});
+
 // POST /admin/insert-personal-memory body: { secret?, title, content } —
 // inserta una memoria personal nueva (NO sagrada). Bootstrap la carga en su
 // próxima recarga (TTL 60s) sin tocar bootstrap.ts.
