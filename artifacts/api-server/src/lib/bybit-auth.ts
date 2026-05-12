@@ -1,7 +1,11 @@
 import { createHmac } from "crypto";
 import { getKey } from "./api-keys-provider";
 
-let useTestnet = true;
+// Default false: producción real. Override con env var BYBIT_TESTNET=true para
+// pruebas. Históricamente esto estaba hardcoded a true y mentía: el proxy
+// motivated-prosperity siempre va a mainnet, pero consultar_estado_sistema()
+// reportaba testnet:true confundiendo a Tanit y a Luis.
+let useTestnet = process.env.BYBIT_TESTNET === "true";
 const MAINNET_URL = "https://api.bybit.com";
 const TESTNET_URL = "https://api-testnet.bybit.com";
 const RECV_WINDOW = "5000";
@@ -359,15 +363,26 @@ export async function fetchQtyRule(symbol: string): Promise<{ min: number; step:
   return QTY_RULES_LOCAL[symbol] ?? { min: 0.001, step: 0.001, dp: 3 };
 }
 
+/**
+ * Convierte size_usd + leverage en qty de Bybit respetando lot step.
+ *
+ * IMPORTANTE: si el nocional pedido (capitalUSDT * leverage) es menor al
+ * MIN_NOTIONAL de Bybit ($5), retorna null. NO infla silenciosamente.
+ * Históricamente este fn inflaba al min_step, causando "Luis pidió $1 y se
+ * enviaron $80" (lección 2026-05-09). Si no alcanza, el caller debe abortar
+ * y pedirle al usuario subir size o leverage.
+ */
 export async function calcQtyReal(symbol: string, capitalUSDT: number, leverage: number, price: number): Promise<string | null> {
   const rule = await fetchQtyRule(symbol);
   const notional = capitalUSDT * leverage;
-  const rawQty   = notional / price;
-  let stepped    = Math.floor(rawQty / rule.step) * rule.step;
-  // Si el nocional real queda por debajo del mínimo de Bybit ($5), subir un step
   const BYBIT_MIN_NOTIONAL = 5.0;
-  if (stepped * price < BYBIT_MIN_NOTIONAL) stepped += rule.step;
+  // Pre-check: el nocional pedido no alcanza el mínimo de Bybit. NO inflar.
+  if (notional < BYBIT_MIN_NOTIONAL) return null;
+  const rawQty  = notional / price;
+  const stepped = Math.floor(rawQty / rule.step) * rule.step;
   if (stepped < rule.min) return null;
+  // Defensiva: tras el rounding-down podría caer bajo el min notional.
+  if (stepped * price < BYBIT_MIN_NOTIONAL) return null;
   return stepped.toFixed(rule.dp);
 }
 
@@ -411,14 +426,87 @@ export function calcQty(symbol: string, capitalUSDT: number, leverage: number, p
 // ═══════════════════════════════════════════════════════════════════════════════
 
 export async function setLeverage(symbol: string, leverage: number): Promise<boolean> {
+  const r = await setLeverageDetailed(symbol, leverage);
+  return r.ok;
+}
+
+export async function setLeverageDetailed(
+  symbol: string, leverage: number
+): Promise<{ ok: boolean; retCode: number | null; retMsg: string }> {
   try {
-    await bybitPrivate("POST", "/v5/position/set-leverage", {
+    const d = await bybitPrivate("POST", "/v5/position/set-leverage", {
       category: "linear", symbol,
       buyLeverage:  String(leverage),
       sellLeverage: String(leverage),
     });
-    return true;
-  } catch { return false; }
+    // 0 = OK, 110043 = leverage sin cambio (también OK)
+    if (d?.retCode === 0 || d?.retCode === 110043) {
+      return { ok: true, retCode: d.retCode, retMsg: d?.retMsg ?? "OK" };
+    }
+    console.error(`[bybit] setLeverage ${symbol} ${leverage}x retCode=${d?.retCode} msg=${d?.retMsg}`);
+    return {
+      ok: false,
+      retCode: typeof d?.retCode === "number" ? d.retCode : null,
+      retMsg: String(d?.retMsg ?? "Bybit no devolvió retCode"),
+    };
+  } catch (e) {
+    console.error(`[bybit] setLeverage ${symbol} exception:`, e);
+    return { ok: false, retCode: null, retMsg: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+/**
+ * Agrega o quita margen manualmente a una posición isolated.
+ * margin: positivo = añade, negativo = quita.
+ * Requiere positionIdx correcto (0 one-way, 1 long-hedge, 2 short-hedge).
+ */
+export async function addPositionMargin(
+  symbol: string, marginUsd: number, positionIdx = 0
+): Promise<{ ok: boolean; retCode: number | null; retMsg: string }> {
+  try {
+    const d = await bybitPrivate("POST", "/v5/position/add-margin", {
+      category: "linear", symbol, margin: String(marginUsd), positionIdx,
+    });
+    if (d?.retCode === 0) return { ok: true, retCode: 0, retMsg: "OK" };
+    console.error(`[bybit] addPositionMargin ${symbol} ${marginUsd} retCode=${d?.retCode} msg=${d?.retMsg}`);
+    return {
+      ok: false,
+      retCode: typeof d?.retCode === "number" ? d.retCode : null,
+      retMsg: String(d?.retMsg ?? "Bybit no devolvió retCode"),
+    };
+  } catch (e) {
+    return { ok: false, retCode: null, retMsg: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+/**
+ * Cambia el modo de margen de un símbolo: 0=cross, 1=isolated.
+ * Requiere setear leverage al mismo tiempo (Bybit lo exige).
+ */
+export async function switchMarginMode(
+  symbol: string, mode: 0 | 1, leverage: number
+): Promise<{ ok: boolean; retCode: number | null; retMsg: string }> {
+  try {
+    const d = await bybitPrivate("POST", "/v5/position/switch-isolated", {
+      category: "linear",
+      symbol,
+      tradeMode: mode, // 0 = cross, 1 = isolated
+      buyLeverage: String(leverage),
+      sellLeverage: String(leverage),
+    });
+    // 0 = OK, 110026 = ya está en ese modo (también OK)
+    if (d?.retCode === 0 || d?.retCode === 110026) {
+      return { ok: true, retCode: d.retCode, retMsg: d?.retMsg ?? "OK" };
+    }
+    console.error(`[bybit] switchMarginMode ${symbol} mode=${mode} retCode=${d?.retCode} msg=${d?.retMsg}`);
+    return {
+      ok: false,
+      retCode: typeof d?.retCode === "number" ? d.retCode : null,
+      retMsg: String(d?.retMsg ?? "Bybit no devolvió retCode"),
+    };
+  } catch (e) {
+    return { ok: false, retCode: null, retMsg: e instanceof Error ? e.message : String(e) };
+  }
 }
 
 export async function switchPositionMode(symbol: string, mode: 0 | 3): Promise<boolean> {
@@ -448,37 +536,104 @@ export async function placeMarketOrder(
   }
 }
 
+/**
+ * Variante de placeMarketOrder que devuelve el detalle del error de Bybit
+ * (retCode + retMsg) en lugar de null silencioso. Necesario para que las
+ * tools de Tanit puedan reportar a Luis QUÉ rechazó Bybit y por qué.
+ *
+ * Auto-retry inteligente para retCode=10001 ('position idx not match
+ * position mode'): la cuenta puede estar en One-Way (idx=0) o Hedge Mode
+ * (idx=1 long, idx=2 short). Si el primer intento falla con ese error,
+ * reintentamos con el idx alternativo según el side.
+ */
+export async function placeMarketOrderDetailed(
+  symbol: string, side: "Buy" | "Sell", qty: string,
+  reduceOnly = false, positionIdx = 0
+): Promise<
+  | { ok: true; orderId: string; positionMode: "one-way" | "hedge" }
+  | { ok: false; retCode: number | null; retMsg: string }
+> {
+  const tryOrder = async (idx: number): Promise<any> => {
+    try {
+      return await bybitPrivate("POST", "/v5/order/create", {
+        category: "linear", symbol, side, orderType: "Market", qty,
+        timeInForce: "GoodTillCancel", reduceOnly, positionIdx: idx,
+      });
+    } catch (e) {
+      return { _exception: e instanceof Error ? e.message : String(e) };
+    }
+  };
+
+  // Primer intento con el idx solicitado (default 0 = One-Way)
+  let d = await tryOrder(positionIdx);
+  if (d?.retCode === 0 && d?.result?.orderId) {
+    return { ok: true, orderId: String(d.result.orderId), positionMode: positionIdx === 0 ? "one-way" : "hedge" };
+  }
+
+  // Si fue 10001 (position idx mismatch), reintentar con idx alternativo
+  if (d?.retCode === 10001 && /position idx/i.test(String(d?.retMsg ?? ""))) {
+    // Si pidió 0 (One-Way) y falló, cuenta está en Hedge → idx 1 long, 2 short
+    // Si pidió 1/2 (Hedge) y falló, cuenta está en One-Way → idx 0
+    const altIdx = positionIdx === 0 ? (side === "Buy" ? 1 : 2) : 0;
+    console.warn(`[bybit-real] retCode=10001 retry: positionIdx ${positionIdx} → ${altIdx} (side=${side})`);
+    d = await tryOrder(altIdx);
+    if (d?.retCode === 0 && d?.result?.orderId) {
+      return {
+        ok: true,
+        orderId: String(d.result.orderId),
+        positionMode: altIdx === 0 ? "one-way" : "hedge",
+      };
+    }
+  }
+
+  // Fallo definitivo
+  if (d?._exception) {
+    return { ok: false, retCode: null, retMsg: String(d._exception) };
+  }
+  return {
+    ok: false,
+    retCode: typeof d?.retCode === "number" ? d.retCode : null,
+    retMsg: String(d?.retMsg ?? "Bybit no devolvió orderId"),
+  };
+}
+
 export async function closePosition(
   symbol: string, direction: "LONG" | "SHORT", qty: string, positionIdx = 0
 ): Promise<boolean> {
+  const result = await closePositionDetailed(symbol, direction, qty, positionIdx);
+  return result.ok;
+}
+
+export async function closePositionDetailed(
+  symbol: string, direction: "LONG" | "SHORT", qty: string, positionIdx = 0
+): Promise<{ ok: boolean; orderId?: string; error?: string }> {
   const side = direction === "LONG" ? "Sell" : "Buy";
   invalidateBalanceCache();
-  const orderId = await placeMarketOrder(symbol, side, qty, true, positionIdx);
-  return !!orderId;
+  const result = await placeMarketOrderDetailed(symbol, side, qty, true, positionIdx);
+  if (result.ok) {
+    console.log(`[bybit] closePositionDetailed OK: ${symbol} ${direction} qty=${qty} orderId=${result.orderId} positionMode=${result.positionMode}`);
+    return { ok: true, orderId: result.orderId };
+  }
+  return { ok: false, error: `${result.retCode}: ${result.retMsg}` };
 }
 
 export async function closePositionMainnet(
   symbol: string, direction: "LONG" | "SHORT", qty: string, positionIdx = 0
 ): Promise<boolean> {
-  const side = direction === "LONG" ? "Sell" : "Buy";
-  invalidateBalanceCache();
-  try {
-    const d = await bybitPrivate("POST", "/v5/order/create", {
-      category: "linear", symbol, side, orderType: "Market", qty,
-      timeInForce: "GoodTillCancel", reduceOnly: true, positionIdx,
-    });
-    if (d?.retCode === 0) return true;
-    console.error("[bybit] closePositionMainnet error:", d?.retMsg);
-    return false;
-  } catch (e) {
-    console.error("[bybit] closePositionMainnet exception:", e);
-    return false;
-  }
+  const result = await closePositionDetailed(symbol, direction, qty, positionIdx);
+  return result.ok;
 }
 
 export async function setTradingStop(
   symbol: string, stopLoss?: number, takeProfit?: number | null, positionIdx = 0
 ): Promise<boolean> {
+  const r = await setTradingStopDetailed(symbol, stopLoss, takeProfit, positionIdx);
+  return r.ok;
+}
+
+export async function setTradingStopDetailed(
+  symbol: string, stopLoss?: number, takeProfit?: number | null, positionIdx = 0
+): Promise<{ ok: boolean; retCode: number | null; retMsg: string }> {
   try {
     const params: Record<string, unknown> = { category: "linear", symbol, positionIdx };
     if (stopLoss != null) params.stopLoss = String(stopLoss);
@@ -487,18 +642,23 @@ export async function setTradingStop(
     } else if (takeProfit === null) {
       params.takeProfit = "0";
     }
-    const d = await bybitPrivate("POST", "/v5/position/set-trading-stop", params);
+    const d = await bybitPrivate("POST", "/v5/position/trading-stop", params);
     if (d?.error === "Unexpected end of JSON input") {
       console.log(`[bybit] setTradingStop ${symbol} OK (empty body = success)`);
-      return true;
+      return { ok: true, retCode: 0, retMsg: "OK (empty body)" };
     }
     if (d?.retCode !== 0) {
       console.error(`[bybit] setTradingStop ${symbol} retCode=${d?.retCode} msg=${d?.retMsg}`);
     }
-    return d?.retCode === 0;
+    if (d?.retCode === 0) return { ok: true, retCode: 0, retMsg: "OK" };
+    return {
+      ok: false,
+      retCode: typeof d?.retCode === "number" ? d.retCode : null,
+      retMsg: String(d?.retMsg ?? "Bybit no devolvió retCode"),
+    };
   } catch (e: any) {
     console.error(`[bybit] setTradingStop ${symbol} EXCEPCION:`, e);
-    return false;
+    return { ok: false, retCode: null, retMsg: e instanceof Error ? e.message : String(e) };
   }
 }
 

@@ -1,6 +1,7 @@
 import { registerTelegramCommandHandler, startTelegramPolling } from "./telegram";
 import { pauseTrading, resumeTrading, isTradingPaused, getEngineState, runGeminiUserCommand } from "./trading-engine";
 import { getHybridStatus, isHybridActive } from "./hybrid-engine";
+import { getAutonomyConfig, updateAutonomyConfig } from "./autonomy";
 
 const TAG = "[telegram-commands]";
 
@@ -87,6 +88,60 @@ async function handleCommand(cmd: string): Promise<string> {
       pauseTrading();
       console.log(TAG, "Trading pausado vía Telegram");
       return "⏸ <b>Trading pausado.</b>\nTanit no abrirá nuevas posiciones hasta que envíes /reanudar.\nLas posiciones abiertas siguen gestionadas con normalidad.";
+    }
+
+    // ── /activar — Anillo 3: enciende autonomía operativa ─────────────────
+    case "/activar": {
+      try {
+        const before = await getAutonomyConfig({ force: true });
+        const changes: string[] = [];
+        if (before.mode !== "execute_with_governance") {
+          await updateAutonomyConfig({
+            field: "mode",
+            value: "execute_with_governance",
+            actor: "luis-telegram",
+            reason: "comando /activar desde Telegram",
+          });
+          changes.push(`mode: ${before.mode} → execute_with_governance`);
+        }
+        if (!before.enabled) {
+          await updateAutonomyConfig({
+            field: "enabled",
+            value: true,
+            actor: "luis-telegram",
+            reason: "comando /activar desde Telegram",
+          });
+          changes.push("enabled: false → true");
+        }
+        const after = await getAutonomyConfig({ force: true });
+        if (changes.length === 0) {
+          return `🟢 <b>Tanit ya está operativa.</b>\nMode: ${after.mode}\nMax pos: $${after.max_autonomous_size_usd.toFixed(2)} · ${after.max_autonomous_leverage}x\nTrades hoy: ${after.daily_trade_count}/${after.max_daily_trades}`;
+        }
+        return `🟢 <b>ANILLO 3 ACTIVADO</b>\nTanit puede operar dentro de governance.\n\n<b>Cambios:</b>\n${changes.map((c) => `• ${c}`).join("\n")}\n\n<b>Topes:</b>\n• Max por trade: $${after.max_autonomous_size_usd.toFixed(2)} · ${after.max_autonomous_leverage}x\n• Trades por día: ${after.max_daily_trades}\n• Cooldown: ${after.cooldown_minutes_between_trades} min\n\nCada trade requiere confirmación humana en el chat. Usa /desactivar para apagar.`;
+      } catch (e) {
+        return `❌ Error activando autonomía: ${(e as Error).message}`;
+      }
+    }
+
+    // ── /desactivar — Anillo 3: apaga autonomía operativa ─────────────────
+    case "/desactivar": {
+      try {
+        await updateAutonomyConfig({
+          field: "mode",
+          value: "observe_only",
+          actor: "luis-telegram",
+          reason: "comando /desactivar desde Telegram",
+        });
+        await updateAutonomyConfig({
+          field: "enabled",
+          value: false,
+          actor: "luis-telegram",
+          reason: "comando /desactivar desde Telegram",
+        });
+        return `🔴 <b>Autonomía desactivada.</b>\nTanit vuelve a modo observe_only. Las posiciones abiertas siguen como están.`;
+      } catch (e) {
+        return `❌ Error desactivando autonomía: ${(e as Error).message}`;
+      }
     }
 
     // ── /reanudar — reanudar apertura de posiciones ───────────────────────

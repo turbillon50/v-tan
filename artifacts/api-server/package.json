@@ -10,8 +10,14 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@ai-sdk/google": "^3.0.68",
+    "@ai-sdk/openai": "^3.0.63",
     "@google/genai": "^1.49.0",
+    "@mastra/core": "^1.32.1",
+    "@mastra/memory": "^1.17.5",
+    "@mastra/pg": "^1.10.0",
     "@types/express-session": "^1.18.2",
+    "@types/pg": "^8.18.0",
     "@types/ws": "^8.18.1",
     "@workspace/api-zod": "workspace:*",
     "@workspace/db": "workspace:*",
@@ -19,11 +25,14 @@
     "cookie-parser": "^1.4.7",
     "cors": "^2",
     "drizzle-orm": "catalog:",
+    "drizzle-zod": "^0.8.3",
     "express": "^5",
     "express-session": "^1.19.0",
+    "pg": "^8.20.0",
     "pino": "^9",
     "pino-http": "^10",
-    "ws": "^8.20.0"
+    "ws": "^8.20.0",
+    "zod": "catalog:"
   },
   "devDependencies": {
     "@types/cookie-parser": "^1.4.10",

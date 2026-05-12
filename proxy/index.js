@@ -69,8 +69,33 @@ app.post("/proxy", async (req, res) => {
       signal: AbortSignal.timeout(10000),
     });
 
-    const data = await response.json();
-    res.json(data);
+    // Bybit a veces responde con body vacío en endpoints como
+    // /v5/position/set-trading-stop cuando solo cambia parámetros sin error.
+    // Si status 2xx y body vacío → retornamos {retCode:0, retMsg:"OK"} para
+    // que el cliente lo interprete como éxito. Si status no es 2xx, devolvemos
+    // el status + cuerpo crudo para que el cliente vea el error real.
+    const text = await response.text();
+    if (!text || text.trim() === "") {
+      if (response.ok) {
+        return res.json({ retCode: 0, retMsg: "OK", result: {} });
+      }
+      return res.status(response.status).json({
+        retCode: -1,
+        retMsg: `Bybit ${response.status} con body vacío`,
+        result: {},
+      });
+    }
+    try {
+      const data = JSON.parse(text);
+      res.json(data);
+    } catch (parseErr) {
+      // No es JSON. Devolvemos como retMsg para que el cliente lo vea.
+      res.status(response.ok ? 200 : response.status).json({
+        retCode: response.ok ? 0 : -1,
+        retMsg: text.slice(0, 500),
+        result: {},
+      });
+    }
   } catch (e) {
     res.status(502).json({ error: e?.message || "Error conectando a Bybit" });
   }

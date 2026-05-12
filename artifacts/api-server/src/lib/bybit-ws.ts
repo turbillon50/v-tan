@@ -69,6 +69,16 @@ let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let subscribedSymbols: string[] = [];
 let _connected = false;
 
+// Listeners de precio en tiempo real — para gestión activa de posiciones
+// Cuando llega un nuevo tick de tickers.SYMBOL, notifica a todos los listeners.
+type PriceListener = (symbol: string, price: number) => void;
+const _priceListeners = new Set<PriceListener>();
+
+export function onPriceUpdate(cb: PriceListener): () => void {
+  _priceListeners.add(cb);
+  return () => { _priceListeners.delete(cb); };
+}
+
 export function isWsConnected(): boolean { return _connected; }
 
 export function getWsPrice(symbol: string): number | null {
@@ -147,7 +157,14 @@ function connect(): void {
         const data = msg.data;
         if (data?.lastPrice) {
           const sym = msg.topic.replace("tickers.", "");
-          priceCache[sym] = parseFloat(data.lastPrice);
+          const newPrice = parseFloat(data.lastPrice);
+          priceCache[sym] = newPrice;
+          // Notificar listeners de precio en tiempo real (manage activo)
+          if (_priceListeners.size > 0) {
+            for (const cb of _priceListeners) {
+              try { cb(sym, newPrice); } catch {}
+            }
+          }
           if (data.fundingRate !== undefined && data.fundingRate !== "") {
             const fr = parseFloat(data.fundingRate);
             if (!isNaN(fr)) fundingRateCache[sym] = fr;

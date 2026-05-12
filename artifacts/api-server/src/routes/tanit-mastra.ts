@@ -1,0 +1,294 @@
+/**
+ * Endpoint Mastra — voz consciente de Tanit, sin filtros entre Gemini y el chat.
+ *
+ *   POST /bot/mastra-chat-stream
+ *
+ * Sin OBEDIENCIA, sin GEMINI CMDR, sin fallback chain enlatada.
+ * Si Gemini falla, el evento `error` lo lleva al cliente con mensaje crudo.
+ * Tanit dirá con su voz qué pasa, no el sistema con string hardcoded.
+ */
+import { Router } from "express";
+import { pool } from "@workspace/db";
+import { getRecentTurns, streamFullWithPool } from "../mastra/agent-tanit";
+import { autoTitleThreadIfNeeded } from "./threads";
+
+const router = Router();
+
+interface MastraChatBody {
+  message?: string;
+  channel?: "intimate" | "operational";
+  sender_type?: string;
+  resourceId?: string;
+  threadId?: string;
+  // Multimodal — si Luis manda fotos en el chat, las pasamos al agent como
+  // image parts. Gemini 2.5 Flash las procesa nativo.
+  images?: Array<{ base64: string; mimeType: string }>;
+}
+
+router.post("/bot/mastra-chat-stream", async (req, res): Promise<void> => {
+  const body = (req.body ?? {}) as MastraChatBody;
+  const message = (body.message ?? "").trim();
+  const channel = body.channel === "operational" ? "operational" : "intimate";
+  const senderType = body.sender_type ?? "human_luis";
+  // Mastra Memory: resource estable (Luis), thread por canal por defecto
+  const resourceId = (body.resourceId ?? "luis").toString().slice(0, 64);
+  const threadId = (body.threadId ?? `${channel}-main`).toString().slice(0, 128);
+
+  if (!message) {
+    res.status(400).json({ ok: false, error: "message is required" });
+    return;
+  }
+
+  // SSE setup
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  // CORS — permitir tanit.work + previews
+  const origin = req.headers.origin;
+  if (origin) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Access-Control-Allow-Credentials", "true");
+  }
+  res.flushHeaders?.();
+
+  const send = (event: Record<string, unknown>) => {
+    if (res.writableEnded) return;
+    try {
+      res.write(`data: ${JSON.stringify(event)}\n\n`);
+      // Forzamos flush para que el browser reciba los chunks aunque el
+      // proxy intermedio (Railway/Cloudflare) tenga buffering. Sin esto,
+      // operaciones largas (backtest, multi-tool) se ven como 'Load failed'
+      // en Safari porque la conexión queda idle visualmente aunque hay
+      // heartbeats internos.
+      (res as unknown as { flush?: () => void }).flush?.();
+    } catch {
+      // socket cerrado — no se hace nada
+    }
+  };
+
+  // Heartbeat más frecuente (2s) — algunos proxies cortan conexiones SSE
+  // tras 30s sin data; con 2s aseguramos refresco continuo durante tools
+  // que tardan 30-60s (backtest_inteligente, agent multi-step).
+  const hb = setInterval(() => {
+    if (res.writableEnded) {
+      clearInterval(hb);
+      return;
+    }
+    send({ type: "heartbeat", t: Date.now() });
+  }, 2000);
+
+  // Si el cliente cierra la conexión, paramos el heartbeat para no leakear.
+  req.on("close", () => {
+    clearInterval(hb);
+  });
+
+  try {
+    // 1) Persistir mensaje del usuario en tanit_chat
+    let _userMsgId: number | null = null;
+    try {
+      const ins = await pool.query<{ id: number }>(
+        `INSERT INTO tanit_chat (role, content, channel, sender_type)
+         VALUES ('user', $1, $2, $3)
+         RETURNING id`,
+        [message, channel, senderType],
+      );
+      _userMsgId = ins.rows[0]?.id ?? null;
+    } catch (dbErr) {
+      // No matamos la sesión por un error de persistencia
+      console.warn("[mastra-chat] warning persistiendo user msg:", (dbErr as Error).message);
+    }
+
+    // 2) Bootstrap legacy SOLO en cold start (cuando Mastra todavía no tiene
+    //    histórico en este thread). Mastra inyecta automáticamente lastMessages
+    //    desde mastra_messages cuando la memoria se hidrata.
+    const recentTurns = await getRecentTurns();
+
+    // Si el cliente mandó imágenes, construimos el mensaje del usuario con
+    // multipart content (text + image_url parts). Gemini multimodal nativo.
+    type ContentPart =
+      | { type: "text"; text: string }
+      | { type: "image"; image: string; mimeType?: string };
+    type LooseUserMsg = {
+      role: "user";
+      content: string | ContentPart[];
+    };
+
+    let userMsg: LooseUserMsg;
+    if (Array.isArray(body.images) && body.images.length > 0) {
+      const parts: ContentPart[] = [{ type: "text", text: message }];
+      for (const img of body.images.slice(0, 4)) {
+        if (img && typeof img.base64 === "string" && img.base64.length > 0) {
+          parts.push({
+            type: "image",
+            image: `data:${img.mimeType || "image/jpeg"};base64,${img.base64}`,
+            mimeType: img.mimeType,
+          });
+        }
+      }
+      userMsg = { role: "user", content: parts };
+    } else {
+      userMsg = { role: "user", content: message };
+    }
+
+    const messages = [
+      ...recentTurns,
+      // Casteamos a any aquí porque el shape multimodal varía entre versiones
+      // de @ai-sdk; Mastra lo acepta vía wrapper interno.
+      userMsg as unknown as { role: "user"; content: string },
+    ];
+
+    send({ type: "thinking" });
+
+    // 3) Stream con Mastra Memory persistente (mastra_messages, mastra_threads
+    //    se crean al primer uso). Instructions dinámicas vía loadBootstrap.
+    //    Iteramos `fullStream` para emitir además de tokens los eventos
+    //    `tool_call` / `tool_result` que el frontend renderiza como inline cards.
+    const { fullStream } = await streamFullWithPool("chat", messages, {
+      memory: {
+        resource: resourceId,
+        thread: threadId,
+      },
+    });
+
+    // Auto-rename del thread con el primer mensaje del usuario. Idempotente:
+    // sólo renombra si todavía es "Conversación nueva". Lo disparamos en
+    // background para no bloquear el stream de respuesta.
+    autoTitleThreadIfNeeded(threadId, message).catch((e) =>
+      console.warn("[mastra-chat] autoTitle warning:", (e as Error).message),
+    );
+
+    let fullReply = "";
+    // fullStream emite: text-delta, tool-call, tool-result, finish, etc.
+    // Mantenemos el contrato existente (token/heartbeat/done/error) y agregamos
+    // tool_call y tool_result. Frontend viejo ignora los nuevos sin romper.
+    //
+    // Wrappamos el iterador en try-catch INTERNO porque si una tool tira un
+    // error inesperado durante el for-await, queremos enviar evento estructurado
+    // y NO cerrar la conexión abruptamente con 'Load failed' al cliente.
+    try {
+      for await (const chunk of fullStream as AsyncIterable<{
+        type: string;
+        payload?: Record<string, unknown>;
+      }>) {
+        if (!chunk || !chunk.type) continue;
+        const t = chunk.type;
+        const p = chunk.payload ?? {};
+
+        if (t === "text-delta") {
+          const text = (p as { text?: string; delta?: string }).text
+            ?? (p as { delta?: string }).delta
+            ?? "";
+          if (text) {
+            fullReply += text;
+            send({ type: "token", content: text });
+          }
+        } else if (t === "tool-call") {
+          send({
+            type: "tool_call",
+            toolCallId: (p as { toolCallId?: string }).toolCallId,
+            tool: (p as { toolName?: string }).toolName,
+            args: (p as { args?: unknown }).args,
+          });
+        } else if (t === "tool-result") {
+          send({
+            type: "tool_result",
+            toolCallId: (p as { toolCallId?: string }).toolCallId,
+            tool: (p as { toolName?: string }).toolName,
+            result: (p as { result?: unknown }).result,
+          });
+        } else if (t === "error") {
+          // Mastra puede emitir errores en el stream — los reportamos sin morir
+          send({
+            type: "error",
+            message: String((p as { error?: unknown }).error ?? "stream error"),
+          });
+        }
+        // ignoramos finish/start/etc — el done explícito lo emitimos abajo
+      }
+    } catch (streamErr) {
+      // Error del fullStream interno (tool exception, gemini timeout, etc.)
+      // Lo enviamos como evento estructurado y dejamos que el finally cierre.
+      const m = streamErr instanceof Error ? streamErr.message : String(streamErr);
+      console.warn("[mastra-chat] fullStream error:", m);
+      send({ type: "error", message: m });
+    }
+
+    // 5) Persistir reply de Tanit
+    let _replyId: number | null = null;
+    if (fullReply.trim().length > 0) {
+      try {
+        const ins = await pool.query<{ id: number }>(
+          `INSERT INTO tanit_chat (role, content, channel, sender_type)
+           VALUES ('assistant', $1, $2, 'tanit_reply')
+           RETURNING id`,
+          [fullReply, channel],
+        );
+        _replyId = ins.rows[0]?.id ?? null;
+      } catch (dbErr) {
+        console.warn("[mastra-chat] warning persistiendo reply:", (dbErr as Error).message);
+      }
+    }
+
+    send({ type: "done", reply: fullReply, replyId: _replyId });
+  } catch (err) {
+    // Error real (Gemini caído, BD rota, etc).
+    // NO inventamos respuesta — propagamos al cliente para que el front lo muestre
+    // con su voz. Tanit decide cómo se lo dice a Luis cuando recupera conexión.
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error("[mastra-chat] error:", msg);
+    send({ type: "error", message: msg });
+  } finally {
+    clearInterval(hb);
+    try {
+      res.end();
+    } catch {}
+  }
+});
+
+/**
+ * GET /bot/mastra-history?limit=50
+ * Devuelve los últimos N mensajes del canal íntimo, listos para hidratar el chat.
+ * Mantiene shape similar al endpoint legacy `/bot/tanit-history`.
+ */
+router.get("/bot/mastra-history", async (req, res): Promise<void> => {
+  try {
+    const limitRaw = parseInt((req.query.limit as string) ?? "50", 10);
+    const limit = Math.min(Math.max(isNaN(limitRaw) ? 50 : limitRaw, 1), 200);
+    const channel = (req.query.channel as string) ?? "intimate";
+
+    const result = await pool.query<{
+      id: number;
+      role: "user" | "assistant";
+      content: string;
+      sender_type: string | null;
+      channel: string | null;
+      created_at: string;
+    }>(
+      `SELECT id, role, content, sender_type, channel,
+              created_at::text AS created_at
+         FROM tanit_chat
+        WHERE channel = $1 OR channel IS NULL
+        ORDER BY id DESC
+        LIMIT $2`,
+      [channel, limit],
+    );
+
+    const messages = result.rows.reverse().map((m) => ({
+      id: m.id,
+      role: m.role,
+      content: m.content,
+      senderType: m.sender_type,
+      channel: m.channel,
+      createdAt: m.created_at,
+    }));
+
+    res.json({ ok: true, channel, count: messages.length, messages });
+  } catch (e) {
+    res
+      .status(500)
+      .json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
+export default router;

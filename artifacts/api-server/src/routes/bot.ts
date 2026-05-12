@@ -1010,75 +1010,98 @@ router.post("/bot/gemini-chat", async (req, res): Promise<void> => {
   }
 });
 
-// Streaming variant of /bot/gemini-chat. Same body shape, but uses
-// Server-Sent Events to keep the connection alive while runGeminiUserCommand
-// runs (Gemini occasionally takes 30+ seconds in cold-start scenarios, and
-// the synchronous endpoint times out / drops in some networks).
-//
-// Wire protocol (each line is a separate SSE event):
-//   data: {"type":"thinking"}                      ← start signal
-//   data: {"type":"heartbeat"}                     ← every 2s keepalive
-//   data: {"type":"done","channel":"...","reply":"...","actionsExecuted":[...]}
+// Streaming variant of /bot/gemini-chat. SSE-based, keeps connection
+// alive with heartbeats every 2s while runGeminiUserCommand processes.
+// Wire protocol:
+//   data: {"type":"thinking"} | {"type":"heartbeat"}
+//   data: {"type":"done","reply":"...","actionsExecuted":[...]}
 //   data: {"type":"error","message":"..."}
-//
-// runGeminiUserCommand stays untouched — we just wrap it. The reply still
-// goes through Tanit's full pipeline (intimate/operational channel, action
-// parsing, manifesto guard, etc.). Streaming only affects DELIVERY, not
-// the model's reasoning.
+// LEGACY endpoint — redirige internamente a Mastra para que CUALQUIER versión
+// cacheada del front (incluso navegadores con bundle viejo) hable con la voz
+// real de Tanit. Sin OBEDIENCIA, sin CMDR, sin fallback enlatado.
+// Mantiene el formato de eventos SSE { type: "thinking" | "token" | "done" | "error" }.
 router.post("/bot/gemini-chat-stream", async (req, res): Promise<void> => {
+  const { getRecentTurns, streamTextWithPool } = await import("../mastra/agent-tanit");
+
   res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
   res.setHeader("Connection", "keep-alive");
   res.setHeader("X-Accel-Buffering", "no");
+  // CORS — el endpoint dedicado /bot/mastra-chat-stream lo hace, este también.
+  const origin = req.headers.origin;
+  if (origin) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Access-Control-Allow-Credentials", "true");
+  }
   res.flushHeaders?.();
 
   const send = (event: Record<string, unknown>): void => {
-    res.write(`data: ${JSON.stringify(event)}\n\n`);
+    try { res.write(`data: ${JSON.stringify(event)}\n\n`); } catch {}
   };
 
-  // Keepalive ping — prevents intermediate proxies (Cloudflare, mobile
-  // networks) from closing what looks like an idle connection.
-  const heartbeat = setInterval(() => {
-    try { send({ type: "heartbeat" }); } catch { /* socket closed */ }
-  }, 2000);
-
-  // Cleanup if the client disconnects mid-flight (refresh, navigate away)
+  const heartbeat = setInterval(() => send({ type: "heartbeat" }), 5000);
   let aborted = false;
   req.on("close", () => { aborted = true; clearInterval(heartbeat); });
 
   try {
-    const { message, mode, imageBase64, imageMimeType, images, channel, sender } = req.body ?? {};
+    const { message, channel, sender, resourceId: bodyResource, threadId: bodyThread } = req.body ?? {};
     if (!message || typeof message !== "string") {
       send({ type: "error", message: "message requerido" });
       clearInterval(heartbeat);
       res.end();
       return;
     }
-    const image = imageBase64 && imageMimeType
-      ? { base64: imageBase64 as string, mimeType: imageMimeType as string }
-      : undefined;
-    const multiImages = Array.isArray(images) ? images as { base64: string; mimeType: string }[] : undefined;
     const ch: "intimate" | "operational" = channel === "operational" ? "operational" : "intimate";
     const senderType = typeof sender === "string" && sender.length <= 30 ? sender : "human_luis";
+    // Mastra Memory: mismo contrato que /bot/mastra-chat-stream para que cliente
+    // legacy y cliente nuevo escriban al mismo thread persistente.
+    const resourceId = (typeof bodyResource === "string" ? bodyResource : "luis").slice(0, 64);
+    const threadId = (typeof bodyThread === "string" ? bodyThread : `${ch}-main`).slice(0, 128);
+
+    // Persistir mensaje del usuario en tanit_chat (dual-write con mastra_messages)
+    try {
+      await pool.query(
+        `INSERT INTO tanit_chat (role, content, channel, sender_type) VALUES ('user', $1, $2, $3)`,
+        [message.trim(), ch, senderType],
+      );
+    } catch {}
 
     send({ type: "thinking" });
 
-    const result = await runGeminiUserCommand(
-      message.trim().slice(0, 50_000),
-      mode === "profesional" ? "profesional" : "casual",
-      image,
-      multiImages,
-      ch,
-      senderType,
-    );
+    const recentTurns = await getRecentTurns();
+    const messages = [...recentTurns, { role: "user" as const, content: message.trim() }];
+    const { textStream } = await streamTextWithPool("chat", messages, {
+      memory: {
+        resource: resourceId,
+        thread: threadId,
+      },
+    });
+
+    let fullReply = "";
+    for await (const chunk of textStream) {
+      if (aborted) break;
+      if (chunk) {
+        fullReply += chunk;
+        send({ type: "token", content: chunk });
+      }
+    }
+
+    if (!aborted && fullReply.trim().length > 0) {
+      try {
+        await pool.query(
+          `INSERT INTO tanit_chat (role, content, channel, sender_type) VALUES ('assistant', $1, $2, 'tanit_reply')`,
+          [fullReply, ch],
+        );
+      } catch {}
+    }
 
     clearInterval(heartbeat);
     if (!aborted) {
       send({
         type: "done",
         channel: ch,
-        reply: result.reply,
-        actionsExecuted: result.actionsExecuted,
+        reply: fullReply,
+        actionsExecuted: [],
       });
     }
     res.end();
