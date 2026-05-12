@@ -649,6 +649,38 @@ router.get("/admin/gemini-keys/test", async (_req, res): Promise<void> => {
       results.push({ envName, ok: false, error: e instanceof Error ? e.message : String(e), tookMs: Date.now() - t0 });
     }
   }
+  // Test OpenRouter también con google/gemini-2.5-flash via OpenRouter
+  const orKey = process.env["OPENROUTER_API_KEY"];
+  if (orKey) {
+    const t0 = Date.now();
+    try {
+      const r = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${orKey}`,
+          "HTTP-Referer": "https://tanit.work",
+          "X-Title": "Tanit",
+        },
+        body: JSON.stringify({
+          model: "google/gemini-2.5-flash",
+          messages: [{ role: "user", content: "ping" }],
+          max_tokens: 5,
+        }),
+      });
+      const took = Date.now() - t0;
+      if (r.ok) {
+        results.push({ envName: "OPENROUTER_API_KEY", ok: true, status: r.status, tookMs: took });
+      } else {
+        const txt = await r.text();
+        results.push({ envName: "OPENROUTER_API_KEY", ok: false, status: r.status, error: txt.slice(0, 300), tookMs: took });
+      }
+    } catch (e) {
+      results.push({ envName: "OPENROUTER_API_KEY", ok: false, error: e instanceof Error ? e.message : String(e), tookMs: Date.now() - t0 });
+    }
+  } else {
+    results.push({ envName: "OPENROUTER_API_KEY", ok: false, error: "not configured", tookMs: 0 });
+  }
   res.json({ ok: true, results });
 });
 
