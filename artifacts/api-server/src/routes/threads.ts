@@ -132,7 +132,12 @@ router.get("/bot/threads", async (req, res): Promise<void> => {
 
 /**
  * GET /bot/threads/:id/messages
- * Devuelve mensajes ordenados ASC por createdAt para reproducir el chat.
+ * Devuelve los ÚLTIMOS N mensajes del thread, ordenados ASC para que el
+ * cliente los renderice del más viejo al más nuevo (orden natural del chat).
+ *
+ * Antes ordenaba ASC LIMIT N — para threads grandes (ej. intimate-main con
+ * 5,152 msgs) eso traía los más VIEJOS al abrir, no los recientes. Bug grave
+ * de UX. Ahora ordenamos DESC para tomar los más recientes y revertimos.
  */
 router.get("/bot/threads/:id/messages", async (req, res): Promise<void> => {
   try {
@@ -141,22 +146,24 @@ router.get("/bot/threads/:id/messages", async (req, res): Promise<void> => {
       res.status(400).json({ ok: false, error: "id inválido" });
       return;
     }
-    const limit = Math.min(parseInt((req.query.limit as string) ?? "200", 10) || 200, 500);
+    const limit = Math.min(parseInt((req.query.limit as string) ?? "100", 10) || 100, 500);
     const r = await pool.query(
       `SELECT id, thread_id, role, content, "createdAt"::text AS "createdAt"
          FROM mastra_messages
         WHERE thread_id = $1
-        ORDER BY "createdAt" ASC
+        ORDER BY "createdAt" DESC
         LIMIT $2`,
       [id, limit],
     );
-    const messages = r.rows.map((m) => ({
-      id: String(m.id),
-      threadId: m.thread_id,
-      role: m.role,
-      content: extractText(m.content),
-      createdAt: m.createdAt,
-    }));
+    const messages = r.rows
+      .map((m) => ({
+        id: String(m.id),
+        threadId: m.thread_id,
+        role: m.role,
+        content: extractText(m.content),
+        createdAt: m.createdAt,
+      }))
+      .reverse();
     res.json({ ok: true, threadId: id, count: messages.length, messages });
   } catch (e) {
     res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
