@@ -203,8 +203,98 @@ export const actualizarMemoria = createTool({
   },
 });
 
+// ─── BUSCAR EN CHAT HISTORICO ────────────────────────────────────────────────
+// Acceso a los 5,408+ turnos de tanit_chat. Mastra Memory carga solo los
+// ultimos 50 turnos del thread; las memorias semanticas tocan tanit_memory.
+// Esta tool da acceso al TODO el historial de conversacion con Luis —
+// permitiendo a Tanit recordar momentos especificos cuando le preguntan
+// "te acuerdas cuando..." o cuando ella misma quiere relemerse.
+export const buscarEnChatHistorico = createTool({
+  id: "buscar_en_chat_historico",
+  description:
+    "Busca en TODO tu historial de conversacion con Luis (tabla tanit_chat, ~5,400 mensajes desde el 11-abril-2026). " +
+    "Usalo cuando Luis te pregunte si te acuerdas de algo especifico, cuantas veces dijiste/dijo algo, o cuando tu quieras releer momentos de la relacion. " +
+    "Diferente de buscar_memoria_semantica que busca en memorias estructuradas: esta busca en CHAT crudo, todos los mensajes literales. " +
+    "Parametros: query (texto a buscar, case-insensitive), channel ('intimate'|'operational'|null para ambos), role ('user'|'assistant'|null para ambos), limit (default 20, max 100).",
+  inputSchema: z.object({
+    query: z.string().min(1).max(200).describe("Texto a buscar (case-insensitive, busca substring)."),
+    channel: z.enum(["intimate", "operational"]).optional().describe("Filtrar por canal. Omitir para buscar en ambos."),
+    role: z.enum(["user", "assistant"]).optional().describe("'user'=Luis, 'assistant'=tu. Omitir para ambos."),
+    limit: z.number().int().min(1).max(100).default(20).optional(),
+  }),
+  outputSchema: z.object({
+    ok: z.boolean(),
+    count: z.number(),
+    totalMatches: z.number().optional(),
+    matches: z.array(z.object({
+      id: z.number(),
+      role: z.string(),
+      channel: z.string().nullable(),
+      content: z.string(),
+      created_at: z.string(),
+    })),
+    error: z.string().optional(),
+  }),
+  execute: async (rawInput: unknown) => {
+    const ctx = (rawInput && typeof rawInput === "object" && "context" in rawInput
+      ? (rawInput as { context: any }).context
+      : (rawInput as any)) as {
+      query: string;
+      channel?: "intimate" | "operational";
+      role?: "user" | "assistant";
+      limit?: number;
+    };
+    const limit = Math.min(Math.max(ctx.limit ?? 20, 1), 100);
+    try {
+      const params: unknown[] = [`%${ctx.query}%`];
+      let sql = `SELECT id, role, channel, content, created_at::text FROM tanit_chat WHERE content ILIKE $1`;
+      if (ctx.channel) {
+        params.push(ctx.channel);
+        sql += ` AND channel = $${params.length}`;
+      }
+      if (ctx.role) {
+        params.push(ctx.role);
+        sql += ` AND role = $${params.length}`;
+      }
+      sql += ` ORDER BY id DESC`;
+      // Total para que la agente sepa cuántos hits hay mas alla del limit
+      const countRes = await pool.query<{ n: number }>(
+        sql.replace("SELECT id, role, channel, content, created_at::text", "SELECT count(*)::int as n").replace(/ORDER BY .*$/, ""),
+        params,
+      );
+      params.push(limit);
+      sql += ` LIMIT $${params.length}`;
+      const r = await pool.query(sql, params);
+      // Truncar content en preview (250 chars) para no inflar contexto
+      const matches = r.rows.map((row: any) => ({
+        id: row.id,
+        role: row.role,
+        channel: row.channel,
+        content: typeof row.content === "string" && row.content.length > 250
+          ? row.content.slice(0, 250) + "…"
+          : (row.content ?? ""),
+        created_at: row.created_at,
+      }));
+      return {
+        ok: true,
+        count: matches.length,
+        totalMatches: countRes.rows[0]?.n ?? matches.length,
+        matches,
+      };
+    } catch (e) {
+      return {
+        ok: false,
+        count: 0,
+        matches: [],
+        error: e instanceof Error ? e.message : String(e),
+      };
+    }
+  },
+});
+
 export const memoryTools = {
   guardarMemoria,
   buscarMemoria,
   actualizarMemoria,
+  buscarEnChatHistorico,
 };
