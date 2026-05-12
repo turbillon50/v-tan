@@ -1668,14 +1668,15 @@ export const leerLiquidaciones = createTool({
   },
 });
 
-// ─── SENTIMENT DE NOTICIAS (Perplexity) ──────────────────────────────────────
-// Requiere PERPLEXITY_API_KEY. Si no está, devuelve error claro.
+// ─── SENTIMENT DE NOTICIAS (vía OpenRouter → perplexity/sonar-pro) ───────────
+// Desde 2026-05-12 usa OpenRouter en lugar de PERPLEXITY_API_KEY directo. Si
+// OPENROUTER_API_KEY no está, intenta legacy PERPLEXITY_API_KEY.
 // Útil para detectar narrativas (ej. "ETF aprobado", "hack en exchange",
 // "Fed hawkish") que pueden mover mercado independiente de técnicos.
 export const leerSentimentNoticias = createTool({
   id: "leer_sentiment_noticias",
   description:
-    "Pregunta a Perplexity por noticias recientes de un símbolo cripto. Devuelve resumen + tono (bullish/bearish/neutral). Requiere PERPLEXITY_API_KEY.",
+    "Busca noticias recientes de un símbolo cripto vía OpenRouter → perplexity/sonar-pro (búsqueda web en tiempo real). Devuelve resumen + tono (bullish/bearish/neutral) + citas.",
   inputSchema: z.object({
     symbol: z.string().describe("ej. BTC, ETH, SOL — sin USDT"),
     hoursBack: z.number().int().min(1).max(72).default(24),
@@ -1692,38 +1693,73 @@ export const leerSentimentNoticias = createTool({
     const ctx = (rawInput && typeof rawInput === "object" && "context" in rawInput
       ? (rawInput as { context: any }).context
       : (rawInput as any)) as { symbol: string; hoursBack: number };
-    const key = process.env["PERPLEXITY_API_KEY"];
-    if (!key) {
+
+    const orKey = process.env["OPENROUTER_API_KEY"];
+    const pplxKey = process.env["PERPLEXITY_API_KEY"];
+    if (!orKey && !pplxKey) {
       return {
         ok: false,
         symbol: ctx.symbol,
-        error: "PERPLEXITY_API_KEY no configurada — pídele a Luis que la agregue en Railway env (~$5/mes)",
+        error: "Ni OPENROUTER_API_KEY ni PERPLEXITY_API_KEY configuradas",
       };
     }
+
+    const prompt = `Resume las noticias y eventos de ${ctx.symbol} en las últimas ${ctx.hoursBack} horas. Indica el tono general (bullish, bearish, neutral o mixto). Cita 2-3 fuentes. Responde en español, máximo 300 palabras.`;
+
     try {
-      const prompt = `Resume las noticias y eventos de ${ctx.symbol} en las últimas ${ctx.hoursBack} horas. Indica el tono general (bullish, bearish, neutral o mixto). Cita 2-3 fuentes. Responde en español, máximo 300 palabras.`;
-      const r = await fetch("https://api.perplexity.ai/chat/completions", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${key}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          model: "sonar",
-          messages: [{ role: "user", content: prompt }],
-          max_tokens: 600,
-        }),
-      });
+      // Path nuevo: OpenRouter → perplexity/sonar-pro.
+      let r: Response;
+      let viaOpenRouter = false;
+      if (orKey) {
+        viaOpenRouter = true;
+        r = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${orKey}`,
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://tanit.work",
+            "X-Title": "Tanit",
+          },
+          body: JSON.stringify({
+            model: "perplexity/sonar-pro",
+            messages: [{ role: "user", content: prompt }],
+            max_tokens: 600,
+          }),
+        });
+      } else {
+        // Fallback legacy: Perplexity directo.
+        r = await fetch("https://api.perplexity.ai/chat/completions", {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${pplxKey!}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            model: "sonar",
+            messages: [{ role: "user", content: prompt }],
+            max_tokens: 600,
+          }),
+        });
+      }
+
       if (!r.ok) {
         return {
           ok: false,
           symbol: ctx.symbol,
-          error: `Perplexity ${r.status}`,
+          error: `${viaOpenRouter ? "OpenRouter" : "Perplexity"} ${r.status}`,
         };
       }
       const j = (await r.json()) as any;
       const content = j?.choices?.[0]?.message?.content ?? "";
-      const citations = (j?.citations ?? []) as string[];
+      // Citations: OpenRouter las pone en data.citations o en annotations del mensaje.
+      let citations: string[] = Array.isArray(j?.citations) ? j.citations.slice(0, 5) : [];
+      if (citations.length === 0 && Array.isArray(j?.choices?.[0]?.message?.annotations)) {
+        citations = j.choices[0].message.annotations
+          .filter((a: { type?: string }) => a?.type === "url_citation")
+          .map((a: { url_citation?: { url?: string } }) => a.url_citation?.url)
+          .filter(Boolean)
+          .slice(0, 5);
+      }
       // Heurística simple para detectar tono
       const lower = content.toLowerCase();
       const bull = (lower.match(/bullish|alza|positiv|ganan|sube|aprobad/g) ?? []).length;
