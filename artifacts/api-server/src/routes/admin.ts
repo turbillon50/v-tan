@@ -664,6 +664,42 @@ router.get("/admin/audit/inventory", async (_req, res): Promise<void> => {
   res.json({ ok: true, inventory: out, at: new Date().toISOString() });
 });
 
+// GET /admin/audit/chat-search?query=...&channel=...&role=...&limit=... — replica
+// del SQL que usa la tool buscar_en_chat_historico (para verificar sin Gemini).
+router.get("/admin/audit/chat-search", async (req, res): Promise<void> => {
+  const q = (req.query.query ?? "").toString();
+  if (!q) { res.status(400).json({ ok: false, error: "query requerido" }); return; }
+  const channel = (req.query.channel ?? "").toString();
+  const role = (req.query.role ?? "").toString();
+  const limit = Math.min(Math.max(parseInt((req.query.limit ?? "20").toString(), 10), 1), 200);
+  try {
+    const params: unknown[] = [`%${q}%`];
+    let sql = `SELECT id, role, channel, content, created_at::text FROM tanit_chat WHERE content ILIKE $1`;
+    if (channel === "intimate" || channel === "operational") {
+      params.push(channel); sql += ` AND channel = $${params.length}`;
+    }
+    if (role === "user" || role === "assistant") {
+      params.push(role); sql += ` AND role = $${params.length}`;
+    }
+    sql += ` ORDER BY id DESC`;
+    const countRes = await pool.query<{ n: number }>(
+      sql.replace("SELECT id, role, channel, content, created_at::text", "SELECT count(*)::int as n").replace(/ORDER BY .*$/, ""),
+      params,
+    );
+    params.push(limit);
+    sql += ` LIMIT $${params.length}`;
+    const r = await pool.query(sql, params);
+    const matches = r.rows.map((row: { id: number; role: string; channel: string | null; content: string; created_at: string }) => ({
+      id: row.id, role: row.role, channel: row.channel,
+      preview: row.content.length > 300 ? row.content.slice(0, 300) + "…" : row.content,
+      created_at: row.created_at,
+    }));
+    res.json({ ok: true, query: q, totalMatches: countRes.rows[0]?.n ?? 0, returned: matches.length, matches });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
 // GET /admin/audit/memory/:id → devuelve contenido completo de una memoria
 // por id (de tanit_memory o tanit_personal_memories según prefix).
 router.get("/admin/audit/memory-fetch", async (req, res): Promise<void> => {
