@@ -303,7 +303,9 @@ export async function streamFullWithPool(
 ): Promise<{ fullStream: AsyncIterable<any>; envName: string }> {
   let lastErr: unknown = null;
   const triedThisRequest = new Set<string>();
-  for (let attempt = 0; attempt < 4; attempt++) {
+  // 6 attempts cubre los 5 slots (1 chat + 3 live + 1 OpenRouter) con margen.
+  // Antes era 4 — bug crítico: cuando las 4 Gemini se agotaban, no llegaba a probar OpenRouter.
+  for (let attempt = 0; attempt < 6; attempt++) {
     const pick = getAgentForPool(pool, triedThisRequest);
     if (!pick) {
       throw new Error(
@@ -351,7 +353,9 @@ export async function streamTextWithPool(
 ): Promise<{ textStream: AsyncIterable<string>; envName: string }> {
   let lastErr: unknown = null;
   const triedThisRequest = new Set<string>();
-  for (let attempt = 0; attempt < 4; attempt++) {
+  // 6 attempts cubre los 5 slots (1 chat + 3 live + 1 OpenRouter) con margen.
+  // Antes era 4 — bug crítico: cuando las 4 Gemini se agotaban, no llegaba a probar OpenRouter.
+  for (let attempt = 0; attempt < 6; attempt++) {
     const pick = getAgentForPool(pool, triedThisRequest);
     if (!pick) {
       throw new Error(
