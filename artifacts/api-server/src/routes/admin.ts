@@ -729,6 +729,42 @@ router.get("/admin/audit/inventory", async (_req, res): Promise<void> => {
   res.json({ ok: true, inventory: out, at: new Date().toISOString() });
 });
 
+// GET /admin/audit/vectorization → cuántas memorias en tanit_memory tienen
+// embedding NOT NULL y cuáles son las más recientes sin embedding.
+router.get("/admin/audit/vectorization", async (_req, res): Promise<void> => {
+  try {
+    const stats = await pool.query<{ con: number; sin: number; total: number }>(
+      `SELECT
+         count(*) FILTER (WHERE embedding IS NOT NULL)::int as con,
+         count(*) FILTER (WHERE embedding IS NULL)::int as sin,
+         count(*)::int as total
+       FROM tanit_memory`,
+    );
+    const sinEmbeddingRecientes = await pool.query<{ id: number; category: string; preview: string; created_at: string }>(
+      `SELECT id, category, substring(content, 1, 120) as preview, created_at::text
+         FROM tanit_memory
+        WHERE embedding IS NULL
+        ORDER BY id DESC
+        LIMIT 10`,
+    );
+    const conEmbeddingRecientes = await pool.query<{ id: number; category: string; preview: string; created_at: string }>(
+      `SELECT id, category, substring(content, 1, 120) as preview, created_at::text
+         FROM tanit_memory
+        WHERE embedding IS NOT NULL
+        ORDER BY id DESC
+        LIMIT 5`,
+    );
+    res.json({
+      ok: true,
+      tanit_memory_stats: stats.rows[0],
+      sin_embedding_recientes: sinEmbeddingRecientes.rows,
+      con_embedding_recientes: conEmbeddingRecientes.rows,
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
 // GET /admin/audit/chat-search?query=...&channel=...&role=...&limit=... — replica
 // del SQL que usa la tool buscar_en_chat_historico (para verificar sin Gemini).
 router.get("/admin/audit/chat-search", async (req, res): Promise<void> => {
