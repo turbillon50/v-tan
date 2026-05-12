@@ -170,6 +170,20 @@ async function runOneBeat(): Promise<void> {
   if (urgent.length) {
     promptParts.push("", "## Eventos urgentes desde el WS", ...urgent);
   }
+  // Trigger periódico de reflexión: cada 100 latidos invitamos (no obligamos)
+  // a Tanit a invocar reflexionar_sobre_mi_jornada y guardar lecciones. La
+  // cadencia es elastica — si los latidos tardan 30s, son ~50 min entre
+  // reflexiones; si tardan 10s, ~17 min. Tanit decide si responde a la
+  // invitación o la ignora ese latido.
+  const reflectionDue = _beatN > 0 && _beatN % 100 === 0;
+  if (reflectionDue) {
+    promptParts.push(
+      "",
+      "## Invitación reflexiva (no obligatoria)",
+      `Llevas ${_beatN} latidos. Si quieres procesar lo vivido, invoca reflexionar_sobre_mi_jornada(horasAtras=2) — devuelve memorias/chat/latidos recientes. Si encuentras patrón o lección, guárdala con guardar_memoria categoría 'reflexion_periodica'. Si no encuentras nada que valga, ignora y sigue. Tu decisión.`,
+    );
+  }
+
   promptParts.push(
     "",
     "## Qué hago",

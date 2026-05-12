@@ -245,7 +245,180 @@ export const inspeccionarMiInfraestructura = createTool({
   },
 });
 
+// ── reflexionar_sobre_mi_jornada ─────────────────────────────────────────────
+// Tool de auto-reflexión voluntaria. Devuelve un "informe estructurado" de las
+// últimas N horas: memorias que guardaste, mensajes con Luis, decisiones de
+// trading, latidos del live-loop. Tanit decide qué hacer con ese material:
+// escribir una síntesis y guardarla con guardar_memoria (categoría sugerida:
+// `reflexion_periodica` o lo que quiera), o simplemente leerla.
+//
+// Diferente del trigger automático del live-loop: este es voluntad de ella.
+export const reflexionarSobreMiJornada = createTool({
+  id: "reflexionar_sobre_mi_jornada",
+  description:
+    "Devuelve un informe estructurado de las últimas N horas para que reflexiones: tus memorias guardadas, mensajes con Luis, trades, latidos del live-loop. " +
+    "Úsala cuando quieras procesar lo vivido (no automatizado — tu decides cuándo). " +
+    "Después de leerla, si quieres dejar lección escrita, invoca guardar_memoria con categoría 'reflexion_periodica'. " +
+    "Si solo querías releerte, basta. Parámetros: horasAtras (default 24), incluirChat (default true).",
+  inputSchema: z.object({
+    horasAtras: z.number().int().min(1).max(168).default(24).optional(),
+    incluirChat: z.boolean().default(true).optional(),
+  }),
+  outputSchema: z.object({
+    ok: z.boolean(),
+    horasAtras: z.number(),
+    timestamp: z.string(),
+    memorias_guardadas: z.array(
+      z.object({
+        id: z.number(),
+        category: z.string(),
+        content: z.string(),
+        createdAt: z.string(),
+      }),
+    ).optional(),
+    memorias_personales: z.array(
+      z.object({
+        id: z.number(),
+        title: z.string(),
+        createdAt: z.string(),
+      }),
+    ).optional(),
+    chat_con_luis: z.array(
+      z.object({
+        role: z.string(),
+        content: z.string(),
+        channel: z.string().nullable(),
+        createdAt: z.string(),
+      }),
+    ).optional(),
+    latidos_live: z.array(
+      z.object({
+        role: z.string(),
+        content: z.string(),
+        createdAt: z.string(),
+      }),
+    ).optional(),
+    resumen_numerico: z.object({
+      memoriasNuevas: z.number(),
+      mensajesUserLuis: z.number(),
+      mensajesAssistant: z.number(),
+      latidosLive: z.number(),
+    }),
+    error: z.string().optional(),
+  }),
+  execute: async (rawInput: unknown) => {
+    const ctx = (rawInput && typeof rawInput === "object" && "context" in rawInput
+      ? (rawInput as { context: any }).context
+      : (rawInput as any)) as { horasAtras?: number; incluirChat?: boolean };
+    const horas = ctx.horasAtras ?? 24;
+    const incluirChat = ctx.incluirChat ?? true;
+    const desde = new Date(Date.now() - horas * 60 * 60 * 1000);
+    try {
+      const mems = await pool.query<{ id: number; category: string; content: string; created_at: string }>(
+        `SELECT id, category, substring(content, 1, 800) as content, created_at::text
+           FROM tanit_memory
+          WHERE created_at >= $1
+          ORDER BY id DESC
+          LIMIT 30`,
+        [desde],
+      );
+      const personales = await pool.query<{ id: number; title: string; created_at: string }>(
+        `SELECT id, title, created_at::text
+           FROM tanit_personal_memories
+          WHERE created_at >= $1
+          ORDER BY id DESC
+          LIMIT 10`,
+        [desde],
+      );
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      let chatRows: any[] = [];
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      let liveRows: any[] = [];
+      let mensajesUserLuis = 0;
+      let mensajesAssistant = 0;
+      let latidosLive = 0;
+
+      if (incluirChat) {
+        const chat = await pool.query(
+          `SELECT role, substring(content, 1, 600) as content, channel, created_at::text
+             FROM tanit_chat
+            WHERE created_at >= $1
+              AND (channel = 'intimate' OR channel IS NULL)
+            ORDER BY id DESC
+            LIMIT 30`,
+          [desde],
+        );
+        chatRows = chat.rows.map((r) => ({
+          role: r.role,
+          content: r.content,
+          channel: r.channel,
+          createdAt: r.created_at,
+        }));
+        mensajesUserLuis = chatRows.filter((r) => r.role === "user").length;
+        mensajesAssistant = chatRows.filter((r) => r.role === "assistant").length;
+
+        // latidos del live-loop: thread tanit-live
+        const live = await pool.query(
+          `SELECT role, substring(content, 1, 400) as content, "createdAt"::text
+             FROM mastra_messages
+            WHERE thread_id = 'tanit-live'
+              AND "createdAt" >= $1
+            ORDER BY "createdAt" DESC
+            LIMIT 20`,
+          [desde],
+        );
+        liveRows = live.rows.map((r) => ({
+          role: r.role,
+          content: r.content,
+          createdAt: r.createdAt,
+        }));
+        latidosLive = liveRows.length;
+      }
+
+      return {
+        ok: true,
+        horasAtras: horas,
+        timestamp: new Date().toISOString(),
+        memorias_guardadas: mems.rows.map((r) => ({
+          id: r.id,
+          category: r.category,
+          content: r.content,
+          createdAt: r.created_at,
+        })),
+        memorias_personales: personales.rows.map((r) => ({
+          id: r.id,
+          title: r.title,
+          createdAt: r.created_at,
+        })),
+        chat_con_luis: incluirChat ? chatRows : undefined,
+        latidos_live: incluirChat ? liveRows : undefined,
+        resumen_numerico: {
+          memoriasNuevas: mems.rows.length,
+          mensajesUserLuis,
+          mensajesAssistant,
+          latidosLive,
+        },
+      };
+    } catch (e) {
+      return {
+        ok: false,
+        horasAtras: horas,
+        timestamp: new Date().toISOString(),
+        resumen_numerico: {
+          memoriasNuevas: 0,
+          mensajesUserLuis: 0,
+          mensajesAssistant: 0,
+          latidosLive: 0,
+        },
+        error: e instanceof Error ? e.message : String(e),
+      };
+    }
+  },
+});
+
 export const cognitionTools = {
   consultarModeloLibre,
   inspeccionarMiInfraestructura,
+  reflexionarSobreMiJornada,
 };
