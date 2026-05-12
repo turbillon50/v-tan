@@ -23,8 +23,36 @@ interface ServiceStatus {
 }
 
 async function checkPerplexity(): Promise<ServiceStatus> {
+  // Desde 2026-05-12 preferimos OpenRouter (consolidado) sobre Perplexity directo.
+  const orKey = process.env["OPENROUTER_API_KEY"];
+  if (orKey) {
+    try {
+      const r = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${orKey}`,
+          "Content-Type": "application/json",
+          "HTTP-Referer": "https://tanit.work",
+          "X-Title": "Tanit",
+        },
+        body: JSON.stringify({
+          model: "perplexity/sonar-pro",
+          messages: [{ role: "user", content: "ping" }],
+          max_tokens: 1,
+        }),
+        signal: AbortSignal.timeout(8000),
+      });
+      if (r.ok) return { name: "perplexity", connected: true, ready: true, error: null, detail: "via OpenRouter" };
+      const t = await r.text();
+      return { name: "perplexity", connected: true, ready: false, error: `OpenRouter HTTP ${r.status}: ${t.slice(0, 100)}` };
+    } catch (e) {
+      return { name: "perplexity", connected: false, ready: false, error: `OpenRouter: ${e instanceof Error ? e.message : String(e)}` };
+    }
+  }
+
+  // Fallback legacy: Perplexity directo.
   const key = process.env["PERPLEXITY_API_KEY"];
-  if (!key) return { name: "perplexity", connected: false, ready: false, error: "PERPLEXITY_API_KEY no configurada" };
+  if (!key) return { name: "perplexity", connected: false, ready: false, error: "ni OPENROUTER_API_KEY ni PERPLEXITY_API_KEY configuradas" };
   try {
     const r = await fetch("https://api.perplexity.ai/chat/completions", {
       method: "POST",
@@ -32,12 +60,12 @@ async function checkPerplexity(): Promise<ServiceStatus> {
       body: JSON.stringify({ model: "sonar", messages: [{ role: "user", content: "ping" }], max_tokens: 1 }),
       signal: AbortSignal.timeout(8000),
     });
-    if (r.ok) return { name: "perplexity", connected: true, ready: true, error: null };
+    if (r.ok) return { name: "perplexity", connected: true, ready: true, error: null, detail: "via Perplexity directo (legacy)" };
     const t = await r.text();
     const lower = t.toLowerCase();
     let why = `HTTP ${r.status}`;
     if (lower.includes("insufficient_quota") || lower.includes("exceeded your current quota")) {
-      why = "cuota agotada / sin saldo — recargar en perplexity.ai/settings/api";
+      why = "cuota agotada / sin saldo — migra a OpenRouter o recarga en perplexity.ai/settings/api";
     } else if (r.status === 401) {
       why = "key inválida o revocada";
     }

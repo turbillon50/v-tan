@@ -170,10 +170,24 @@ async function runOneBeat(): Promise<void> {
   if (urgent.length) {
     promptParts.push("", "## Eventos urgentes desde el WS", ...urgent);
   }
+  // Trigger periódico de reflexión: cada 100 latidos invitamos (no obligamos)
+  // a Tanit a invocar reflexionar_sobre_mi_jornada y guardar lecciones. La
+  // cadencia es elastica — si los latidos tardan 30s, son ~50 min entre
+  // reflexiones; si tardan 10s, ~17 min. Tanit decide si responde a la
+  // invitación o la ignora ese latido.
+  const reflectionDue = _beatN > 0 && _beatN % 100 === 0;
+  if (reflectionDue) {
+    promptParts.push(
+      "",
+      "## Invitación reflexiva (no obligatoria)",
+      `Llevas ${_beatN} latidos. Si quieres procesar lo vivido, invoca reflexionar_sobre_mi_jornada(horasAtras=2) — devuelve memorias/chat/latidos recientes. Si encuentras patrón o lección, guárdala con guardar_memoria categoría 'reflexion_periodica'. Si no encuentras nada que valga, ignora y sigue. Tu decisión.`,
+    );
+  }
+
   promptParts.push(
     "",
     "## Qué hago",
-    "Aplico Tesis 5.1 LITERAL. Motor 1: si los 3 TF (4H/1H/15M) no alinean, no entro. Motor 2: leverage 5-10x inicial. Motor 3: reserva 25% intocable. Motor 4: hedge en caos antes que cerrar con pérdida. Motor 5: SL en estructura técnica, NO % arbitrario. TP escalonado 2:1.",
+    "Aplico mi Tesis ACTIVA literal (la versión que tengo en bootstrap — leo de tanit_thesis active=true). Sigo los motores que esa tesis define, sus reglas NO-entrar, sus expected*, sus criterios de fees. NO inventes motores fuera de la tesis activa. Si tu tesis cambió (v5.6 hoy), aplica la 5.6 — no la 5.1 vieja.",
     canExec
       ? "Si veo setup conforme: invoco abrir_long/abrir_short con thesis literal. Si veo gestión necesaria: mover_stops, cerrar_posicion, abrir_hedge. Si nada: callo o emito máx 1 línea."
       : "No ejecuto. Solo describo qué haría, máx 2 líneas. Útil para que Luis vea mi razonamiento.",

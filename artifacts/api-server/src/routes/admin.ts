@@ -729,6 +729,58 @@ router.get("/admin/audit/inventory", async (_req, res): Promise<void> => {
   res.json({ ok: true, inventory: out, at: new Date().toISOString() });
 });
 
+// GET /admin/audit/vectorization → cuántas memorias en tanit_memory tienen
+// embedding NOT NULL y cuáles son las más recientes sin embedding.
+router.get("/admin/audit/vectorization", async (_req, res): Promise<void> => {
+  try {
+    const stats = await pool.query<{ con: number; sin: number; total: number }>(
+      `SELECT
+         count(*) FILTER (WHERE embedding IS NOT NULL)::int as con,
+         count(*) FILTER (WHERE embedding IS NULL)::int as sin,
+         count(*)::int as total
+       FROM tanit_memory`,
+    );
+    const sinEmbeddingRecientes = await pool.query<{ id: number; category: string; preview: string; created_at: string }>(
+      `SELECT id, category, substring(content, 1, 120) as preview, created_at::text
+         FROM tanit_memory
+        WHERE embedding IS NULL
+        ORDER BY id DESC
+        LIMIT 10`,
+    );
+    const conEmbeddingRecientes = await pool.query<{ id: number; category: string; preview: string; created_at: string }>(
+      `SELECT id, category, substring(content, 1, 120) as preview, created_at::text
+         FROM tanit_memory
+        WHERE embedding IS NOT NULL
+        ORDER BY id DESC
+        LIMIT 5`,
+    );
+    res.json({
+      ok: true,
+      tanit_memory_stats: stats.rows[0],
+      sin_embedding_recientes: sinEmbeddingRecientes.rows,
+      con_embedding_recientes: conEmbeddingRecientes.rows,
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
+// GET /admin/audit/thesis → devuelve el texto completo de la Tesis 5.1 activa.
+router.get("/admin/audit/thesis", async (_req, res): Promise<void> => {
+  try {
+    const r = await pool.query<{ id: number; version: number; text: string; active: boolean; authored_by: string; created_at: string }>(
+      `SELECT id, version, text, active, authored_by, created_at::text
+         FROM tanit_thesis
+        WHERE active = true
+        ORDER BY id DESC
+        LIMIT 1`,
+    );
+    res.json({ ok: true, thesis: r.rows[0] ?? null });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
 // GET /admin/audit/chat-search?query=...&channel=...&role=...&limit=... — replica
 // del SQL que usa la tool buscar_en_chat_historico (para verificar sin Gemini).
 router.get("/admin/audit/chat-search", async (req, res): Promise<void> => {
@@ -837,6 +889,70 @@ router.get("/admin/audit/diagnose-mastra", async (_req, res): Promise<void> => {
   } catch (e) {
     timings.error = e instanceof Error ? e.message : String(e);
     res.status(500).json({ ok: false, timings });
+  }
+});
+
+// POST /admin/thesis/replace body: { secret?, oldVersion, newVersion, text,
+// expectedWr?, expectedTradesPerDay?, expectedProfitFactor?, expectedMaxDrawdownPct?,
+// authoredBy?, reason?, actualOutcomeForOld? }
+// Atómicamente: oldVersion → active=false + closed_at + actual_outcome.
+// newVersion → INSERT active=true con los expected* poblados.
+router.post("/admin/thesis/replace", async (req, res): Promise<void> => {
+  const body = (req.body ?? {}) as {
+    secret?: unknown;
+    oldVersion?: number;
+    newVersion?: number;
+    text?: string;
+    expectedWr?: number;
+    expectedTradesPerDay?: number;
+    expectedProfitFactor?: number;
+    expectedMaxDrawdownPct?: number;
+    authoredBy?: string;
+    reason?: string;
+    actualOutcomeForOld?: string;
+  };
+  const guard = requireAdmin(body.secret, req.headers.origin);
+  if (guard) { res.status(403).json({ ok: false, error: guard }); return; }
+  if (typeof body.newVersion !== "number" || typeof body.text !== "string") {
+    res.status(400).json({ ok: false, error: "newVersion (int) y text requeridos" });
+    return;
+  }
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    if (typeof body.oldVersion === "number") {
+      await client.query(
+        `UPDATE tanit_thesis
+           SET active = false, closed_at = now(), actual_outcome = $2
+         WHERE version = $1 AND active = true`,
+        [body.oldVersion, body.actualOutcomeForOld ?? `reemplazada por v${body.newVersion}`],
+      );
+    }
+    const ins = await client.query<{ id: number }>(
+      `INSERT INTO tanit_thesis
+        (version, text, expected_wr, expected_trades_per_day,
+         expected_profit_factor, expected_max_drawdown_pct,
+         active, authored_by, reason, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, true, $7, $8, now())
+       RETURNING id`,
+      [
+        body.newVersion,
+        body.text,
+        body.expectedWr ?? null,
+        body.expectedTradesPerDay ?? null,
+        body.expectedProfitFactor ?? null,
+        body.expectedMaxDrawdownPct ?? null,
+        body.authoredBy ?? "tanit",
+        body.reason ?? null,
+      ],
+    );
+    await client.query("COMMIT");
+    res.json({ ok: true, newId: ins.rows[0]?.id, newVersion: body.newVersion });
+  } catch (e) {
+    await client.query("ROLLBACK").catch(() => {});
+    res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+  } finally {
+    client.release();
   }
 });
 

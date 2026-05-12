@@ -365,6 +365,14 @@ async function checkGovernanceAndAutonomy(): Promise<ComponentStatus[]> {
     const cfg = await getAutonomyConfig({ force: true });
     const pausedNow =
       !!cfg.paused_until && Date.now() < new Date(cfg.paused_until).getTime();
+    // Leer versión de tesis activa para no hardcodear "5.1".
+    let thesisLabel = "Tesis activa";
+    try {
+      const tr = await pool.query<{ version: number }>(
+        `SELECT version FROM tanit_thesis WHERE active = true ORDER BY id DESC LIMIT 1`,
+      );
+      if (tr.rows[0]?.version != null) thesisLabel = `Tesis v${tr.rows[0].version}`;
+    } catch { /* fallback al label genérico */ }
     out.push({
       name: "Autonomía",
       ok: true,
@@ -374,7 +382,7 @@ async function checkGovernanceAndAutonomy(): Promise<ComponentStatus[]> {
         : cfg.mode === "execute_with_governance"
           ? pausedNow
             ? `pausada hasta ${cfg.paused_until}`
-            : `🟢 operando según Tesis 5.1 · ${cfg.daily_trade_count}/${cfg.max_daily_trades} trades hoy`
+            : `🟢 operando según ${thesisLabel} · ${cfg.daily_trade_count}/${cfg.max_daily_trades} trades hoy`
           : `solo observa`,
       needsAttention: pausedNow,
       meta: {
