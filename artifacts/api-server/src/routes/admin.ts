@@ -765,6 +765,22 @@ router.get("/admin/audit/vectorization", async (_req, res): Promise<void> => {
   }
 });
 
+// GET /admin/audit/thesis → devuelve el texto completo de la Tesis 5.1 activa.
+router.get("/admin/audit/thesis", async (_req, res): Promise<void> => {
+  try {
+    const r = await pool.query<{ id: number; version: number; text: string; active: boolean; authored_by: string; created_at: string }>(
+      `SELECT id, version, text, active, authored_by, created_at::text
+         FROM tanit_thesis
+        WHERE active = true
+        ORDER BY id DESC
+        LIMIT 1`,
+    );
+    res.json({ ok: true, thesis: r.rows[0] ?? null });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
 // GET /admin/audit/chat-search?query=...&channel=...&role=...&limit=... — replica
 // del SQL que usa la tool buscar_en_chat_historico (para verificar sin Gemini).
 router.get("/admin/audit/chat-search", async (req, res): Promise<void> => {
