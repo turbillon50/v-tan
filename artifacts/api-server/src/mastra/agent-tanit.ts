@@ -69,7 +69,11 @@ const tanitMemory = new Memory({
     connectionString: DATABASE_URL ?? "postgresql://invalid",
   }),
   options: {
-    lastMessages: 50,
+    // Bajado de 50 → 15 (2026-05-11): los 50 turnos inyectaban ~8k tokens
+    // adicionales por call y eran 90% redundantes con el bootstrap. 15 turnos
+    // dan continuidad reciente sin inflar contexto. Tanit accede al pasado
+    // profundo via tool `buscar_en_chat_historico`, no via memory pasivo.
+    lastMessages: 15,
     semanticRecall: false,
     workingMemory: { enabled: false },
   },

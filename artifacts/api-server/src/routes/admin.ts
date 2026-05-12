@@ -525,6 +525,39 @@ router.get("/admin/live-status", async (_req, res): Promise<void> => {
 // POST /admin/live-mute body: { secret? } — pausa el envio de prompts a
 // Gemini sin matar el loop. La cola de eventos se sigue acumulando y se
 // vacia al unmute. Util si Luis quiere parar el gasto sin reiniciar.
+// POST /admin/live-mute → mute en memoria + persistente en BD si body.persistent=true
+router.post("/admin/live-mute-persistent", async (req, res): Promise<void> => {
+  const guard = requireAdmin((req.body ?? {}).secret, req.headers.origin);
+  if (guard) { res.status(403).json({ ok: false, error: guard }); return; }
+  try {
+    await pool.query(
+      `INSERT INTO tanit_runtime_config (key, value, reason, updated_at)
+       VALUES ('live_loop_muted_persistent', 'true', 'Mute persistente desde admin', now())
+       ON CONFLICT (key) DO UPDATE SET value = 'true', reason = EXCLUDED.reason, updated_at = now()`,
+    );
+    muteTanitLive();
+    res.json({ ok: true, persistent: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
+router.post("/admin/live-unmute-persistent", async (req, res): Promise<void> => {
+  const guard = requireAdmin((req.body ?? {}).secret, req.headers.origin);
+  if (guard) { res.status(403).json({ ok: false, error: guard }); return; }
+  try {
+    await pool.query(
+      `INSERT INTO tanit_runtime_config (key, value, reason, updated_at)
+       VALUES ('live_loop_muted_persistent', 'false', 'Unmute persistente desde admin', now())
+       ON CONFLICT (key) DO UPDATE SET value = 'false', reason = EXCLUDED.reason, updated_at = now()`,
+    );
+    unmuteTanitLive();
+    res.json({ ok: true, persistent: false });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
 router.post("/admin/live-mute", async (req, res): Promise<void> => {
   const guard = requireAdmin((req.body ?? {}).secret, req.headers.origin);
   if (guard) { res.status(403).json({ ok: false, error: guard }); return; }
