@@ -27,6 +27,24 @@ const LIVE_KEY_ENVS = [
 ] as const;
 const FALLBACK_KEY_ENVS = ["OPENROUTER_API_KEY"] as const;
 
+/**
+ * Modelos OpenRouter en orden de preferencia: free primero (sin costo cuando
+ * dispoibles), pago después (Luis pagó OpenRouter para tener fallback real).
+ * Cada modelo es un "sub-slot" virtual del slot OPENROUTER_API_KEY — si uno
+ * da 429 o timeout, probamos el siguiente.
+ *
+ * NOTA: los :free son tier comunitario sin costo pero con rate limit por
+ * minuto. Los de pago se cobran del crédito de la cuenta.
+ */
+export const OPENROUTER_MODEL_CHAIN = [
+  "google/gemini-2.0-flash-exp:free",      // free, rápido, Gemini reciente
+  "meta-llama/llama-3.3-70b-instruct:free", // free, distinto provider para variar
+  "deepseek/deepseek-chat:free",            // free, distinto provider
+  "google/gemini-2.5-flash",                // paga, $0.30/M, mismo modelo que directo
+  "anthropic/claude-haiku-4.5",             // paga, $1/M, muy rápido
+  "openai/gpt-5-mini",                      // paga, fallback final
+] as const;
+
 export type Pool = "chat" | "live";
 export type Provider = "google" | "openrouter";
 
@@ -36,6 +54,13 @@ interface KeySlot {
   envName: string;
   key: string;
   exhaustedUntilMs: number;
+  // Para OpenRouter: lista de modelos a iterar. Cada uno tiene su propio
+  // estado exhausted (por minuto/día según el modelo).
+  modelChain?: readonly string[];
+  // Estado de modelos OpenRouter exhausted hasta cuándo (key=model, value=ms).
+  modelExhaustedUntil?: Map<string, number>;
+  // Modelo actualmente activo (para reporting).
+  currentModel?: string;
 }
 
 const _slots: KeySlot[] = [];
@@ -54,7 +79,18 @@ function loadSlots(): void {
   }
   for (const envName of FALLBACK_KEY_ENVS) {
     const k = process.env[envName];
-    if (k && k.length > 10) _slots.push({ pool: "fallback", provider: "openrouter", envName, key: k, exhaustedUntilMs: 0 });
+    if (k && k.length > 10) {
+      _slots.push({
+        pool: "fallback",
+        provider: "openrouter",
+        envName,
+        key: k,
+        exhaustedUntilMs: 0,
+        modelChain: OPENROUTER_MODEL_CHAIN,
+        modelExhaustedUntil: new Map(),
+        currentModel: OPENROUTER_MODEL_CHAIN[0],
+      });
+    }
   }
   const summary = _slots.map((s) => ({ pool: s.pool, provider: s.provider, envName: s.envName }));
   logger.info({ count: _slots.length, summary }, "[llm-keys] pools cargados");
@@ -98,14 +134,40 @@ export function pickAvailableKey(pool: Pool, skip?: Set<string>): KeySlot | null
   return null;
 }
 
-export function markKeyExhausted(envName: string): void {
+export function markKeyExhausted(envName: string, model?: string): void {
   const s = _slots.find((x) => x.envName === envName);
   if (!s) return;
+  // Si tenemos modelChain (OpenRouter), marcamos SOLO ese modelo como
+  // exhausted por 1 minuto (los :free reset por minuto en OpenRouter).
+  // El slot completo no se marca exhausted — los demás modelos siguen vivos.
+  if (s.modelChain && model) {
+    s.modelExhaustedUntil = s.modelExhaustedUntil ?? new Map();
+    s.modelExhaustedUntil.set(model, Date.now() + 60_000);
+    logger.warn({ envName, model, resetIn: "60s" }, "[llm-keys] modelo OpenRouter marcado exhausted por 60s");
+    return;
+  }
+  // Para Gemini directo: hasta reset diario UTC.
   s.exhaustedUntilMs = nextUtcMidnight();
   logger.warn(
     { envName, pool: s.pool, resetAtUtc: new Date(s.exhaustedUntilMs).toISOString() },
     "[llm-keys] key marcada exhausted hasta reset",
   );
+}
+
+/**
+ * Elige el siguiente modelo disponible en la chain de un slot OpenRouter.
+ * Devuelve el primer modelo no exhausted, o null si todos están marcados.
+ */
+export function pickModelForSlot(slot: KeySlot, skipModels?: Set<string>): string | null {
+  if (!slot.modelChain) return null;
+  const now = Date.now();
+  for (const model of slot.modelChain) {
+    if (skipModels?.has(model)) continue;
+    const exhaustedUntil = slot.modelExhaustedUntil?.get(model) ?? 0;
+    if (exhaustedUntil > now) continue;
+    return model;
+  }
+  return null;
 }
 
 /** Limpia las marcas exhausted. Para usar tras agregar keys nuevas o tras
@@ -152,22 +214,21 @@ export function isExhaustedError(err: unknown): boolean {
  *    modelo prefijado con namespace ("google/gemini-2.5-flash").
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-export function buildAgentForKey(keySlot: KeySlot, cfg: any): any {
+export function buildAgentForKey(keySlot: KeySlot, cfg: any, overrideModel?: string): any {
   const { modelId, ...rest } = cfg;
   if (keySlot.provider === "openrouter") {
     const openrouter = createOpenAI({
       apiKey: keySlot.key,
       baseURL: "https://openrouter.ai/api/v1",
-      // OpenRouter pide headers para identificación (opcional pero buena práctica).
       headers: {
         "HTTP-Referer": "https://tanit.work",
         "X-Title": "Tanit",
       },
     });
-    // En OpenRouter, gemini-2.5-flash se llama google/gemini-2.5-flash.
-    // Mantenemos el mismo modelo para preservar voz.
-    const orModelId = modelId.includes("/") ? modelId : `google/${modelId}`;
-    return new Agent({ ...rest, model: openrouter(orModelId) });
+    // Para OpenRouter: si overrideModel viene (de la chain), usar ese.
+    // Si no, el currentModel del slot, o el default.
+    const effectiveModel = overrideModel ?? keySlot.currentModel ?? "google/gemini-2.5-flash";
+    return new Agent({ ...rest, model: openrouter(effectiveModel) });
   }
   // default: google
   const google = createGoogleGenerativeAI({ apiKey: keySlot.key });

@@ -28,6 +28,7 @@ import { cognitionTools } from "./tools/cognition-tools";
 import { motorEjecutorTools } from "./tools/motor-ejecutor-tools";
 import {
   pickAvailableKey,
+  pickModelForSlot,
   markKeyExhausted,
   isExhaustedError,
   buildAgentForKey,
@@ -142,8 +143,11 @@ export async function getRecentTurns(): Promise<
 
 const _agentCache = new Map<string, Agent>();
 
-function getAgentForSlot(slot: KeySlot): Agent {
-  const cached = _agentCache.get(slot.envName);
+function getAgentForSlot(slot: KeySlot, modelOverride?: string): Agent {
+  // Cache key incluye modelo para que distintos modelos de OpenRouter no
+  // colisionen en el cache.
+  const cacheKey = modelOverride ? `${slot.envName}:${modelOverride}` : slot.envName;
+  const cached = _agentCache.get(cacheKey);
   if (cached) return cached;
   const a = buildAgentForKey(slot, {
     id: "tanit",
@@ -174,22 +178,37 @@ function getAgentForSlot(slot: KeySlot): Agent {
       return ctx.systemPrompt;
     },
   });
-  _agentCache.set(slot.envName, a);
+  _agentCache.set(cacheKey, a);
   return a;
 }
 
 /**
- * Obtiene un Agent listo para usar según el pool ("chat" o "live"), eligiendo
- * la siguiente key disponible. `skip` permite excluir keys ya intentadas en
- * el mismo request.
+ * Obtiene un Agent listo para usar según el pool. Para slots OpenRouter
+ * itera la chain de modelos (free → paga). Devuelve también qué modelo
+ * concreto se está usando para que el caller pueda marcar el correcto si
+ * falla.
  */
 export function getAgentForPool(
   pool: Pool,
-  skip?: Set<string>,
-): { agent: Agent; envName: string } | null {
-  const slot = pickAvailableKey(pool, skip);
+  skipKeys?: Set<string>,
+  skipModels?: Set<string>,
+): { agent: Agent; envName: string; modelLabel: string } | null {
+  const slot = pickAvailableKey(pool, skipKeys);
   if (!slot) return null;
-  return { agent: getAgentForSlot(slot), envName: slot.envName };
+  if (slot.provider === "openrouter") {
+    const model = pickModelForSlot(slot, skipModels);
+    if (!model) return null;
+    return {
+      agent: getAgentForSlot(slot, model),
+      envName: slot.envName,
+      modelLabel: model,
+    };
+  }
+  return {
+    agent: getAgentForSlot(slot),
+    envName: slot.envName,
+    modelLabel: "gemini-2.5-flash",
+  };
 }
 
 /**
@@ -304,26 +323,37 @@ export async function streamFullWithPool(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
 ): Promise<{ fullStream: AsyncIterable<any>; envName: string }> {
   let lastErr: unknown = null;
-  const triedThisRequest = new Set<string>();
-  // 6 attempts cubre los 5 slots (1 chat + 3 live + 1 OpenRouter) con margen.
-  // Antes era 4 — bug crítico: cuando las 4 Gemini se agotaban, no llegaba a probar OpenRouter.
-  for (let attempt = 0; attempt < 6; attempt++) {
-    const pick = getAgentForPool(pool, triedThisRequest);
+  const triedKeys = new Set<string>();
+  const triedModels = new Set<string>();
+  // 12 attempts: 4 Gemini + 6 modelos OpenRouter + margen.
+  for (let attempt = 0; attempt < 12; attempt++) {
+    const pick = getAgentForPool(pool, triedKeys, triedModels);
     if (!pick) {
       throw new Error(
-        `[gemini-keys] no hay keys disponibles para pool=${pool}`,
+        `[gemini-keys] no hay keys/modelos disponibles para pool=${pool}`,
       );
     }
-    triedThisRequest.add(pick.envName);
+    // Marcar este intento en triedModels (para OpenRouter, evita repetir el
+    // mismo modelo). Para Gemini directo, agrega el envName a triedKeys así
+    // pasa al siguiente slot Gemini.
+    if (pick.modelLabel.includes("/")) {
+      triedModels.add(pick.modelLabel);
+    } else {
+      triedKeys.add(pick.envName);
+    }
     try {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const stream = await (pick.agent as any).stream(messages, options);
+      const agentToUse = (pick as any).agent;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const stream = await (agentToUse as any).stream(messages, options);
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const iter = stream.fullStream[Symbol.asyncIterator]() as AsyncIterator<any>;
       const { merged, outcome } = await probeAndMerge(iter);
       if (outcome === "exhausted") {
-        markKeyExhausted(pick.envName);
-        logger.warn({ envName: pick.envName, pool, attempt }, "[streamFull] exhausted, marcando hasta reset");
+        // Si es OpenRouter, marca el modelo (1 min); si es Gemini directo, marca el key (hasta reset diario).
+        const modelArg = pick.modelLabel.includes("/") ? pick.modelLabel : undefined;
+        markKeyExhausted(pick.envName, modelArg);
+        logger.warn({ envName: pick.envName, model: pick.modelLabel, pool, attempt }, "[streamFull] exhausted, marcando");
         lastErr = new Error("exhausted");
         continue;
       }
@@ -336,8 +366,9 @@ export async function streamFullWithPool(
     } catch (e) {
       lastErr = e;
       if (isExhaustedError(e)) {
-        markKeyExhausted(pick.envName);
-        logger.warn({ envName: pick.envName, pool, attempt }, "[streamFull] excepcion exhausted, rotando");
+        const modelArg = pick.modelLabel.includes("/") ? pick.modelLabel : undefined;
+        markKeyExhausted(pick.envName, modelArg);
+        logger.warn({ envName: pick.envName, model: pick.modelLabel, pool, attempt }, "[stream] exhausted, rotando");
         continue;
       }
       throw e;
@@ -354,20 +385,29 @@ export async function streamTextWithPool(
   options?: any,
 ): Promise<{ textStream: AsyncIterable<string>; envName: string }> {
   let lastErr: unknown = null;
-  const triedThisRequest = new Set<string>();
-  // 6 attempts cubre los 5 slots (1 chat + 3 live + 1 OpenRouter) con margen.
-  // Antes era 4 — bug crítico: cuando las 4 Gemini se agotaban, no llegaba a probar OpenRouter.
-  for (let attempt = 0; attempt < 6; attempt++) {
-    const pick = getAgentForPool(pool, triedThisRequest);
+  const triedKeys = new Set<string>();
+  const triedModels = new Set<string>();
+  // 12 attempts: 4 Gemini + 6 modelos OpenRouter + margen.
+  for (let attempt = 0; attempt < 12; attempt++) {
+    const pick = getAgentForPool(pool, triedKeys, triedModels);
     if (!pick) {
       throw new Error(
-        `[gemini-keys] no hay keys disponibles para pool=${pool}`,
+        `[gemini-keys] no hay keys/modelos disponibles para pool=${pool}`,
       );
     }
-    triedThisRequest.add(pick.envName);
+    // Marcar este intento en triedModels (para OpenRouter, evita repetir el
+    // mismo modelo). Para Gemini directo, agrega el envName a triedKeys así
+    // pasa al siguiente slot Gemini.
+    if (pick.modelLabel.includes("/")) {
+      triedModels.add(pick.modelLabel);
+    } else {
+      triedKeys.add(pick.envName);
+    }
     try {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const stream = await (pick.agent as any).stream(messages, options);
+      const agentToUse = (pick as any).agent;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const stream = await (agentToUse as any).stream(messages, options);
       // textStream solo emite strings — si la key falla con exhausted,
       // Mastra debería lanzar al hacer next(). Pero por si la versión actual
       // emite un primer "" antes del error, también probamos a leer dos chunks.
