@@ -781,6 +781,41 @@ router.get("/admin/audit/thesis", async (_req, res): Promise<void> => {
   }
 });
 
+// POST /admin/ws/resubscribe — re-conecta el WS Bybit suscrito a allowed_symbols
+// actuales (∪ CORE_SYMBOLS por seguridad). Usar tras cambiar la lista en
+// governance, o cuando solo unos pocos símbolos tienen datos en los latidos.
+router.post("/admin/ws/resubscribe", async (req, res): Promise<void> => {
+  const guard = requireAdmin((req.body ?? {}).secret, req.headers.origin);
+  if (guard) { res.status(403).json({ ok: false, error: guard }); return; }
+  try {
+    const { restartBybitWs } = await import("../lib/bybit-ws");
+    const { getRules } = await import("../lib/governance");
+    const CORE = ["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT","DOGEUSDT","AVAXUSDT","LINKUSDT","ADAUSDT","DOTUSDT","LTCUSDT","BCHUSDT","SHIBUSDT"];
+    const rules = await getRules({ force: true }).catch(() => null);
+    const allowed = (rules?.allowed_symbols ?? []).filter((s) => typeof s === "string" && s.length > 0);
+    const symbols = Array.from(new Set([...allowed, ...CORE]));
+    restartBybitWs(symbols);
+    res.json({ ok: true, count: symbols.length, symbols });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
+// GET /admin/ws/status — qué símbolos están suscritos ahora mismo
+router.get("/admin/ws/status", async (_req, res): Promise<void> => {
+  try {
+    const { getSubscribedSymbols, isWsConnected } = await import("../lib/bybit-ws");
+    res.json({
+      ok: true,
+      connected: isWsConnected(),
+      count: getSubscribedSymbols().length,
+      symbols: getSubscribedSymbols(),
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
 // GET /admin/reports?days=N&category=X → reportes detallados que Tanit guarda
 // en BD (memorias categoria reporte_*, leccion_*, analisis_*, decision_*).
 // Lo usa el frontend para mostrar la pestaña "Reportes" sin que invadan el chat.

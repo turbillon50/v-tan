@@ -102,12 +102,17 @@ server.listen(port, () => {
   ];
   getRules()
     .then((rules) => {
-      const symbols =
-        rules.allowed_symbols.length > 0 ? rules.allowed_symbols : CORE_SYMBOLS;
+      // 2026-05-13: union allowed_symbols + CORE_SYMBOLS para evitar el bug
+      // donde Tanit recibía $? n/a en 10 de 12 símbolos del watchlist por
+      // desincronización entre governance.allowed_symbols y la lista del WS.
+      const symbols = Array.from(new Set([
+        ...rules.allowed_symbols,
+        ...CORE_SYMBOLS,
+      ]));
       startBybitWs(symbols);
       logger.info(
-        { symbols, source: rules.allowed_symbols.length > 0 ? "governance" : "core-default" },
-        "[bybit-ws] arrancado al boot",
+        { symbols, count: symbols.length },
+        "[bybit-ws] arrancado al boot — union allowed_symbols + CORE_SYMBOLS",
       );
       // Arrancar Realtime Guard 5s después de WS para asegurar conexión
       setTimeout(() => startRealtimeGuard(), 5000);

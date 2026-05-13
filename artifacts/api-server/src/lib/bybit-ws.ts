@@ -108,6 +108,25 @@ export function startBybitWs(symbols: string[]): void {
   connect();
 }
 
+/**
+ * Re-suscribir el WS con una nueva lista de símbolos. Detiene la conexión
+ * actual y arranca con la lista nueva. Útil cuando cambia allowed_symbols
+ * en governance sin tener que redeployar Railway.
+ */
+export function restartBybitWs(symbols: string[]): void {
+  console.log(TAG, `Re-suscribiendo a ${symbols.length} símbolos: ${symbols.join(", ")}`);
+  stopBybitWs();
+  setTimeout(() => {
+    subscribedSymbols = symbols;
+    connect();
+  }, 500);
+}
+
+/** Lista actual de símbolos suscritos (read-only para UI/admin). */
+export function getSubscribedSymbols(): string[] {
+  return [...subscribedSymbols];
+}
+
 export function stopBybitWs(): void {
   _connected = false;
   if (pingTimer)     { clearInterval(pingTimer);  pingTimer = null; }
