@@ -34,6 +34,15 @@
 
 import { logger } from "./logger";
 import { getRules } from "./governance";
+import {
+  placeMarketOrderWithSL,
+  getOpenPositions,
+  getMarkPrice,
+  invalidateBalanceCache,
+  getBybitBalance,
+  calcQtyReal,
+  setLeverage,
+} from "./bybit-auth";
 
 export type EjecutorDirection = "long" | "short";
 
@@ -209,16 +218,101 @@ async function tick(): Promise<void> {
   }
   _activeCampaign.lastTickTs = now;
 
-  // Aquí va la ejecución real del trade siguiendo la campaign.
-  // Por ahora dejamos esqueleto — la integración con bybit-auth.placeMarketOrder
-  // viene en el commit siguiente cuando agreguemos el módulo de ejecución de orden
-  // con SL/TP explícitos via /v5/order/create + tpsl.
-  logger.info(
-    { campaignId: _activeCampaign.id, tradesExecuted: _activeCampaign.tradesExecuted },
-    "[motor-ejecutor] TICK — aquí ejecuta entrada según campaign (TODO integración Bybit real con SL/TP)",
-  );
+  // ═══ EJECUCIÓN REAL ═══
+  try {
+    // 1) ¿ya hay posición abierta de esta campaign?
+    const positions = await getOpenPositions();
+    const samePositions = positions.filter((p: { symbol: string; side: string; size?: string }) => {
+      if (p.symbol !== _activeCampaign!.symbol) return false;
+      const sideMatch = _activeCampaign!.direction === "long" ? p.side === "Buy" : p.side === "Sell";
+      return sideMatch && parseFloat(p.size ?? "0") > 0;
+    });
+    if (samePositions.length >= _activeCampaign.maxConcurrent) {
+      // Llenas el cap — espera tick siguiente.
+      return;
+    }
 
-  // simulación temporal: incrementa contador sin operar (lo activamos en commit F5b
-  // cuando enlacemos bybit-auth.placeMarketOrderWithSL).
-  // _activeCampaign.tradesExecuted++;
+    // 2) verificar margen disponible
+    invalidateBalanceCache();
+    const bal = await getBybitBalance();
+    const requiredMargin = _activeCampaign.sizePerEntryUsd / _activeCampaign.leverage * 1.10;
+    if (!bal || bal.available < requiredMargin) {
+      logger.warn(
+        { campaignId: _activeCampaign.id, required: requiredMargin, available: bal?.available },
+        "[motor-ejecutor] margen insuficiente — skip tick",
+      );
+      _activeCampaign.tradesFailed++;
+      return;
+    }
+
+    // 3) obtener mark price
+    const markPrice = await getMarkPrice(_activeCampaign.symbol);
+    if (!markPrice) {
+      logger.warn({ campaignId: _activeCampaign.id, symbol: _activeCampaign.symbol }, "[motor-ejecutor] no mark price");
+      _activeCampaign.tradesFailed++;
+      return;
+    }
+
+    // 4) verificar que SL está al lado correcto del mark
+    if (_activeCampaign.direction === "long" && _activeCampaign.slPrice >= markPrice) {
+      logger.warn({ campaignId: _activeCampaign.id, sl: _activeCampaign.slPrice, mark: markPrice }, "[motor-ejecutor] SL inválido para LONG (SL >= mark)");
+      _activeCampaign.tradesFailed++;
+      _activeCampaign.status = "paused";
+      _activeCampaign.killReason = `SL ${_activeCampaign.slPrice} inválido para LONG con mark ${markPrice}`;
+      return;
+    }
+    if (_activeCampaign.direction === "short" && _activeCampaign.slPrice <= markPrice) {
+      logger.warn({ campaignId: _activeCampaign.id, sl: _activeCampaign.slPrice, mark: markPrice }, "[motor-ejecutor] SL inválido para SHORT (SL <= mark)");
+      _activeCampaign.tradesFailed++;
+      _activeCampaign.status = "paused";
+      _activeCampaign.killReason = `SL ${_activeCampaign.slPrice} inválido para SHORT con mark ${markPrice}`;
+      return;
+    }
+
+    // 5) calcular qty
+    const qty = await calcQtyReal(_activeCampaign.symbol, _activeCampaign.sizePerEntryUsd, _activeCampaign.leverage, markPrice);
+    if (!qty) {
+      logger.warn({ campaignId: _activeCampaign.id }, "[motor-ejecutor] no se pudo calcular qty");
+      _activeCampaign.tradesFailed++;
+      return;
+    }
+
+    // 6) setear leverage
+    await setLeverage(_activeCampaign.symbol, _activeCampaign.leverage).catch(() => {});
+
+    // 7) abrir con SL inline
+    const result = await placeMarketOrderWithSL({
+      symbol: _activeCampaign.symbol,
+      side: _activeCampaign.direction === "long" ? "Buy" : "Sell",
+      qty,
+      stopLossPrice: _activeCampaign.slPrice,
+      takeProfitPrice: _activeCampaign.tp1Price ?? undefined,
+    });
+
+    if (result.ok) {
+      _activeCampaign.tradesExecuted++;
+      logger.info(
+        {
+          campaignId: _activeCampaign.id,
+          orderId: result.orderId,
+          symbol: _activeCampaign.symbol,
+          side: _activeCampaign.direction,
+          qty,
+          sl: _activeCampaign.slPrice,
+          tp: _activeCampaign.tp1Price,
+          tradesExecuted: _activeCampaign.tradesExecuted,
+        },
+        "[motor-ejecutor] ✅ trade ejecutado",
+      );
+    } else {
+      _activeCampaign.tradesFailed++;
+      logger.warn(
+        { campaignId: _activeCampaign.id, retCode: result.retCode, retMsg: result.retMsg },
+        "[motor-ejecutor] ❌ trade rechazado por Bybit",
+      );
+    }
+  } catch (e) {
+    _activeCampaign.tradesFailed++;
+    logger.error({ campaignId: _activeCampaign.id, err: e instanceof Error ? e.message : String(e) }, "[motor-ejecutor] tick error");
+  }
 }

@@ -597,6 +597,91 @@ export async function placeMarketOrderDetailed(
   };
 }
 
+/**
+ * Coloca orden Market con stopLoss y takeProfit inline (Bybit V5 acepta ambos
+ * en /v5/order/create con tpslMode=Full). Esto previene el bug donde se abre
+ * posición y SL queda vacío.
+ *
+ * slTriggerBy y tpTriggerBy: "LastPrice" (default) | "MarkPrice" | "IndexPrice".
+ * Para scalping usar "LastPrice" para reaccionar a movimiento real del precio.
+ */
+export async function placeMarketOrderWithSL(args: {
+  symbol: string;
+  side: "Buy" | "Sell";
+  qty: string;
+  stopLossPrice: number;
+  takeProfitPrice?: number;
+  reduceOnly?: boolean;
+  positionIdx?: number;
+}): Promise<
+  | { ok: true; orderId: string; positionMode: "one-way" | "hedge"; slSet: boolean; tpSet: boolean }
+  | { ok: false; retCode: number | null; retMsg: string }
+> {
+  const tryOrder = async (idx: number): Promise<any> => {
+    try {
+      const body: Record<string, unknown> = {
+        category: "linear",
+        symbol: args.symbol,
+        side: args.side,
+        orderType: "Market",
+        qty: args.qty,
+        timeInForce: "GoodTillCancel",
+        reduceOnly: args.reduceOnly ?? false,
+        positionIdx: idx,
+        // SL/TP inline:
+        stopLoss: args.stopLossPrice.toString(),
+        slTriggerBy: "LastPrice",
+        tpslMode: "Full",
+      };
+      if (args.takeProfitPrice != null && args.takeProfitPrice > 0) {
+        body.takeProfit = args.takeProfitPrice.toString();
+        body.tpTriggerBy = "LastPrice";
+      }
+      return await bybitPrivate("POST", "/v5/order/create", body);
+    } catch (e) {
+      return { _exception: e instanceof Error ? e.message : String(e) };
+    }
+  };
+
+  const initialIdx = args.positionIdx ?? 0;
+  let d = await tryOrder(initialIdx);
+
+  // Retry con idx alternativo si position-mode mismatch.
+  if (d?.retCode === 10001 && /position idx/i.test(String(d?.retMsg ?? ""))) {
+    const altIdx = initialIdx === 0 ? (args.side === "Buy" ? 1 : 2) : 0;
+    console.warn(`[bybit-real] placeMarketOrderWithSL retCode=10001 retry: idx ${initialIdx} → ${altIdx}`);
+    d = await tryOrder(altIdx);
+    if (d?.retCode === 0 && d?.result?.orderId) {
+      return {
+        ok: true,
+        orderId: String(d.result.orderId),
+        positionMode: altIdx === 0 ? "one-way" : "hedge",
+        slSet: true,
+        tpSet: args.takeProfitPrice != null && args.takeProfitPrice > 0,
+      };
+    }
+  }
+
+  if (d?.retCode === 0 && d?.result?.orderId) {
+    return {
+      ok: true,
+      orderId: String(d.result.orderId),
+      positionMode: initialIdx === 0 ? "one-way" : "hedge",
+      slSet: true,
+      tpSet: args.takeProfitPrice != null && args.takeProfitPrice > 0,
+    };
+  }
+
+  if (d?._exception) {
+    return { ok: false, retCode: null, retMsg: String(d._exception) };
+  }
+  return {
+    ok: false,
+    retCode: typeof d?.retCode === "number" ? d.retCode : null,
+    retMsg: String(d?.retMsg ?? "Bybit no devolvió orderId"),
+  };
+}
+
 export async function closePosition(
   symbol: string, direction: "LONG" | "SHORT", qty: string, positionIdx = 0
 ): Promise<boolean> {
