@@ -36,13 +36,21 @@ const FALLBACK_KEY_ENVS = ["OPENROUTER_API_KEY"] as const;
  * NOTA: los :free son tier comunitario sin costo pero con rate limit por
  * minuto. Los de pago se cobran del crédito de la cuenta.
  */
+/**
+ * Modelos OpenRouter en orden de preferencia.
+ * 2026-05-13: Luis pagó OpenRouter — priorizar modelos PAGA confiables
+ * primero (Gemini 2.5 flash es el mismo modelo que directo a Google pero
+ * con cuota independiente del crédito OpenRouter). Los modelos :free tienen
+ * rate limits estrictos y aguantan mal contexto grande. Los dejamos como
+ * último fallback por si el crédito se agota.
+ */
 export const OPENROUTER_MODEL_CHAIN = [
-  "google/gemini-2.0-flash-exp:free",      // free, rápido, Gemini reciente
-  "meta-llama/llama-3.3-70b-instruct:free", // free, distinto provider para variar
-  "deepseek/deepseek-chat:free",            // free, distinto provider
-  "google/gemini-2.5-flash",                // paga, $0.30/M, mismo modelo que directo
-  "anthropic/claude-haiku-4.5",             // paga, $1/M, muy rápido
-  "openai/gpt-5-mini",                      // paga, fallback final
+  "google/gemini-2.5-flash",                // paga, $0.30/M, mismo modelo que Gemini directo
+  "anthropic/claude-haiku-4.5",             // paga, $1/M, muy rápido, voz distinta
+  "openai/gpt-4o-mini",                     // paga, fallback rápido
+  "google/gemini-2.0-flash-exp:free",       // free como último recurso
+  "meta-llama/llama-3.3-70b-instruct:free", // free
+  "deepseek/deepseek-chat:free",            // free
 ] as const;
 
 export type Pool = "chat" | "live";
