@@ -586,6 +586,17 @@ router.post("/admin/live-inject", async (req, res): Promise<void> => {
   res.json({ ok: true, queued: body.text });
 });
 
+// GET /admin/rotation-errors → últimos errores de rotación de keys/modelos.
+// Para diagnóstico cuando el chat falla con "no hay modelos disponibles".
+router.get("/admin/rotation-errors", async (_req, res): Promise<void> => {
+  try {
+    const { getLastRotationErrors } = await import("../mastra/agent-tanit");
+    res.json({ ok: true, errors: getLastRotationErrors() });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
 // GET /admin/gemini-keys → estado de los pools (cuántas keys activas, cuáles
 // agotadas y hasta cuándo). Solo lectura, no requiere admin secret porque
 // es info de salud del sistema.

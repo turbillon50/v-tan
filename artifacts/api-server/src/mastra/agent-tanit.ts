@@ -211,6 +211,23 @@ export function getAgentForPool(
   };
 }
 
+// Diagnóstico: captura el último error real de rotación para inspección.
+let _lastRotationError: { ts: string; envName: string; modelLabel: string; outcome: string; err: string }[] = [];
+export function getLastRotationErrors(): typeof _lastRotationError {
+  return _lastRotationError.slice(-20);
+}
+function recordRotationError(envName: string, modelLabel: string, outcome: string, err: unknown) {
+  const errStr = err instanceof Error ? err.message : String(err);
+  _lastRotationError.push({
+    ts: new Date().toISOString(),
+    envName,
+    modelLabel,
+    outcome,
+    err: errStr.slice(0, 500),
+  });
+  if (_lastRotationError.length > 50) _lastRotationError = _lastRotationError.slice(-30);
+}
+
 /**
  * Stream con rotación automática. Mastra retorna el stream object sin lanzar
  * — la excepción "Resource exhausted" aparece al iterar. Por eso aquí
@@ -358,20 +375,24 @@ export async function streamFullWithPool(
         continue;
       }
       if (outcome === "timeout" || outcome === "transient_error") {
-        logger.warn({ envName: pick.envName, pool, attempt, outcome }, "[streamFull] skip soft, rotando");
+        logger.warn({ envName: pick.envName, model: pick.modelLabel, pool, attempt, outcome }, "[streamFull] skip soft, rotando");
+        recordRotationError(pick.envName, pick.modelLabel, outcome, `outcome=${outcome}`);
         lastErr = new Error(outcome);
         continue;
       }
       return { fullStream: merged, envName: pick.envName };
     } catch (e) {
       lastErr = e;
+      recordRotationError(pick.envName, pick.modelLabel, "exception", e);
       if (isExhaustedError(e)) {
         const modelArg = pick.modelLabel.includes("/") ? pick.modelLabel : undefined;
         markKeyExhausted(pick.envName, modelArg);
         logger.warn({ envName: pick.envName, model: pick.modelLabel, pool, attempt }, "[stream] exhausted, rotando");
         continue;
       }
-      throw e;
+      // Otros errores: log y rotar a siguiente modelo en lugar de morir.
+      logger.warn({ envName: pick.envName, model: pick.modelLabel, pool, attempt, err: e instanceof Error ? e.message : String(e) }, "[stream] error genérico, rotando");
+      continue;
     }
   }
   throw lastErr ?? new Error("[streamFull] todas las keys del pool fallaron");
