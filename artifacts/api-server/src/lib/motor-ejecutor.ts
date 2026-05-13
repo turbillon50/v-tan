@@ -37,12 +37,27 @@ import { getRules } from "./governance";
 import {
   placeMarketOrderWithSL,
   getOpenPositions,
-  getMarkPrice,
   invalidateBalanceCache,
   getBybitBalance,
   calcQtyReal,
   setLeverage,
 } from "./bybit-auth";
+import { getWsPrice } from "./bybit-ws";
+
+// Mark price helper local: prefiere WS (latencia 0ms), cae a REST si no hay.
+async function getMarkPrice(symbol: string): Promise<number | null> {
+  const wsPrice = getWsPrice(symbol);
+  if (wsPrice && wsPrice > 0) return wsPrice;
+  // Fallback REST si WS aún no tiene el símbolo
+  try {
+    const { bybitPublic } = await import("./bybit-auth");
+    const r = await bybitPublic("GET", `/v5/market/tickers`, { category: "linear", symbol });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const list = (r as any)?.result?.list ?? [];
+    if (list.length > 0 && list[0].markPrice) return parseFloat(list[0].markPrice);
+  } catch {}
+  return null;
+}
 
 export type EjecutorDirection = "long" | "short";
 
