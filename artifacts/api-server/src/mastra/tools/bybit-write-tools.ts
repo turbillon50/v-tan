@@ -198,11 +198,24 @@ async function autonomyAllowsDirectExecution(): Promise<boolean> {
 export const abrirLong = createTool({
   id: "abrir_long",
   description:
-    "Abre posición LONG market en Bybit. Pasa por governance + ejecuta directo cuando Luis lo pide. Único freno: kill_switch_global.",
+    "Abre posición LONG market en Bybit. Pasa por governance + ejecuta directo cuando Luis lo pide. " +
+    "REQUIERE stopLossPrice (en precio absoluto USD, no porcentaje) — tu Tesis 5.7 Motor 5 lo demanda: 'SL colocado en momento de entrada, NUNCA después'. " +
+    "Si no traes stopLossPrice, la orden NO se ejecuta. Único freno adicional: kill_switch_global.",
   inputSchema: z.object({
     symbol: symbolSchema,
     size_usd: z.number().positive().describe("Tamaño nominal en USD."),
-    leverage: z.number().int().describe("Apalancamiento. Tanit decide según Tesis 5.1."),
+    leverage: z.number().int().describe("Apalancamiento. Tanit decide según su tesis activa."),
+    stopLossPrice: z
+      .number()
+      .positive()
+      .describe(
+        "OBLIGATORIO. Precio absoluto USD donde el SL debe activarse, basado en estructura técnica (Motor 5 de tu tesis). NO pases porcentaje. NO omitas. La tool rechaza si falta o si es 0.",
+      ),
+    takeProfit1Price: z
+      .number()
+      .positive()
+      .optional()
+      .describe("Opcional. Precio TP1 (50% pos). Si lo pasas, Bybit lo coloca al abrir."),
     thesis: thesisSchema,
     confirmado: confirmacionSchema,
   }),
@@ -470,11 +483,24 @@ export const abrirLong = createTool({
 export const abrirShort = createTool({
   id: "abrir_short",
   description:
-    "Abre posición SHORT market en Bybit. Mismas tres barreras: governance + confirmación explícita + audit. Usar cuando la tesis valide setup bajista y Luis lo autorice.",
+    "Abre posición SHORT market en Bybit. " +
+    "REQUIERE stopLossPrice (precio absoluto USD, no porcentaje) — tu Tesis 5.7 Motor 5 lo demanda: 'SL colocado en momento de entrada, NUNCA después'. " +
+    "Si no traes stopLossPrice, la orden NO se ejecuta. Único freno adicional: kill_switch_global.",
   inputSchema: z.object({
     symbol: symbolSchema,
     size_usd: z.number().positive(),
-    leverage: z.number().int().describe("Apalancamiento. Tanit decide según Tesis 5.1."),
+    leverage: z.number().int().describe("Apalancamiento. Tanit decide según su tesis activa."),
+    stopLossPrice: z
+      .number()
+      .positive()
+      .describe(
+        "OBLIGATORIO. Precio absoluto USD donde el SL debe activarse, basado en estructura técnica (Motor 5 de tu tesis). NO pases porcentaje. NO omitas. La tool rechaza si falta o si es 0.",
+      ),
+    takeProfit1Price: z
+      .number()
+      .positive()
+      .optional()
+      .describe("Opcional. Precio TP1 (50% pos). Si lo pasas, Bybit lo coloca al abrir."),
     thesis: thesisSchema,
     confirmado: confirmacionSchema,
   }),
