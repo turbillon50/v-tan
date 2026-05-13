@@ -801,6 +801,29 @@ router.post("/admin/ws/resubscribe", async (req, res): Promise<void> => {
   }
 });
 
+// GET /admin/motor-ejecutor/status — estado del motor ejecutor determinista
+router.get("/admin/motor-ejecutor/status", async (_req, res): Promise<void> => {
+  try {
+    const { status } = await import("../lib/motor-ejecutor");
+    res.json({ ok: true, ...status() });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
+// POST /admin/motor-ejecutor/kill — kill manual del motor (override de Tanit)
+router.post("/admin/motor-ejecutor/kill", async (req, res): Promise<void> => {
+  const guard = requireAdmin((req.body ?? {}).secret, req.headers.origin);
+  if (guard) { res.status(403).json({ ok: false, error: guard }); return; }
+  try {
+    const { pausar } = await import("../lib/motor-ejecutor");
+    const r = pausar("kill manual desde admin (Luis)");
+    res.json({ ok: true, ...r });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
 // GET /admin/ws/status — qué símbolos están suscritos ahora mismo
 router.get("/admin/ws/status", async (_req, res): Promise<void> => {
   try {

@@ -25,6 +25,7 @@ import { integrityTools } from "./tools/integrity-tools";
 import { semanticMemoryTools } from "./tools/semantic-memory-tools";
 import { imageTools } from "./tools/image-tools";
 import { cognitionTools } from "./tools/cognition-tools";
+import { motorEjecutorTools } from "./tools/motor-ejecutor-tools";
 import {
   pickAvailableKey,
   markKeyExhausted,
@@ -166,6 +167,7 @@ function getAgentForSlot(slot: KeySlot): Agent {
       ...semanticMemoryTools,
       ...imageTools,
       ...cognitionTools,
+      ...motorEjecutorTools,
     },
     instructions: async () => {
       const ctx = await loadBootstrap();
