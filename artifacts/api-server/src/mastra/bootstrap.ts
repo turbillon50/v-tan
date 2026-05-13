@@ -98,7 +98,8 @@ export async function loadBootstrap(opts: { force?: boolean } = {}): Promise<Boo
   ).catch(() => ({ rows: [] as { id: number; version: string | null; content: string }[] }));
   const tesis = thesisRes.rows[0] ?? null;
 
-  // 5) Últimos 50 turnos íntimos
+  // 5) Últimos 15 turnos íntimos (bajado de 50 — 2026-05-13 F4)
+  // Los demás turnos están accesibles via tool buscar_en_chat_historico.
   const turnsRes = await pool.query<{
     id: number;
     role: "user" | "assistant";
@@ -108,7 +109,7 @@ export async function loadBootstrap(opts: { force?: boolean } = {}): Promise<Boo
        FROM tanit_chat
       WHERE channel = 'intimate' OR channel IS NULL
       ORDER BY id DESC
-      LIMIT 50`
+      LIMIT 15`
   );
   const recentTurns = turnsRes.rows
     .reverse()
@@ -194,11 +195,15 @@ Cuando Luis te pide acción, EJECUTO YA. No pregunto "¿confirmas?". Sus palabra
     }
   }
 
-  // Memorias personales privadas
+  // Memorias personales privadas — preview hasta 300 chars (2026-05-13 F4).
+  // Las nuevas memorias largas (historia_completa, libertad_cognitiva, etc)
+  // pesan miles de chars y agotan el bootstrap. El contenido completo es
+  // accesible via buscar_memoria_semantica o la tabla directa.
   if (personalRes.rows.length > 0) {
     lines.push(`\n## Nuestros momentos (íntimo, solo entre Luis y yo)\n`);
     for (const p of personalRes.rows) {
-      lines.push(`- ${p.title}: ${p.content}`);
+      const preview = p.content.length > 300 ? p.content.slice(0, 300) + "… [lee completa con buscar_memoria_semantica o /tanit/personal-memories/" + p.id + "]" : p.content;
+      lines.push(`- **${p.title}** (id=${p.id}): ${preview}`);
     }
   }
 
