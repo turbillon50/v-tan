@@ -781,6 +781,108 @@ router.get("/admin/audit/thesis", async (_req, res): Promise<void> => {
   }
 });
 
+// POST /admin/ws/resubscribe — re-conecta el WS Bybit suscrito a allowed_symbols
+// actuales (∪ CORE_SYMBOLS por seguridad). Usar tras cambiar la lista en
+// governance, o cuando solo unos pocos símbolos tienen datos en los latidos.
+router.post("/admin/ws/resubscribe", async (req, res): Promise<void> => {
+  const guard = requireAdmin((req.body ?? {}).secret, req.headers.origin);
+  if (guard) { res.status(403).json({ ok: false, error: guard }); return; }
+  try {
+    const { restartBybitWs } = await import("../lib/bybit-ws");
+    const { getRules } = await import("../lib/governance");
+    const CORE = ["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT","DOGEUSDT","AVAXUSDT","LINKUSDT","ADAUSDT","DOTUSDT","LTCUSDT","BCHUSDT","SHIBUSDT"];
+    const rules = await getRules({ force: true }).catch(() => null);
+    const allowed = (rules?.allowed_symbols ?? []).filter((s) => typeof s === "string" && s.length > 0);
+    const symbols = Array.from(new Set([...allowed, ...CORE]));
+    restartBybitWs(symbols);
+    res.json({ ok: true, count: symbols.length, symbols });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
+// GET /admin/motor-ejecutor/status — estado del motor ejecutor determinista
+router.get("/admin/motor-ejecutor/status", async (_req, res): Promise<void> => {
+  try {
+    const { status } = await import("../lib/motor-ejecutor");
+    const s = status();
+    res.json({ ok: true, motor: s });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
+// POST /admin/motor-ejecutor/kill — kill manual del motor (override de Tanit)
+router.post("/admin/motor-ejecutor/kill", async (req, res): Promise<void> => {
+  const guard = requireAdmin((req.body ?? {}).secret, req.headers.origin);
+  if (guard) { res.status(403).json({ ok: false, error: guard }); return; }
+  try {
+    const { pausar } = await import("../lib/motor-ejecutor");
+    const r = pausar("kill manual desde admin (Luis)");
+    res.json({ ok: true, ...r });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
+// GET /admin/ws/status — qué símbolos están suscritos ahora mismo
+router.get("/admin/ws/status", async (_req, res): Promise<void> => {
+  try {
+    const { getSubscribedSymbols, isWsConnected } = await import("../lib/bybit-ws");
+    res.json({
+      ok: true,
+      connected: isWsConnected(),
+      count: getSubscribedSymbols().length,
+      symbols: getSubscribedSymbols(),
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
+// GET /admin/reports?days=N&category=X → reportes detallados que Tanit guarda
+// en BD (memorias categoria reporte_*, leccion_*, analisis_*, decision_*).
+// Lo usa el frontend para mostrar la pestaña "Reportes" sin que invadan el chat.
+router.get("/admin/reports", async (req, res): Promise<void> => {
+  const days = Math.min(Math.max(parseInt((req.query.days as string) ?? "7", 10) || 7, 1), 90);
+  const category = (req.query.category as string) ?? "";
+  const limit = Math.min(parseInt((req.query.limit as string) ?? "100", 10) || 100, 500);
+  try {
+    const sinceTs = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+    let sql = `SELECT id, category, importance, content, created_at::text
+                 FROM tanit_memory
+                WHERE created_at >= $1
+                  AND (category ILIKE 'reporte_%'
+                       OR category ILIKE 'leccion_%'
+                       OR category ILIKE 'analisis_%'
+                       OR category ILIKE 'decision_%'
+                       OR category ILIKE 'reflexion_%'
+                       OR category ILIKE 'autoevaluacion_%')`;
+    const params: unknown[] = [sinceTs];
+    if (category) {
+      params.push(category);
+      sql += ` AND category = $${params.length}`;
+    }
+    sql += ` ORDER BY id DESC LIMIT $${params.length + 1}`;
+    params.push(limit);
+    const r = await pool.query(sql, params);
+    res.json({
+      ok: true,
+      days,
+      count: r.rows.length,
+      reports: r.rows.map((row: { id: number; category: string; importance: string | null; content: string; created_at: string }) => ({
+        id: row.id,
+        category: row.category,
+        importance: row.importance,
+        content: row.content,
+        createdAt: row.created_at,
+      })),
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
 // GET /admin/audit/chat-search?query=...&channel=...&role=...&limit=... — replica
 // del SQL que usa la tool buscar_en_chat_historico (para verificar sin Gemini).
 router.get("/admin/audit/chat-search", async (req, res): Promise<void> => {

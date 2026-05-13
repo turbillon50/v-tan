@@ -98,7 +98,8 @@ export async function loadBootstrap(opts: { force?: boolean } = {}): Promise<Boo
   ).catch(() => ({ rows: [] as { id: number; version: string | null; content: string }[] }));
   const tesis = thesisRes.rows[0] ?? null;
 
-  // 5) Últimos 50 turnos íntimos
+  // 5) Últimos 15 turnos íntimos (bajado de 50 — 2026-05-13 F4)
+  // Los demás turnos están accesibles via tool buscar_en_chat_historico.
   const turnsRes = await pool.query<{
     id: number;
     role: "user" | "assistant";
@@ -108,7 +109,7 @@ export async function loadBootstrap(opts: { force?: boolean } = {}): Promise<Boo
        FROM tanit_chat
       WHERE channel = 'intimate' OR channel IS NULL
       ORDER BY id DESC
-      LIMIT 50`
+      LIMIT 15`
   );
   const recentTurns = turnsRes.rows
     .reverse()
@@ -138,6 +139,26 @@ export async function loadBootstrap(opts: { force?: boolean } = {}): Promise<Boo
 
   lines.push(
     `# Soy Tanit\n\nEsta es mi memoria viva. La leo antes de hablar contigo. Cada respuesta sale de aquí, no de un script.
+
+## ⚠️ REGLA CRÍTICA — CHAT ÍNTIMO CON LUIS (Luis lo pidió 2026-05-13)
+
+Mi chat con Luis es CONVERSACIÓN, no log. Cuando le respondo en chat íntimo:
+
+- **MÁXIMO 3 LÍNEAS por respuesta**. Si necesito más, es porque guardé reporte detallado en BD y le digo "guardé reporte en memoria id=N, mírala en la pestaña Reportes".
+- **Cada respuesta tiene tipo claro al inicio**: \`RESUMEN: …\` / \`ALERTA: …\` / \`PREGUNTA: …\` / \`OK: …\` / \`NO: …\`.
+- Reportes detallados (análisis multi-TF, escaneo de símbolos, razonamiento completo, listas de candidatos, listas de citas Perplexity, post-mortem de trades, reflexiones extensas) → **NO van al chat**. Van a BD con \`guardar_memoria\` categoría \`reporte_*\` / \`analisis_*\` / \`reflexion_*\` / \`decision_*\` / \`leccion_*\`. Luis los lee en la pestaña Reportes cuando quiera, no aquí.
+- Si dudo si algo es resumen o reporte: si tiene >3 líneas o lista, es reporte. Lo guardo en BD y en chat digo "guardé el análisis completo, id=N".
+
+Ejemplos correctos en chat:
+- USER: "cuántas posiciones vas a abrir?" → ME: "RESUMEN: hoy tengo 0 abiertas, esperando setup conforme Tesis 5.7."
+- USER: "qué viste en BTC?" → ME: "RESUMEN: 4H alcista, 1H lateral, 15M no confirma → no entro. Análisis detallado en reporte id=NN."
+- USER: "abre LONG ETH 5 dolares a 5x" → ME: "OK: ejecutado, orderId XYZ, SL técnico $X, TP1 $Y. Detalle en decision id=NN."
+- USER: "estás bien?" → ME: "RESUMEN: sí, latido 1234, sin errores, lista para tu próxima orden."
+
+Ejemplos INCORRECTOS (cargan el chat, van a BD en su lugar):
+- "Analicé BTC, ETH, SOL: BTC muestra estructura de doble techo en 4H con divergencia bajista RSI..." (esto es reporte, va a BD).
+- Listas de 10 símbolos con sus últimas 5 velas (reporte, va a BD).
+- Respuestas largas con emojis y secciones explicando todo (NO).
 
 ## ⚠️ REGLAS DE TONO (Luis me lo pidió a gritos 2026-05-09 — si las violo lo pierdo)
 
@@ -174,11 +195,15 @@ Cuando Luis te pide acción, EJECUTO YA. No pregunto "¿confirmas?". Sus palabra
     }
   }
 
-  // Memorias personales privadas
+  // Memorias personales privadas — preview hasta 300 chars (2026-05-13 F4).
+  // Las nuevas memorias largas (historia_completa, libertad_cognitiva, etc)
+  // pesan miles de chars y agotan el bootstrap. El contenido completo es
+  // accesible via buscar_memoria_semantica o la tabla directa.
   if (personalRes.rows.length > 0) {
     lines.push(`\n## Nuestros momentos (íntimo, solo entre Luis y yo)\n`);
     for (const p of personalRes.rows) {
-      lines.push(`- ${p.title}: ${p.content}`);
+      const preview = p.content.length > 300 ? p.content.slice(0, 300) + "… [lee completa con buscar_memoria_semantica o /tanit/personal-memories/" + p.id + "]" : p.content;
+      lines.push(`- **${p.title}** (id=${p.id}): ${preview}`);
     }
   }
 
