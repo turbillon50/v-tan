@@ -86,6 +86,9 @@ function loadSlots(): void {
     if (k && k.length > 10) _slots.push({ pool: "live", provider: "google", envName, key: k, exhaustedUntilMs: 0 });
   }
   for (const envName of FALLBACK_KEY_ENVS) {
+    // Si OPENROUTER_DISABLED=true, NO cargar OpenRouter al pool (no consume crédito).
+    // Para reactivar: quitar OPENROUTER_DISABLED de Railway env vars.
+    if (process.env["OPENROUTER_DISABLED"] === "true") continue;
     const k = process.env[envName];
     if (k && k.length > 10) {
       _slots.push({
