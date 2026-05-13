@@ -805,7 +805,8 @@ router.post("/admin/ws/resubscribe", async (req, res): Promise<void> => {
 router.get("/admin/motor-ejecutor/status", async (_req, res): Promise<void> => {
   try {
     const { status } = await import("../lib/motor-ejecutor");
-    res.json({ ok: true, ...status() });
+    const s = status();
+    res.json({ ok: true, motor: s });
   } catch (e) {
     res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
   }
