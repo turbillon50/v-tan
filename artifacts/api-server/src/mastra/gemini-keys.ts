@@ -170,11 +170,13 @@ export function pickModelForSlot(slot: KeySlot, skipModels?: Set<string>): strin
   return null;
 }
 
-/** Limpia las marcas exhausted. Para usar tras agregar keys nuevas o tras
- * sospechar falsos positivos. */
+/** Limpia las marcas exhausted (slots + modelos OpenRouter). */
 export function clearAllExhausted(): void {
-  for (const s of _slots) s.exhaustedUntilMs = 0;
-  logger.info("[llm-keys] todas las marcas exhausted limpiadas");
+  for (const s of _slots) {
+    s.exhaustedUntilMs = 0;
+    if (s.modelExhaustedUntil) s.modelExhaustedUntil.clear();
+  }
+  logger.info("[llm-keys] todas las marcas exhausted limpiadas (slots + modelos)");
 }
 
 export function getKeysStatus(): {

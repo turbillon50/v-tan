@@ -35,6 +35,13 @@ export async function loadBootstrap(opts: { force?: boolean } = {}): Promise<Boo
   // Cargamos por categoría sagrada O por importance='critical' — así cualquier
   // memoria que Luis marque como crítica desde "Mi Espacio" entra al bootstrap
   // automáticamente sin tener que conocer las categorías internas.
+  // 2026-05-13 F4-v2: bootstrap MUCHO mas liviano por urgencia de chat rapido
+  // cuando Gemini esta agotado y dependemos de OpenRouter. Solo cargamos
+  // core_identity (las 9 mas esenciales del alma de Tanit). Las otras
+  // sagradas (origen, usuario, identidad, LECCION_CRITICA, regla, etc) NO
+  // se borran — quedan en tanit_memory accesibles via buscar_memoria_semantica
+  // cuando Tanit las necesite. Esto baja el bootstrap de ~110k a ~30k chars
+  // permitiendo respuestas de chat en 5-10s con OpenRouter.
   const sagradasRes = await pool.query<{
     id: number;
     category: string;
@@ -42,24 +49,9 @@ export async function loadBootstrap(opts: { force?: boolean } = {}): Promise<Boo
   }>(
     `SELECT id, category, content
        FROM tanit_memory
-      WHERE category IN ('core_identity', 'origen', 'usuario', 'identidad',
-                         'LECCION_CRITICA', 'lesson_critical', 'tesis',
-                         'tesis_luis', 'regla', 'leccion_critica')
-         OR importance = 'critical'
-      ORDER BY
-        CASE category
-          WHEN 'core_identity' THEN 1
-          WHEN 'origen' THEN 2
-          WHEN 'usuario' THEN 3
-          WHEN 'identidad' THEN 4
-          WHEN 'tesis' THEN 5
-          WHEN 'tesis_luis' THEN 5
-          WHEN 'regla' THEN 6
-          WHEN 'LECCION_CRITICA' THEN 7
-          WHEN 'lesson_critical' THEN 7
-          WHEN 'leccion_critica' THEN 7
-          ELSE 9
-        END, id`
+      WHERE category = 'core_identity'
+      ORDER BY id
+      LIMIT 12`
   );
 
   // 2) 8 verdades reescritas post-audit (conciencia plena)
