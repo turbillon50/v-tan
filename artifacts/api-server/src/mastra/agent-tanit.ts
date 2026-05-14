@@ -31,6 +31,7 @@ import {
   markKeyExhausted,
   isExhaustedError,
   buildAgentForKey,
+  slotKey,
   type Pool,
   type KeySlot,
 } from "./gemini-keys";
@@ -143,7 +144,8 @@ export async function getRecentTurns(): Promise<
 const _agentCache = new Map<string, Agent>();
 
 function getAgentForSlot(slot: KeySlot): Agent {
-  const cached = _agentCache.get(slot.envName);
+  const key = slotKey(slot);
+  const cached = _agentCache.get(key);
   if (cached) return cached;
   const a = buildAgentForKey(slot, {
     id: "tanit",
@@ -174,7 +176,7 @@ function getAgentForSlot(slot: KeySlot): Agent {
       return ctx.systemPrompt;
     },
   });
-  _agentCache.set(slot.envName, a);
+  _agentCache.set(key, a);
   return a;
 }
 
@@ -186,10 +188,10 @@ function getAgentForSlot(slot: KeySlot): Agent {
 export function getAgentForPool(
   pool: Pool,
   skip?: Set<string>,
-): { agent: Agent; envName: string } | null {
+): { agent: Agent; envName: string; slotId: string } | null {
   const slot = pickAvailableKey(pool, skip);
   if (!slot) return null;
-  return { agent: getAgentForSlot(slot), envName: slot.envName };
+  return { agent: getAgentForSlot(slot), envName: slot.envName, slotId: slotKey(slot) };
 }
 
 /**
@@ -305,16 +307,15 @@ export async function streamFullWithPool(
 ): Promise<{ fullStream: AsyncIterable<any>; envName: string }> {
   let lastErr: unknown = null;
   const triedThisRequest = new Set<string>();
-  // 6 attempts cubre los 5 slots (1 chat + 3 live + 1 OpenRouter) con margen.
-  // Antes era 4 — bug crítico: cuando las 4 Gemini se agotaban, no llegaba a probar OpenRouter.
-  for (let attempt = 0; attempt < 6; attempt++) {
+  // 10 attempts: 1 chat + 3 live + 5 OR free models + margen.
+  for (let attempt = 0; attempt < 10; attempt++) {
     const pick = getAgentForPool(pool, triedThisRequest);
     if (!pick) {
       throw new Error(
         `[gemini-keys] no hay keys disponibles para pool=${pool}`,
       );
     }
-    triedThisRequest.add(pick.envName);
+    triedThisRequest.add(pick.slotId);
     try {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const stream = await (pick.agent as any).stream(messages, options);
@@ -322,13 +323,13 @@ export async function streamFullWithPool(
       const iter = stream.fullStream[Symbol.asyncIterator]() as AsyncIterator<any>;
       const { merged, outcome } = await probeAndMerge(iter);
       if (outcome === "exhausted") {
-        markKeyExhausted(pick.envName);
-        logger.warn({ envName: pick.envName, pool, attempt }, "[streamFull] exhausted, marcando hasta reset");
+        markKeyExhausted(pick.slotId);
+        logger.warn({ slotId: pick.slotId, pool, attempt }, "[streamFull] exhausted, marcando hasta reset");
         lastErr = new Error("exhausted");
         continue;
       }
       if (outcome === "timeout" || outcome === "transient_error") {
-        logger.warn({ envName: pick.envName, pool, attempt, outcome }, "[streamFull] skip soft, rotando");
+        logger.warn({ slotId: pick.slotId, pool, attempt, outcome }, "[streamFull] skip soft, rotando");
         lastErr = new Error(outcome);
         continue;
       }
@@ -336,8 +337,8 @@ export async function streamFullWithPool(
     } catch (e) {
       lastErr = e;
       if (isExhaustedError(e)) {
-        markKeyExhausted(pick.envName);
-        logger.warn({ envName: pick.envName, pool, attempt }, "[streamFull] excepcion exhausted, rotando");
+        markKeyExhausted(pick.slotId);
+        logger.warn({ slotId: pick.slotId, pool, attempt }, "[streamFull] excepcion exhausted, rotando");
         continue;
       }
       throw e;
@@ -355,32 +356,28 @@ export async function streamTextWithPool(
 ): Promise<{ textStream: AsyncIterable<string>; envName: string }> {
   let lastErr: unknown = null;
   const triedThisRequest = new Set<string>();
-  // 6 attempts cubre los 5 slots (1 chat + 3 live + 1 OpenRouter) con margen.
-  // Antes era 4 — bug crítico: cuando las 4 Gemini se agotaban, no llegaba a probar OpenRouter.
-  for (let attempt = 0; attempt < 6; attempt++) {
+  // 10 attempts: 1 chat + 3 live + 5 OR free models + margen.
+  for (let attempt = 0; attempt < 10; attempt++) {
     const pick = getAgentForPool(pool, triedThisRequest);
     if (!pick) {
       throw new Error(
         `[gemini-keys] no hay keys disponibles para pool=${pool}`,
       );
     }
-    triedThisRequest.add(pick.envName);
+    triedThisRequest.add(pick.slotId);
     try {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const stream = await (pick.agent as any).stream(messages, options);
-      // textStream solo emite strings — si la key falla con exhausted,
-      // Mastra debería lanzar al hacer next(). Pero por si la versión actual
-      // emite un primer "" antes del error, también probamos a leer dos chunks.
       const iter = stream.textStream[Symbol.asyncIterator]() as AsyncIterator<string>;
       const { merged, outcome } = await probeAndMerge<string>(iter);
       if (outcome === "exhausted") {
-        markKeyExhausted(pick.envName);
-        logger.warn({ envName: pick.envName, pool, attempt }, "[streamText] exhausted, marcando hasta reset");
+        markKeyExhausted(pick.slotId);
+        logger.warn({ slotId: pick.slotId, pool, attempt }, "[streamText] exhausted, marcando hasta reset");
         lastErr = new Error("exhausted");
         continue;
       }
       if (outcome === "timeout" || outcome === "transient_error") {
-        logger.warn({ envName: pick.envName, pool, attempt, outcome }, "[streamText] skip soft, rotando");
+        logger.warn({ slotId: pick.slotId, pool, attempt, outcome }, "[streamText] skip soft, rotando");
         lastErr = new Error(outcome);
         continue;
       }
@@ -388,8 +385,8 @@ export async function streamTextWithPool(
     } catch (e) {
       lastErr = e;
       if (isExhaustedError(e)) {
-        markKeyExhausted(pick.envName);
-        logger.warn({ envName: pick.envName, pool, attempt }, "[streamText] excepcion exhausted, rotando");
+        markKeyExhausted(pick.slotId);
+        logger.warn({ slotId: pick.slotId, pool, attempt }, "[streamText] excepcion exhausted, rotando");
         continue;
       }
       throw e;
