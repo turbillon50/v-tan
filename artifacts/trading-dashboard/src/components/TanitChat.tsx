@@ -104,10 +104,56 @@ export function TanitChat() {
     localStorage.setItem("tanit_mode", next);
   };
 
+  const [voiceEnabled, setVoiceEnabled] = useState<boolean>(() =>
+    localStorage.getItem("tanit_voice") === "1"
+  );
+  const [speaking, setSpeaking] = useState(false);
+
   const inputRef   = useRef<HTMLTextAreaElement>(null);
   const chatRef    = useRef<HTMLDivElement>(null);
   const recognRef  = useRef<any>(null);
   const fileRef    = useRef<HTMLInputElement>(null);
+  const audioRef   = useRef<HTMLAudioElement | null>(null);
+
+  const stopAudio = useCallback(() => {
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current = null;
+    }
+    setSpeaking(false);
+  }, []);
+
+  const speakText = useCallback(async (text: string) => {
+    if (!text.trim()) return;
+    stopAudio();
+    setSpeaking(true);
+    try {
+      const r = await fetch(`${BASE_URL}api/audio/synthesize`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: text.slice(0, 4000), voice: "Kore" }),
+      });
+      if (!r.ok) { setSpeaking(false); return; }
+      const blob = await r.blob();
+      const url  = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      audioRef.current = audio;
+      audio.onended = () => { setSpeaking(false); URL.revokeObjectURL(url); audioRef.current = null; };
+      audio.onerror = () => { setSpeaking(false); URL.revokeObjectURL(url); audioRef.current = null; };
+      await audio.play();
+    } catch {
+      setSpeaking(false);
+    }
+  }, [stopAudio]);
+
+  const toggleVoiceEnabled = useCallback(() => {
+    setVoiceEnabled(prev => {
+      const next = !prev;
+      localStorage.setItem("tanit_voice", next ? "1" : "0");
+      if (!next) stopAudio();
+      return next;
+    });
+  }, [stopAudio]);
 
   /* ── imagen desde archivo ── */
   const loadImageFile = (file: File) => {
@@ -182,6 +228,7 @@ export function TanitChat() {
     const msg = (text ?? input).trim();
     if ((!msg && pendingImages.length === 0) || sending) return;
     if (listening) { recognRef.current?.stop(); setListening(false); setInterimText(""); }
+    stopAudio();
     const imgsToSend = [...pendingImages];
     setInput("");
     setInterimText("");
@@ -210,18 +257,20 @@ export function TanitChat() {
         body: JSON.stringify(body),
       });
       const d = await r.json();
+      const reply = d.reply ?? "Sin respuesta.";
       setMessages(prev => [...prev, {
         role: "ai",
-        text: d.reply ?? "Sin respuesta.",
+        text: reply,
         actions: d.actionsExecuted ?? [],
         ts: Date.now(),
       }]);
+      if (voiceEnabled) speakText(reply);
     } catch {
       setMessages(prev => [...prev, { role: "ai", text: "Error de conexión.", ts: Date.now() }]);
     } finally {
       setSending(false);
     }
-  }, [input, sending, listening, tanitMode, pendingImages]);
+  }, [input, sending, listening, tanitMode, pendingImages, voiceEnabled, speakText, stopAudio]);
 
   const toggleVoice = useCallback(() => {
     const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
@@ -234,6 +283,7 @@ export function TanitChat() {
       return;
     }
 
+    stopAudio();
     setExpanded(true);
     const r = new SR();
     r.lang = "es-MX";
@@ -364,9 +414,9 @@ export function TanitChat() {
                         />
                       )}
                       {!m.text.startsWith("📸 [imagen") && <span style={{ padding: (m.imagePreviews?.length || m.imagePreview) ? "0 6px" : undefined }}>{m.text}</span>}
-                      {m.role === "ai" && m.actions && m.actions.length > 0 && (
-                        <div style={{ marginTop: 6, display: "flex", gap: 4, flexWrap: "wrap" }}>
-                          {m.actions.map((a, j) => (
+                      {m.role === "ai" && (
+                        <div style={{ marginTop: 6, display: "flex", gap: 4, flexWrap: "wrap", alignItems: "center" }}>
+                          {m.actions && m.actions.length > 0 && m.actions.map((a, j) => (
                             <span key={j} style={{
                               fontSize: 9, padding: "2px 7px", borderRadius: 8,
                               background: "rgba(0,229,204,0.07)",
@@ -376,6 +426,20 @@ export function TanitChat() {
                               fontWeight: 600,
                             }}>✓ {a}</span>
                           ))}
+                          <button
+                            onClick={() => speakText(m.text)}
+                            title="Escuchar respuesta"
+                            style={{
+                              marginLeft: "auto",
+                              background: "transparent", border: "none",
+                              color: "rgba(0,229,204,0.35)", cursor: "pointer",
+                              fontSize: 12, padding: "0 2px",
+                              lineHeight: 1,
+                              transition: "color 0.15s",
+                            }}
+                            onMouseEnter={e => (e.currentTarget.style.color = TEAL)}
+                            onMouseLeave={e => (e.currentTarget.style.color = "rgba(0,229,204,0.35)")}
+                          >🔊</button>
                         </div>
                       )}
                     </div>
@@ -443,7 +507,7 @@ export function TanitChat() {
             }}
               onClick={() => { if (!expanded) setExpanded(true); }}
             >
-              <TanitOrb size={36} pulse={listening || sending} />
+              <TanitOrb size={36} pulse={listening || sending || speaking} />
 
               <div style={{ flex: 1, position: "relative", minWidth: 0 }}>
                 {expanded ? (
@@ -692,6 +756,48 @@ export function TanitChat() {
                     OCULTAR
                   </button>
                 )}
+
+                {/* Stop audio — visible solo cuando Tanit está hablando */}
+                {speaking && (
+                  <button
+                    onClick={stopAudio}
+                    title="Detener voz"
+                    style={{
+                      height: 24, padding: "0 10px",
+                      borderRadius: 8,
+                      border: "1px solid rgba(242,54,69,0.35)",
+                      background: "rgba(242,54,69,0.08)",
+                      color: ROSE,
+                      cursor: "pointer",
+                      fontSize: 9, fontWeight: 700,
+                      fontFamily: "'Plus Jakarta Sans', system-ui",
+                      letterSpacing: "0.07em",
+                      animation: "tanit-ring-out 1.8s ease-in-out infinite",
+                    }}>
+                    ⏹ PARAR
+                  </button>
+                )}
+
+                {/* Toggle voz — 🔊 activo / 🔇 silencio */}
+                <button
+                  onClick={toggleVoiceEnabled}
+                  title={voiceEnabled ? "Desactivar voz de Tanit" : "Activar voz de Tanit"}
+                  style={{
+                    height: 24, padding: "0 10px",
+                    borderRadius: 8,
+                    border: voiceEnabled
+                      ? "1px solid rgba(0,229,204,0.30)"
+                      : "1px solid rgba(255,255,255,0.08)",
+                    background: voiceEnabled
+                      ? "rgba(0,229,204,0.06)"
+                      : "rgba(255,255,255,0.03)",
+                    color: voiceEnabled ? TEAL : "rgba(255,255,255,0.28)",
+                    cursor: "pointer",
+                    fontSize: 12,
+                    transition: "all 0.2s",
+                  }}>
+                  {voiceEnabled ? "🔊" : "🔇"}
+                </button>
 
                 <button
                   onClick={toggleMode}
