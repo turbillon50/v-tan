@@ -48,8 +48,11 @@ async function ensureGalleryTable(): Promise<void> {
 
 const GEMINI_API_KEY = process.env["GEMINI_API_KEY"];
 const OPENAI_API_KEY = process.env["OPENAI_API_KEY"];
-if (!GEMINI_API_KEY) {
-  logger.warn("[audio] GEMINI_API_KEY no está definida — voz e imagen no funcionarán.");
+const OPENROUTER_API_KEY = process.env["OPENROUTER_API_KEY"];
+if (!GEMINI_API_KEY && !OPENROUTER_API_KEY) {
+  logger.warn("[audio] ni GEMINI_API_KEY ni OPENROUTER_API_KEY definidas — voz e imagen no funcionarán.");
+} else if (!GEMINI_API_KEY) {
+  logger.warn("[audio] GEMINI_API_KEY no definida — usando OpenRouter como proveedor de voz.");
 }
 
 /**
@@ -178,7 +181,40 @@ router.post("/audio/transcribe", async (req, res): Promise<void> => {
       }
     }
 
-    // 2) Fallback OpenAI Whisper (sólo si la cuenta tiene saldo)
+    // 2) Fallback OpenRouter → whisper-1 (cuota independiente de Gemini y OpenAI directo)
+    if (OPENROUTER_API_KEY) {
+      try {
+        const ext = mimeType.includes("webm") ? "webm" : mimeType.includes("mp4") ? "mp4" : "mp3";
+        const blob = new Blob([new Uint8Array(audioBuffer)], { type: mimeType });
+        const form = new FormData();
+        form.append("file", blob, `audio.${ext}`);
+        form.append("model", "openai/whisper-1");
+        form.append("language", "es");
+        form.append("response_format", "json");
+
+        const r = await fetch("https://openrouter.ai/api/v1/audio/transcriptions", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${OPENROUTER_API_KEY}` },
+          body: form,
+        });
+        if (r.ok) {
+          const data = (await r.json()) as { text?: string };
+          if (data.text) {
+            res.json({ ok: true, text: data.text, provider: "openrouter" });
+            return;
+          }
+        }
+        const errTxt = await r.text().catch(() => "");
+        logger.warn(
+          { status: r.status, errTxt: errTxt.slice(0, 300) },
+          "[audio] openrouter transcribe fallback failed",
+        );
+      } catch (e) {
+        logger.warn({ err: e }, "[audio] openrouter transcribe threw, intento OpenAI directo");
+      }
+    }
+
+    // 3) Fallback OpenAI Whisper directo (sólo si la cuenta tiene saldo)
     if (OPENAI_API_KEY) {
       try {
         const form = new FormData();
@@ -211,9 +247,10 @@ router.post("/audio/transcribe", async (req, res): Promise<void> => {
 
     res.status(502).json({
       ok: false,
-      error: GEMINI_API_KEY
-        ? "Gemini no pudo transcribir y OpenAI tampoco (sin saldo)"
-        : "GEMINI_API_KEY no configurada",
+      error:
+        GEMINI_API_KEY || OPENROUTER_API_KEY
+          ? "Todos los proveedores de transcripción fallaron (Gemini, OpenRouter, OpenAI)"
+          : "Sin API keys configuradas (GEMINI_API_KEY u OPENROUTER_API_KEY requerida)",
     });
   } catch (e) {
     logger.error({ err: e }, "[audio] transcribe error");
@@ -305,7 +342,45 @@ router.post("/audio/synthesize", async (req, res): Promise<void> => {
       }
     }
 
-    // Fallback OpenAI TTS-1 (si hay saldo)
+    // Fallback OpenRouter TTS (cuota independiente de Gemini y OpenAI directo)
+    if (OPENROUTER_API_KEY) {
+      try {
+        const orVoice = voiceMap[voiceInput.toLowerCase()] ? voiceInput.toLowerCase() : "nova";
+        const r = await fetch("https://openrouter.ai/api/v1/audio/speech", {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            model: "openai/tts-1",
+            voice: orVoice,
+            input: text,
+            response_format: "mp3",
+            speed: 1.0,
+          }),
+        });
+        if (r.ok) {
+          const arrayBuffer = await r.arrayBuffer();
+          const buffer = Buffer.from(arrayBuffer);
+          res.setHeader("Content-Type", "audio/mpeg");
+          res.setHeader("Content-Length", String(buffer.length));
+          res.setHeader("Cache-Control", "private, max-age=3600");
+          res.setHeader("X-TTS-Provider", "openrouter");
+          res.send(buffer);
+          return;
+        }
+        const errTxt = await r.text().catch(() => "");
+        logger.warn(
+          { status: r.status, errTxt: errTxt.slice(0, 300) },
+          "[audio] openrouter tts fallback failed",
+        );
+      } catch (e) {
+        logger.warn({ err: e }, "[audio] openrouter tts fallback threw");
+      }
+    }
+
+    // Fallback OpenAI TTS-1 directo (si hay saldo)
     if (OPENAI_API_KEY) {
       try {
         const r = await fetch("https://api.openai.com/v1/audio/speech", {
@@ -339,9 +414,10 @@ router.post("/audio/synthesize", async (req, res): Promise<void> => {
 
     res.status(502).json({
       ok: false,
-      error: GEMINI_API_KEY
-        ? "Gemini TTS falló y OpenAI tampoco (sin saldo o no configurada)"
-        : "GEMINI_API_KEY no configurada",
+      error:
+        GEMINI_API_KEY || OPENROUTER_API_KEY
+          ? "Todos los proveedores TTS fallaron (Gemini, OpenRouter, OpenAI)"
+          : "Sin API keys configuradas (GEMINI_API_KEY u OPENROUTER_API_KEY requerida)",
     });
   } catch (e) {
     logger.error({ err: e }, "[audio] synthesize error");
