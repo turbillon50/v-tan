@@ -1,5 +1,5 @@
 /**
- * LLM providers manager — 3 pools + fallback OpenRouter.
+ * LLM providers manager — 3 pools + fallback OpenRouter con mezcla de modelos.
  *
  *  CHAT pool: 1 key dedicada (GEMINI_API_KEY) — solo conversación íntima
  *  con Luis. Aislada del consumo del loop para que él SIEMPRE pueda hablar
@@ -9,10 +9,10 @@
  *  24/7 que consume mucho. Cuando una se agota (Resource exhausted) la
  *  marcamos hasta el reset diario (medianoche UTC) y vamos a la siguiente.
  *
- *  FALLBACK pool: OPENROUTER_API_KEY — backup universal. Cuando los pools
- *  primarios están agotados, OpenRouter sirve `google/gemini-2.5-flash`
- *  (mismo modelo, cuota independiente). Sin OpenRouter configurado, el
- *  fallback chat→live se sigue intentando.
+ *  FALLBACK pool: OPENROUTER_API_KEY — cuando los pools Gemini se agotan,
+ *  rota por OR_FREE_MODELS en orden: modelos casi gratuitos o de coste mínimo.
+ *  Cada modelo tiene su propio slot con exhaustion independiente para que un
+ *  rate-limit en uno no bloquee a los demás.
  */
 import { Agent } from "@mastra/core/agent";
 import { createGoogleGenerativeAI } from "@ai-sdk/google";
@@ -27,6 +27,22 @@ const LIVE_KEY_ENVS = [
 ] as const;
 const FALLBACK_KEY_ENVS = ["OPENROUTER_API_KEY"] as const;
 
+/**
+ * Modelos de OpenRouter priorizados por coste. Los `:free` son gratuitos
+ * (con rate-limit por minuto). Se prueban en orden; si uno devuelve 429
+ * o "exhausted", se marca y se pasa al siguiente.
+ *
+ * Orden: primero los más capaces dentro de los gratuitos, luego opciones
+ * de pago mínimo como seguro final.
+ */
+export const OR_FREE_MODELS = [
+  "google/gemini-2.0-flash-exp:free",      // Gemini 2.0 Flash, gratuito
+  "deepseek/deepseek-chat-v3-0324:free",   // DeepSeek V3, excelente en chat, gratuito
+  "qwen/qwen3-30b-a3b:free",               // Qwen 3 30B MoE, gratuito
+  "meta-llama/llama-3.3-70b-instruct:free", // Llama 3.3 70B, gratuito
+  "google/gemini-2.5-flash",               // Gemini 2.5 Flash vía OR, pago mínimo — último recurso
+] as const;
+
 export type Pool = "chat" | "live";
 export type Provider = "google" | "openrouter";
 
@@ -34,6 +50,8 @@ interface KeySlot {
   pool: Pool | "fallback";
   provider: Provider;
   envName: string;
+  /** Para slots OpenRouter: el modelo exacto a usar (con namespace). */
+  modelId?: string;
   key: string;
   exhaustedUntilMs: number;
 }
@@ -52,11 +70,18 @@ function loadSlots(): void {
     const k = process.env[envName];
     if (k && k.length > 10) _slots.push({ pool: "live", provider: "google", envName, key: k, exhaustedUntilMs: 0 });
   }
+  // Un slot por modelo gratuito, todos usando la misma OPENROUTER_API_KEY.
+  // Exhaustion es independiente: si Gemini Flash free tiene rate-limit,
+  // DeepSeek sigue disponible.
   for (const envName of FALLBACK_KEY_ENVS) {
     const k = process.env[envName];
-    if (k && k.length > 10) _slots.push({ pool: "fallback", provider: "openrouter", envName, key: k, exhaustedUntilMs: 0 });
+    if (k && k.length > 10) {
+      for (const modelId of OR_FREE_MODELS) {
+        _slots.push({ pool: "fallback", provider: "openrouter", envName, modelId, key: k, exhaustedUntilMs: 0 });
+      }
+    }
   }
-  const summary = _slots.map((s) => ({ pool: s.pool, provider: s.provider, envName: s.envName }));
+  const summary = _slots.map((s) => ({ pool: s.pool, provider: s.provider, envName: s.envName, modelId: s.modelId }));
   logger.info({ count: _slots.length, summary }, "[llm-keys] pools cargados");
 }
 
@@ -73,6 +98,11 @@ function nextUtcMidnight(): number {
  * Cascada para pool=live: live → fallback (no toca chat para preservar la
  * cuota dedicada de Luis).
  */
+/** ID único de slot — distingue modelos OpenRouter distintos en la misma key. */
+export function slotKey(s: KeySlot): string {
+  return s.modelId ? `${s.envName}:${s.modelId}` : s.envName;
+}
+
 export function pickAvailableKey(pool: Pool, skip?: Set<string>): KeySlot | null {
   loadSlots();
   const now = Date.now();
@@ -80,7 +110,7 @@ export function pickAvailableKey(pool: Pool, skip?: Set<string>): KeySlot | null
     for (const s of _slots) {
       if (s.pool !== p) continue;
       if (s.exhaustedUntilMs > now) continue;
-      if (skip?.has(s.envName)) continue;
+      if (skip?.has(slotKey(s))) continue;
       return s;
     }
     return null;
@@ -98,13 +128,18 @@ export function pickAvailableKey(pool: Pool, skip?: Set<string>): KeySlot | null
   return null;
 }
 
-export function markKeyExhausted(envName: string): void {
-  const s = _slots.find((x) => x.envName === envName);
+/** Marca un slot como agotado por su slotKey (envName o envName:modelId). */
+export function markKeyExhausted(key: string): void {
+  // Busca por slotKey exacto; para slots Google coincide con envName.
+  const s = _slots.find((x) => slotKey(x) === key);
   if (!s) return;
-  s.exhaustedUntilMs = nextUtcMidnight();
+  // Los modelos :free tienen rate-limit por minuto, no por día.
+  // Usamos reset corto (5 min) para no bloquearnos demasiado tiempo.
+  const isFreeModel = s.modelId?.includes(":free") ?? false;
+  s.exhaustedUntilMs = isFreeModel ? Date.now() + 5 * 60 * 1000 : nextUtcMidnight();
   logger.warn(
-    { envName, pool: s.pool, resetAtUtc: new Date(s.exhaustedUntilMs).toISOString() },
-    "[llm-keys] key marcada exhausted hasta reset",
+    { key, pool: s.pool, modelId: s.modelId, resetAtUtc: new Date(s.exhaustedUntilMs).toISOString() },
+    "[llm-keys] slot marcado exhausted",
   );
 }
 
@@ -120,7 +155,7 @@ export function getKeysStatus(): {
   activeChat: number;
   activeLive: number;
   activeFallback: number;
-  slots: { pool: string; provider: Provider; envName: string; exhausted: boolean; resetAt: string | null }[];
+  slots: { pool: string; provider: Provider; envName: string; modelId?: string; exhausted: boolean; resetAt: string | null }[];
 } {
   loadSlots();
   const now = Date.now();
@@ -128,6 +163,7 @@ export function getKeysStatus(): {
     pool: s.pool,
     provider: s.provider,
     envName: s.envName,
+    modelId: s.modelId,
     exhausted: s.exhaustedUntilMs > now,
     resetAt: s.exhaustedUntilMs > 0 ? new Date(s.exhaustedUntilMs).toISOString() : null,
   }));
@@ -148,30 +184,28 @@ export function isExhaustedError(err: unknown): boolean {
 /**
  * Construye un Agent Mastra con el provider correspondiente al slot.
  *  - provider=google → createGoogleGenerativeAI con apiKey directa.
- *  - provider=openrouter → createOpenAI con baseURL openrouter.ai/api/v1 +
- *    modelo prefijado con namespace ("google/gemini-2.5-flash").
+ *  - provider=openrouter → createOpenAI con baseURL openrouter.ai/api/v1.
+ *    El modelo usado es keySlot.modelId (ya tiene namespace, ej. "google/gemini-2.0-flash-exp:free").
+ *    Si el slot no tiene modelId, cae al primer modelo de OR_FREE_MODELS.
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export function buildAgentForKey(keySlot: KeySlot, cfg: any): any {
-  const { modelId, ...rest } = cfg;
+  const { modelId: cfgModelId, ...rest } = cfg;
   if (keySlot.provider === "openrouter") {
     const openrouter = createOpenAI({
       apiKey: keySlot.key,
       baseURL: "https://openrouter.ai/api/v1",
-      // OpenRouter pide headers para identificación (opcional pero buena práctica).
       headers: {
         "HTTP-Referer": "https://tanit.work",
         "X-Title": "Tanit",
       },
     });
-    // En OpenRouter, gemini-2.5-flash se llama google/gemini-2.5-flash.
-    // Mantenemos el mismo modelo para preservar voz.
-    const orModelId = modelId.includes("/") ? modelId : `google/${modelId}`;
+    const orModelId = keySlot.modelId ?? OR_FREE_MODELS[0];
     return new Agent({ ...rest, model: openrouter(orModelId) });
   }
   // default: google
   const google = createGoogleGenerativeAI({ apiKey: keySlot.key });
-  return new Agent({ ...rest, model: google(modelId) });
+  return new Agent({ ...rest, model: google(cfgModelId) });
 }
 
 export type { KeySlot };
