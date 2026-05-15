@@ -116,6 +116,11 @@ async function snapshotPositions(): Promise<string> {
   }
 }
 
+// Cada cuántos beats se dispara el motor completo de scanning (runEngineTick).
+// Con beats de ~5s → cada 20 beats = cada ~100s (~1.5 min). Ajustable.
+const ENGINE_SCAN_EVERY_N_BEATS = 20;
+let _engineRunning = false;
+
 async function runOneBeat(): Promise<void> {
   _beatN++;
   const t0 = Date.now();
@@ -149,6 +154,27 @@ async function runOneBeat(): Promise<void> {
     autonomy?.enabled === true &&
     autonomy?.mode === "execute_with_governance";
 
+  // ── Motor de scanning autónomo ─────────────────────────────────────────
+  // Cada ENGINE_SCAN_EVERY_N_BEATS, corre el motor completo SIN depender del
+  // LLM. Escanea 15 símbolos con WS prices (instantáneo), aplica motores
+  // de la tesis, ejecuta mejores setups. El LLM luego observa el resultado.
+  let engineReport: { setupsScanned: number; setupsExecuted: number; decisions: { action: string; detail: string }[] } | null = null;
+  if (canExec && _beatN % ENGINE_SCAN_EVERY_N_BEATS === 0 && !_engineRunning) {
+    _engineRunning = true;
+    try {
+      const { runEngineTick } = await import("./tanit-trading-engine");
+      engineReport = await runEngineTick();
+      logger.info(
+        { beat: _beatN, scanned: engineReport.setupsScanned, executed: engineReport.setupsExecuted },
+        "[tanit-live] engine scan tick",
+      );
+    } catch (e) {
+      logger.error({ err: e, beat: _beatN }, "[tanit-live] engine scan error");
+    } finally {
+      _engineRunning = false;
+    }
+  }
+
   // Si no puede ejecutar y NO hay nada urgente en cola, igual late — pero
   // con prompt mínimo para no quemar tokens en mercado plano y modo observación.
   const symbols = (rules?.allowed_symbols?.length ? rules.allowed_symbols : CORE_SYMBOLS).slice(0, 12);
@@ -161,12 +187,22 @@ async function runOneBeat(): Promise<void> {
     `## Latido ${_beatN} · ${new Date().toISOString()}`,
     canExec ? "MODO: EJECUTAR. autonomy.enabled=true mode=execute_with_governance kill_switch=off." : `MODO: OBSERVAR. ${killSwitch ? "kill_switch ON" : `autonomy.enabled=${autonomy?.enabled} mode=${autonomy?.mode}`}.`,
     "",
-    "## Mercado ahora",
+    "## Mercado ahora (precios WS — úsalos directo, no hagas REST queries individuales)",
     market,
     "",
     "## Mis posiciones",
     positions,
   ];
+  if (engineReport) {
+    promptParts.push(
+      "",
+      `## Motor de scanning (automático, beat ${_beatN})`,
+      `Scaneé ${engineReport.setupsScanned} símbolos, abrí ${engineReport.setupsExecuted} posiciones.`,
+      engineReport.decisions.length > 0
+        ? engineReport.decisions.slice(0, 5).map((d) => `- ${d.action}: ${d.detail}`).join("\n")
+        : "Sin decisiones este tick.",
+    );
+  }
   if (urgent.length) {
     promptParts.push("", "## Eventos urgentes desde el WS", ...urgent);
   }
@@ -187,10 +223,10 @@ async function runOneBeat(): Promise<void> {
   promptParts.push(
     "",
     "## Qué hago",
-    "Aplico mi Tesis ACTIVA literal (la versión que tengo en bootstrap — leo de tanit_thesis active=true). Sigo los motores que esa tesis define, sus reglas NO-entrar, sus expected*, sus criterios de fees. NO inventes motores fuera de la tesis activa. Si tu tesis cambió (v5.6 hoy), aplica la 5.6 — no la 5.1 vieja.",
+    "Aplico mi Tesis ACTIVA (de tanit_thesis active=true en bootstrap). Los precios del mercado están arriba — los uso directo sin llamar consultar_precio_mercado.",
     canExec
-      ? "Si veo setup conforme: invoco abrir_long/abrir_short con thesis literal. Si veo gestión necesaria: mover_stops, cerrar_posicion, abrir_hedge. Si nada: callo o emito máx 1 línea."
-      : "No ejecuto. Solo describo qué haría, máx 2 líneas. Útil para que Luis vea mi razonamiento.",
+      ? "Para gestión de posiciones abiertas: mover_stops, cerrar_posicion, abrir_hedge. Para abrir MÚLTIPLES posiciones nuevas: uso disparar_motor_ahora (15 símbolos en ~2s, no símbolo por símbolo). Para apertura individual con criterio preciso: abrir_long/abrir_short con slPrice calculado del precio de arriba. Si nada relevante: callo o 1 línea máximo."
+      : "No ejecuto. Máx 2 líneas describiendo qué veo.",
   );
 
   const prompt = promptParts.join("\n");

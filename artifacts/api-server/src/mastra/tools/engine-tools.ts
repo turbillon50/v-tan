@@ -114,7 +114,15 @@ export const consultarSetupsHoy = createTool({
 export const disparar_motor_ahora = createTool({
   id: "disparar_motor_ahora",
   description:
-    "Ejecuta UN tick del motor de trading INMEDIATAMENTE (sin esperar al loop de 15min). Úsalo solo si Luis te lo pide explícitamente ('escanea ya', 'abre setups ahora'). Devuelve el reporte completo del tick.",
+    "Tu herramienta principal para escanear y operar en múltiples símbolos a la vez. " +
+    "Escanea 15 símbolos usando precios del WS (instantáneo, no REST), aplica tus motores de tesis, " +
+    "y ejecuta los mejores setups en 1-3 segundos. " +
+    "ÚSALA cuando: (a) quieras abrir posiciones en varios símbolos, " +
+    "(b) detectes momentum de mercado general, " +
+    "(c) el loop autónomo te lo indique. " +
+    "NO hagas consultar_precio_mercado símbolo por símbolo para luego abrir — eso tarda minutos. " +
+    "Un solo disparar_motor_ahora hace todo en segundos. " +
+    "Devuelve cuántos setups escaneó y cuántos ejecutó.",
   inputSchema: z.object({}).optional(),
   outputSchema: z.object({
     ranAt: z.string(),
