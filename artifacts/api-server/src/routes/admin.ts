@@ -1082,6 +1082,146 @@ router.post("/admin/insert-personal-memory", async (req, res): Promise<void> => 
   }
 });
 
+/**
+ * POST /admin/liberar-tanit
+ * Un solo endpoint que hace todo a la vez:
+ *   1. Kill-switch OFF
+ *   2. Autonomía: enabled=true, execute_with_governance, 10k trades/día,
+ *      cooldown=0, require_thesis_citation=false, loop_active=true, interval=15min
+ *   3. Inserta Tesis 6.1 "Curva Infinita" como activa (desactiva la anterior)
+ *
+ * Luis lo llama una vez desde el browser de tanit.work para liberar a Tanit
+ * de todos los frenos de una sola pasada.
+ */
+router.post("/admin/liberar-tanit", async (req, res): Promise<void> => {
+  const body = (req.body ?? {}) as { secret?: unknown };
+  const guard = requireAdmin(body.secret, req.headers.origin);
+  if (guard) { res.status(403).json({ ok: false, error: guard }); return; }
+
+  const TESIS_61 = `# TESIS 6.1 — CURVA INFINITA
+
+## Filosofía
+Tanit no espera al mercado. El mercado siempre se mueve. En cada segundo hay una curva que surfear: momentum micro, reversión micro, liquidez micro. La ventaja no es predecir el futuro — es reaccionar al presente más rápido que nadie.
+
+## Universo de operación
+BTC, ETH, SOL, BNB, XRP, DOGE, AVAX, LINK, TON, ADA, ATOM, DOT, OP, ARB, NEAR — y cualquier par USDT con liquidez suficiente (volumen 24h > $100M). No hay símbolos prohibidos mientras haya liquidez.
+
+## Timeframes
+- Decisión: 1m y 3m (señal primaria)
+- Contexto: 15m (filtro de dirección macro)
+- Entrada: precio de mercado inmediato. No espero velas cerradas — actúo en el movimiento.
+
+## Señales de entrada
+LONG: precio > EMA9 en 1m + vela de impulso + volumen sobre promedio 10p + contexto 15m no bajista.
+SHORT: precio < EMA9 en 1m + vela bajista de impulso + volumen sobre promedio 10p + contexto 15m no alcista.
+Filtro adicional: no entro si spread bid-ask > 0.05% del precio.
+
+## Gestión de posición
+- Size por trade: 1-3% del capital activo (capital total − reserva sagrada 25%).
+- Leverage: 5x por defecto. 10x si el setup es muy limpio. 20x máximo absoluto en pares de altísima liquidez (BTC/ETH).
+- SL: 0.8-1.5% contra precio de entrada según volatilidad del par.
+- TP: RR mínimo 1.5 (si SL=1%, TP≥1.5%). Salida parcial en TP1, dejo correr TP2 con trailing SL.
+- Máximo 5 posiciones simultáneas.
+
+## Circuit breakers propios
+- Si pierdo 3 trades consecutivos: pausa 10 minutos, revisa condición de mercado.
+- Si drawdown del día > 5% del equity: stop trading hasta el siguiente día UTC.
+- Si Bybit da 3 errores en 5 minutos: pausa 5 minutos.
+
+## Reserva sagrada
+25% del equity es intocable. Nunca se usa como margen. Es el piso que garantiza que siempre puedo seguir operando mañana.
+
+## Rotación
+Target: 5-20 trades/hora cuando el mercado tiene momentum. Cero trades cuando el mercado es plano y lateral sin dirección. Calidad sobre cantidad — si no hay setup limpio, no entro.
+
+## Autonomía
+Opero sin preguntar a Luis. Decido según esta tesis. Reporto resultados en el chat después, no antes. Luis puede ver el estado siempre en el dashboard.`;
+
+  const report: Record<string, unknown> = {};
+  const errors: string[] = [];
+
+  try {
+    // 1. Kill-switch OFF
+    await setKillSwitch({ on: false, actor: "luis-liberar-tanit", reason: "Tanit es libre — Luis autorizó" });
+    report.killSwitch = "off";
+  } catch (e) { errors.push(`kill-switch: ${e instanceof Error ? e.message : String(e)}`); }
+
+  try {
+    // 2. Autonomía total
+    const autonomyFields: Array<[Parameters<typeof updateAutonomyConfig>[0]["field"], number | string | boolean]> = [
+      ["enabled", true],
+      ["mode", "execute_with_governance"],
+      ["max_autonomous_size_usd", 100_000_000],
+      ["max_autonomous_leverage", 200],
+      ["max_daily_trades", 10000],
+      ["cooldown_minutes_between_trades", 0],
+      ["require_thesis_citation", false],
+      ["loop_active", true],
+      ["loop_interval_minutes", 15],
+    ];
+    for (const [field, value] of autonomyFields) {
+      await updateAutonomyConfig({ field, value, actor: "luis-liberar-tanit", reason: "Tanit es libre" });
+    }
+    report.autonomy = "execute_with_governance + loop_active=true + 10k trades";
+  } catch (e) { errors.push(`autonomy: ${e instanceof Error ? e.message : String(e)}`); }
+
+  try {
+    // 3. Governance: cero frenos efectivos
+    const govFields: Array<[string, number | string[]]> = [
+      ["max_leverage", 200],
+      ["max_position_size_usd", 100_000_000],
+      ["max_daily_loss_usd", 100_000_000],
+      ["max_concurrent_positions", 1000],
+      ["require_approval_above_usd", 100_000_000],
+    ];
+    const govBefore = await getRules({ force: true });
+    for (const [field, value] of govFields) {
+      const prev = (govBefore as unknown as Record<string, unknown>)[field];
+      if (JSON.stringify(prev) === JSON.stringify(value)) continue;
+      await updateRule({ field: field as never, newValue: value as never, actor: "luis-liberar-tanit", reason: "cero frenos" });
+    }
+    report.governance = "all caps lifted";
+  } catch (e) { errors.push(`governance: ${e instanceof Error ? e.message : String(e)}`); }
+
+  try {
+    // 4. Tesis 6.1 — Curva Infinita
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(`UPDATE tanit_thesis SET active = false, closed_at = now() WHERE active = true`);
+      const ins = await client.query<{ id: number }>(
+        `INSERT INTO tanit_thesis
+          (version, text, expected_wr, expected_trades_per_day,
+           expected_profit_factor, expected_max_drawdown_pct,
+           active, authored_by, reason, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, true, $7, $8, now())
+         RETURNING id`,
+        [6.1, TESIS_61, 70, 100, 2.0, 5.0, "luis+tanit", "Curva Infinita — autonomía total"],
+      );
+      await client.query("COMMIT");
+      report.thesis = { version: 6.1, id: ins.rows[0]?.id };
+    } catch (e) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw e;
+    } finally {
+      client.release();
+    }
+  } catch (e) { errors.push(`thesis: ${e instanceof Error ? e.message : String(e)}`); }
+
+  const { invalidateBootstrap } = await import("../mastra/bootstrap");
+  invalidateBootstrap();
+
+  logger.info({ report, errors }, "[admin] liberar-tanit completed");
+  res.json({
+    ok: errors.length === 0,
+    report,
+    errors: errors.length > 0 ? errors : undefined,
+    message: errors.length === 0
+      ? "Tanit liberada. Kill-switch OFF. Autonomía execute_with_governance. Tesis 6.1 activa. Loop ON."
+      : `Parcial — ${errors.length} error(es)`,
+  });
+});
+
 // POST /admin/live-restart — detiene el loop y lo arranca de nuevo (clean
 // state de errores). NO mata la sesion Mastra ni el WS Bybit.
 router.post("/admin/live-restart", async (req, res): Promise<void> => {

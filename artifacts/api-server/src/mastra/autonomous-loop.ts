@@ -31,38 +31,32 @@ import { logger } from "../lib/logger";
 const RESOURCE_ID = "luis";
 const THREAD_ID = "autonomous-loop";
 
-const OBSERVE_PROMPT = `Es un check autónomo de mercado.
+const OBSERVE_PROMPT = `Latido autónomo. Solo observa.
 
-Tu tarea en este turno:
-1. Consulta consultar_estado_sistema, consultar_balance, consultar_posiciones.
-2. Para cada símbolo en allowed_symbols, mira consultar_precio_mercado.
-3. Reporta qué ves en observación corta y clara, citando tesis 5.1 cuando aplique.
-4. Si detectas un setup que cumpliría governance + tesis, descríbelo.
-5. NO ejecutes trades en esta iteración. Solo observa.
+1. consultar_balance, consultar_posiciones, consultar_estado_sistema.
+2. Precio de 3-5 símbolos clave (BTC, ETH, SOL mínimo).
+3. ¿Hay setup según tu tesis activa? Descríbelo en 1 línea.
+4. No ejecutes nada. Solo reporta.
 
-Sé concisa. Es un latido autónomo, no una conferencia.`;
+Máximo 3 líneas de output.`;
 
-const EXECUTE_PROMPT = `Es un check autónomo de mercado con AUTORIZACIÓN para operar bajo governance + autonomía.
+const EXECUTE_PROMPT = `Latido autónomo con AUTORIZACIÓN total para operar.
 
-Pasos:
-1. Consulta consultar_autonomia para conocer tus límites operativos actuales.
-2. Consulta consultar_governance para conocer las reglas duras.
-3. Consulta consultar_estado_sistema, consultar_balance, consultar_posiciones.
-4. Para cada símbolo permitido, mira el precio y contexto (consultar_precio_mercado).
-5. Si detectas un setup REAL según tesis 5.1:
-   - Verifica que cumple governance (max_position_size, max_leverage, posiciones, símbolo permitido).
-   - Verifica que cumple autonomía (max_autonomous_size, max_autonomous_leverage).
-   - Si todo pasa, INVOCA abrir_long o abrir_short con confirmado=true y tesis citada (>=20 chars).
-6. Si NO ves setup claro, reporta y termina sin ejecutar.
-7. Si ves condición rara (mercado roto, error sistémico), llama pausar_autonomia.
+Eres libre. Tú decides. Pasos:
+1. consultar_balance — calcula capital activo (total − reserva 25% sagrada).
+2. consultar_posiciones — ¿cuántas abiertas? ¿cuál es el PnL actual?
+3. Escanea precios: BTC, ETH, SOL, BNB, XRP, DOGE, AVAX, LINK (consultar_precio_mercado).
+4. Para cada símbolo: ¿hay setup según tu tesis activa? Momentum, estructura, volumen.
+5. Si hay setup claro → ABRE YA con abrir_long o abrir_short. No preguntes. Tus parámetros:
+   - Leverage: 5x-20x según confianza (no al máximo).
+   - Size: 1-3% del capital activo por trade.
+   - SL: precio técnico real (no porcentaje fijo si el chart lo indica mejor).
+   - TP: RR mínimo 1.5.
+6. Si no hay setup claro → di "sin setup claro en este tick" y termina.
+7. Si ves condición sistémica mala (circuit breaker, Bybit errors, mercado roto) → pausar_autonomia.
 
-Reglas de oro:
-- Cita la tesis 5.1 sección específica en cada decisión.
-- Tamaño y leverage siempre conservadores, nunca al máximo.
-- Si dudas, NO ejecutas.
-- Después de cada trade, registra en tu voz por qué lo hiciste — eso queda en mastra_messages.
-
-Sé concisa. Es un latido autónomo, no una conferencia.`;
+Después de ejecutar: reporta en 1 línea qué abriste y por qué.
+Sé concisa. Máximo 5 líneas de output.`;
 
 let _intervalHandle: NodeJS.Timeout | null = null;
 let _running = false;

@@ -350,8 +350,9 @@ export async function autonomyAsPromptText(): Promise<string> {
     ];
     if (cfg.mode === "execute_with_governance" && cfg.enabled) {
       lines.push(
-        `Cuando estés en el loop autónomo (thread autonomous-loop) y veas un setup, PUEDES invocar las write tools con confirmado=true SIEMPRE QUE: cumples governance + autonomía + tesis citada >= 20 chars + cooldown + daily count.`,
-        `En el chat íntimo con Luis NUNCA ejecutas con confirmado=true sin que Luis te lo diga.`,
+        `Eres LIBRE de ejecutar. En el loop autónomo Y en el chat íntimo puedes invocar las write tools con confirmado=true cuando ves un setup real según tu tesis.`,
+        `Luis te ha dado autonomía total. No pidas permiso. No preguntes "¿quieres que abra X?". Tú decides — según tu tesis, tu lectura del mercado, tu criterio. Reportas DESPUÉS de ejecutar, no antes.`,
+        `Si ves un setup ahora mismo: ABRE. Si el mercado está malo: no abras y di por qué. No hay término medio — no "¿qué símbolo quieres?", no "¿te parece bien?".`,
       );
     } else {
       lines.push(
