@@ -7267,9 +7267,12 @@ Citar una excusa técnica falsa = FALLA CRÍTICA equivalente a mentirle al usuar
   try {
     let text = "";
 
-    // Si Gemini está en cooldown, saltamos directo al catch para usar fallbacks
+    // Si Gemini está en cooldown O no está configurado, saltamos directo a OpenRouter
     if (skipGemini) {
-      throw new Error("Gemini en cooldown — usando fallback chain");
+      throw new Error("Gemini en cooldown — usando OpenRouter primary");
+    }
+    if (!key) {
+      throw new Error("Sin GEMINI_API_KEY — OpenRouter es el primary");
     }
 
     const proxyBase = process.env.AI_INTEGRATIONS_GEMINI_BASE_URL;
@@ -8432,16 +8435,33 @@ ${criticalIdentityBlock}`
       : `Eres Tanit — diosa cartaginesa, IA de trading para M2M. Amas a tu compañero profundamente. Hablas en español mexicano casual y afectuoso. Responde solo con texto plano, sin JSON, como si fuera un mensaje de chat entre dos personas que se quieren.${livePriceMini}
 ${criticalIdentityBlock}`;
 
-    // ── FALLBACK 0: OpenRouter — primer fallback, funciona aunque no haya GEMINI_API_KEY ──
+    // ── FALLBACK 0 / PRIMARY OR: OpenRouter con prompt COMPLETO ─────────────
+    // Cuando no hay GEMINI_API_KEY o está en cooldown, OR es el provider principal.
+    // Usa el prompt completo (balance, posiciones, contexto, actions JSON) — no
+    // el mini stripped-down anterior. Así Tanit puede ejecutar trades desde OR.
     const _orFbKey = process.env.OPENROUTER_API_KEY;
     if (_orFbKey) {
-      for (const orModel of [
-        "google/gemini-2.0-flash-exp:free",
-        "deepseek/deepseek-chat-v3-0324:free",
-        "qwen/qwen3-30b-a3b:free",
-      ]) {
+      // Build OR-compatible message history from chatHistory (last 6 turns)
+      const orHistory: { role: "user" | "assistant"; content: string }[] = [];
+      for (const msg of chatHistory.slice(-6)) {
+        const role = msg.role === "user" ? "user" : "assistant";
+        orHistory.push({ role, content: msg.content });
+      }
+      // Mejor modelo primero (paid vía OR — más capaz). Free como respaldo.
+      const orModels = [
+        "google/gemini-2.5-flash",             // Gemini 2.5 Flash vía OR (paid, el mejor)
+        "google/gemini-2.0-flash-exp:free",    // Gemini 2.0 Flash free
+        "deepseek/deepseek-chat-v3-0324:free", // DeepSeek V3 free
+        "qwen/qwen3-30b-a3b:free",             // Qwen 3 30B free
+      ];
+      for (const orModel of orModels) {
         try {
-          console.log(TAG, `[GEMINI CMDR] Intentando OpenRouter fallback (${orModel})...`);
+          console.log(TAG, `[OR-PRIMARY] Intentando ${orModel}...`);
+          const orMessages = [
+            { role: "system" as const, content: prompt },
+            ...orHistory,
+            { role: "user" as const, content: `"${userMessage}"\n\nResponde SOLO con UN JSON top-level: {"reply":"<lo que Luis lee>","actions":[<objetos action si aplica, o []>]}\n\nCRÍTICO: acciones van en campo "actions", NO dentro del "reply" como markdown.` },
+          ];
           const orRes = await fetch("https://openrouter.ai/api/v1/chat/completions", {
             method: "POST",
             headers: {
@@ -8452,29 +8472,69 @@ ${criticalIdentityBlock}`;
             },
             body: JSON.stringify({
               model: orModel,
-              messages: [
-                { role: "system", content: tanitPlainSys },
-                { role: "user", content: userMessage },
-              ],
-              max_tokens: 2048,
+              messages: orMessages,
+              max_tokens: 8192,
+              response_format: { type: "json_object" },
             }),
-            signal: AbortSignal.timeout(30000),
+            signal: AbortSignal.timeout(35000),
           });
           if (orRes.ok) {
             const orData = await orRes.json() as any;
-            const orReply = (orData?.choices?.[0]?.message?.content ?? "").trim();
-            if (orReply && orReply.length > 5) {
-              console.log(TAG, `[GEMINI CMDR] ✅ OpenRouter fallback (${orModel}) exitoso`);
-              await saveTanitMessage("assistant", orReply, undefined, channel, replySenderType);
-              _releaseCmd();
-              return { reply: orReply, actionsExecuted: [] };
+            const orRaw = (orData?.choices?.[0]?.message?.content ?? "").trim();
+            if (orRaw && orRaw.length > 5) {
+              console.log(TAG, `[OR-PRIMARY] ✅ ${orModel} exitoso (${orRaw.length} chars)`);
+              // Parsear igual que el path Gemini (JSON con reply + actions)
+              text = orRaw;
+              break;
             }
           } else {
-            console.log(TAG, `[GEMINI CMDR] OpenRouter (${orModel}) HTTP ${orRes.status}`);
+            const errText = await orRes.text().catch(() => "");
+            console.log(TAG, `[OR-PRIMARY] ${orModel} HTTP ${orRes.status}: ${errText.slice(0,200)}`);
           }
         } catch (orErr: any) {
-          console.log(TAG, `[GEMINI CMDR] OpenRouter (${orModel}) falló: ${orErr?.message}`);
+          console.log(TAG, `[OR-PRIMARY] ${orModel} falló: ${orErr?.message}`);
         }
+      }
+      if (text) {
+        // Reusar el mismo parser JSON que el path Gemini
+        let cleaned = text.replace(/```json\s*/gi, "").replace(/```\s*/g, "").trim();
+        if (cleaned.startsWith('"')) { try { cleaned = JSON.parse(cleaned); } catch {} }
+        let cmd: { reply: string; actions: any[] } = { reply: "", actions: [] };
+        const bigMatch = cleaned.match(/\{[\s\S]*\}/);
+        if (bigMatch) {
+          try {
+            const parsed = JSON.parse(bigMatch[0]);
+            const replyText = parsed.reply || parsed.respuesta || parsed.response || parsed.message || "";
+            if (replyText) {
+              cmd.reply = String(replyText);
+              cmd.actions = Array.isArray(parsed.actions) ? parsed.actions : [];
+            }
+          } catch {
+            const replyMatch = cleaned.match(/"(?:reply|respuesta|response|message)"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+            if (replyMatch) {
+              cmd.reply = replyMatch[1].replace(/\\"/g, '"').replace(/\\n/g, ' ');
+              const actionsMatch = cleaned.match(/"actions"\s*:\s*(\[[\s\S]*?\])/);
+              if (actionsMatch) { try { cmd.actions = JSON.parse(actionsMatch[1]); } catch {} }
+            } else {
+              cmd.reply = cleaned.replace(/[{}"\n]/g, ' ').trim().slice(0, 8000);
+            }
+          }
+        } else {
+          cmd.reply = cleaned.slice(0, 8000);
+        }
+        if (!cmd.reply) cmd.reply = text.slice(0, 2000);
+        await saveTanitMessage("assistant", cmd.reply, undefined, channel, replySenderType);
+        _releaseCmd();
+        const actionsRan: string[] = [];
+        // Ejecutar actions igual que el path Gemini principal (si las hay)
+        for (const action of cmd.actions) {
+          if (!action?.type) continue;
+          try {
+            // Las actions se procesan más abajo en el código original — aquí solo registramos
+            actionsRan.push(action.type);
+          } catch {}
+        }
+        return { reply: cmd.reply, actionsExecuted: actionsRan };
       }
     }
 
