@@ -85,15 +85,16 @@ export async function loadBootstrap(opts: { force?: boolean } = {}): Promise<Boo
       ORDER BY id`
   );
 
-  // 4) Tesis activa (si existe)
+  // 4) Tesis activa (si existe) — columna real es "text", no "content"
   const thesisRes = await pool.query<{
     id: number;
     version: string | null;
     content: string;
   }>(
-    `SELECT id, version, content
+    `SELECT id, version::text AS version, text AS content
        FROM tanit_thesis
-      ORDER BY created_at DESC NULLS LAST, id DESC
+      WHERE active = true
+      ORDER BY id DESC
       LIMIT 1`
   ).catch(() => ({ rows: [] as { id: number; version: string | null; content: string }[] }));
   const tesis = thesisRes.rows[0] ?? null;
