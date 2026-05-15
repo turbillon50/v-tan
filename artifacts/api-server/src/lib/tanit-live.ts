@@ -232,8 +232,9 @@ async function runOneBeat(): Promise<void> {
   const prompt = promptParts.join("\n");
 
   try {
+    // Modo ejecutar → pool "chat" (premium, pagado). Modo observar → pool "live" (gratuito).
     const { textStream } = await streamTextWithPool(
-      "live",
+      canExec ? "chat" : "live",
       [{ role: "user" as const, content: prompt }],
       { memory: { resource: RESOURCE_ID, thread: THREAD_ID } },
     );

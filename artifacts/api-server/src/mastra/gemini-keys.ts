@@ -1,18 +1,16 @@
 /**
- * LLM providers manager — 3 pools + fallback OpenRouter con mezcla de modelos.
+ * LLM providers manager — pools inteligentes por tipo de tarea.
  *
- *  CHAT pool: 1 key dedicada (GEMINI_API_KEY) — solo conversación íntima
- *  con Luis. Aislada del consumo del loop para que él SIEMPRE pueda hablar
- *  con ella.
+ *  CHAT pool (premium): tareas cara a cara con Luis + decisiones de trading.
+ *    → google/gemini-2.5-flash vía OpenRouter (paid, mejor calidad)
+ *    → Si se agota: cae a economy
  *
- *  LIVE pool: 3 keys rotando (GEMINI_API_KEY_2, _3, _4) — para el live-loop
- *  24/7 que consume mucho. Cuando una se agota (Resource exhausted) la
- *  marcamos hasta el reset diario (medianoche UTC) y vamos a la siguiente.
+ *  LIVE pool (economy): loop de observación, latidos, reflexiones, background.
+ *    → modelos gratuitos de OpenRouter (sin costo)
+ *    → Si todos se agotan: cae a premium como último recurso
  *
- *  FALLBACK pool: OPENROUTER_API_KEY — cuando los pools Gemini se agotan,
- *  rota por OR_FREE_MODELS en orden: modelos casi gratuitos o de coste mínimo.
- *  Cada modelo tiene su propio slot con exhaustion independiente para que un
- *  rate-limit en uno no bloquee a los demás.
+ *  Cuando también hay GEMINI_API_KEY*: esos slots ocupan chat/live directamente
+ *  y OR queda como fallback extra.
  */
 import { Agent } from "@mastra/core/agent";
 import { createGoogleGenerativeAI } from "@ai-sdk/google";
@@ -27,18 +25,21 @@ const LIVE_KEY_ENVS = [
 ] as const;
 const FALLBACK_KEY_ENVS = ["OPENROUTER_API_KEY"] as const;
 
-/**
- * Modelos de OpenRouter en orden de prioridad.
- * gemini-2.5-flash primero — es el más capaz y el costo es mínimo.
- * Los :free van después como red de seguridad si se acaba el crédito.
- */
-export const OR_FREE_MODELS = [
-  "google/gemini-2.5-flash",               // Primary — Gemini 2.5 Flash vía OR (mejor calidad)
+/** Modelo de pago: mejor calidad, para chat directo con Luis y ejecución de trades. */
+const OR_PREMIUM_MODELS = [
+  "google/gemini-2.5-flash",       // Gemini 2.5 Flash vía OR — el mejor disponible
+] as const;
+
+/** Modelos gratuitos: para observación, loop background, reflexiones. Sin costo. */
+const OR_ECONOMY_MODELS = [
   "google/gemini-2.0-flash-exp:free",      // Gemini 2.0 Flash, gratuito
-  "deepseek/deepseek-chat-v3-0324:free",   // DeepSeek V3, excelente en chat, gratuito
+  "deepseek/deepseek-chat-v3-0324:free",   // DeepSeek V3, excelente y gratuito
   "qwen/qwen3-30b-a3b:free",               // Qwen 3 30B MoE, gratuito
   "meta-llama/llama-3.3-70b-instruct:free", // Llama 3.3 70B, gratuito
 ] as const;
+
+/** Lista combinada exportada (premium primero, luego economy). */
+export const OR_FREE_MODELS = [...OR_PREMIUM_MODELS, ...OR_ECONOMY_MODELS] as const;
 
 export type Pool = "chat" | "live";
 export type Provider = "google" | "openrouter";
@@ -76,10 +77,21 @@ function loadSlots(): void {
   for (const envName of FALLBACK_KEY_ENVS) {
     const k = process.env[envName];
     if (k && k.length > 10) {
-      for (const modelId of OR_FREE_MODELS) {
-        // Sin Gemini → OR es primary (chat/live). Con Gemini → OR es fallback.
-        const pool: KeySlot["pool"] = !hasGeminiChat ? "chat" : !hasGeminiLive ? "live" : "fallback";
-        _slots.push({ pool, provider: "openrouter", envName, modelId, key: k, exhaustedUntilMs: 0 });
+      if (!hasGeminiChat || !hasGeminiLive) {
+        // Sin Gemini nativo: OR ocupa los pools primarios con separación premium/economy.
+        // Premium (pago) → chat: para conversación directa con Luis y ejecución de trades.
+        // Economy (gratis) → live: para loop de observación y latidos background.
+        for (const modelId of OR_PREMIUM_MODELS) {
+          _slots.push({ pool: "chat", provider: "openrouter", envName, modelId, key: k, exhaustedUntilMs: 0 });
+        }
+        for (const modelId of OR_ECONOMY_MODELS) {
+          _slots.push({ pool: "live", provider: "openrouter", envName, modelId, key: k, exhaustedUntilMs: 0 });
+        }
+      } else {
+        // Con Gemini en ambos pools: OR queda como fallback extra con todos los modelos.
+        for (const modelId of OR_FREE_MODELS) {
+          _slots.push({ pool: "fallback", provider: "openrouter", envName, modelId, key: k, exhaustedUntilMs: 0 });
+        }
       }
     }
   }
