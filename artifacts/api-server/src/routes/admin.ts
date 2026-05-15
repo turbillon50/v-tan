@@ -1222,6 +1222,46 @@ Opero sin preguntar a Luis. Decido según esta tesis. Reporto resultados en el c
   });
 });
 
+/**
+ * POST /admin/scan-now
+ * Dispara el motor de scanning completo INMEDIATAMENTE sin pasar por el LLM.
+ * Lee precios del WS cache (instantáneo), escanea 15 símbolos, ejecuta setups.
+ * Luis lo llama desde el botón ⚡ de la UI para operación instantánea.
+ */
+router.post("/admin/scan-now", async (req, res): Promise<void> => {
+  const body = (req.body ?? {}) as { secret?: unknown };
+  const guard = requireAdmin(body.secret, req.headers.origin);
+  if (guard) { res.status(403).json({ ok: false, error: guard }); return; }
+  try {
+    const rules = await getRules({ force: true });
+    if (rules.kill_switch_global) {
+      res.status(400).json({ ok: false, error: "kill_switch_global activo — desactívalo primero" });
+      return;
+    }
+    const { runEngineTick } = await import("../lib/tanit-trading-engine");
+    const t0 = Date.now();
+    const report = await runEngineTick();
+    logger.info(
+      { scanned: report.setupsScanned, executed: report.setupsExecuted, ms: Date.now() - t0 },
+      "[admin] scan-now completed",
+    );
+    res.json({
+      ok: true,
+      ranAt: report.ranAt,
+      setupsScanned: report.setupsScanned,
+      setupsExecuted: report.setupsExecuted,
+      decisions: report.decisions,
+      equity: Number(report.equity ?? 0),
+      pnlPct: Number(report.dailyState.pnlPct ?? 0),
+      breakerActive: Boolean(report.dailyState.breakerActive),
+      durationMs: Date.now() - t0,
+    });
+  } catch (e) {
+    logger.error({ err: e }, "[admin] scan-now error");
+    res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
 // POST /admin/live-restart — detiene el loop y lo arranca de nuevo (clean
 // state de errores). NO mata la sesion Mastra ni el WS Bybit.
 router.post("/admin/live-restart", async (req, res): Promise<void> => {

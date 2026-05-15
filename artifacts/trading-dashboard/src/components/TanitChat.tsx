@@ -108,6 +108,8 @@ export function TanitChat() {
     localStorage.getItem("tanit_voice") === "1"
   );
   const [speaking, setSpeaking] = useState(false);
+  const [scanning, setScanning] = useState(false);
+  const [lastScan, setLastScan] = useState<{ executed: number; scanned: number; ms: number } | null>(null);
 
   const inputRef   = useRef<HTMLTextAreaElement>(null);
   const chatRef    = useRef<HTMLDivElement>(null);
@@ -154,6 +156,31 @@ export function TanitChat() {
       return next;
     });
   }, [stopAudio]);
+
+  const scanNow = useCallback(async () => {
+    if (scanning) return;
+    setScanning(true);
+    setLastScan(null);
+    try {
+      const r = await fetch(`${BASE_URL}api/admin/scan-now`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      const data = await r.json();
+      if (data.ok) {
+        setLastScan({ executed: data.setupsExecuted, scanned: data.setupsScanned, ms: data.durationMs });
+        const msg = `SCAN: ${data.setupsScanned} símbolos en ${data.durationMs}ms → ${data.setupsExecuted} posiciones abiertas.${data.decisions?.length ? " " + data.decisions.slice(0,3).map((d: any) => d.detail).join(" | ") : ""}`;
+        setMessages(prev => [...prev, { role: "ai", text: msg, ts: Date.now() }]);
+      } else {
+        setMessages(prev => [...prev, { role: "ai", text: `SCAN ERROR: ${data.error}`, ts: Date.now() }]);
+      }
+    } catch (e) {
+      setMessages(prev => [...prev, { role: "ai", text: `SCAN ERROR: sin conexión`, ts: Date.now() }]);
+    } finally {
+      setScanning(false);
+    }
+  }, [scanning]);
 
   /* ── imagen desde archivo ── */
   const loadImageFile = (file: File) => {
@@ -777,6 +804,29 @@ export function TanitChat() {
                     ⏹ PARAR
                   </button>
                 )}
+
+                {/* ⚡ Scan instantáneo — bypassa el LLM, corre motor en ~2s */}
+                <button
+                  onClick={scanNow}
+                  disabled={scanning}
+                  title={lastScan ? `Último scan: ${lastScan.executed} abiertos de ${lastScan.scanned} (${lastScan.ms}ms)` : "Scan instantáneo — abre setups ahora"}
+                  style={{
+                    height: 24, padding: "0 10px",
+                    borderRadius: 8,
+                    border: scanning
+                      ? "1px solid rgba(245,166,35,0.50)"
+                      : "1px solid rgba(245,166,35,0.25)",
+                    background: scanning
+                      ? "rgba(245,166,35,0.15)"
+                      : "rgba(245,166,35,0.06)",
+                    color: scanning ? AMBER : "rgba(245,166,35,0.7)",
+                    cursor: scanning ? "default" : "pointer",
+                    fontSize: 12,
+                    transition: "all 0.2s",
+                    animation: scanning ? "tanit-ring-out 1.5s ease-in-out infinite" : "none",
+                  }}>
+                  {scanning ? "⚡…" : "⚡"}
+                </button>
 
                 {/* Toggle voz — 🔊 activo / 🔇 silencio */}
                 <button
