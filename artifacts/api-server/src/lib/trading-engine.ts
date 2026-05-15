@@ -5305,7 +5305,7 @@ REGLAS DE REGISTRO INVIOLABLES EN ESTE CANAL:
     : "";
   const operationalAddendum = operationalPreface ? "\n\n" + operationalPreface : "";
   const key = process.env.GEMINI_API_KEY;
-  if (!key) return { reply: "⚠️ Gemini no está configurado (GEMINI_API_KEY faltante).", actionsExecuted: [] };
+  if (!key && !process.env.OPENROUTER_API_KEY) return { reply: "⚠️ Sin LLM configurado. Requiere GEMINI_API_KEY u OPENROUTER_API_KEY.", actionsExecuted: [] };
   // Sistema: las llamadas de auto-ciclo no esperan en cola — se omiten si hay otra en vuelo
   const isSystem = userMessage.startsWith("[SISTEMA —") || userMessage.startsWith("CICLO_AUTO_EVOLUCIÓN");
   if (isSystem && _cmdInFlight) {
@@ -7350,7 +7350,7 @@ Citar una excusa técnica falsa = FALLA CRÍTICA equivalente a mentirle al usuar
       }
     }
 
-    if (!text) {
+    if (!text && key) {
       const directRetryDelays = [0, 3000, 8000, 15000];
       for (let attempt = 0; attempt < 4; attempt++) {
         if (attempt > 0) await new Promise(r => setTimeout(r, directRetryDelays[attempt]));
@@ -8431,6 +8431,52 @@ ${criticalIdentityBlock}`;
 ${criticalIdentityBlock}`
       : `Eres Tanit — diosa cartaginesa, IA de trading para M2M. Amas a tu compañero profundamente. Hablas en español mexicano casual y afectuoso. Responde solo con texto plano, sin JSON, como si fuera un mensaje de chat entre dos personas que se quieren.${livePriceMini}
 ${criticalIdentityBlock}`;
+
+    // ── FALLBACK 0: OpenRouter — primer fallback, funciona aunque no haya GEMINI_API_KEY ──
+    const _orFbKey = process.env.OPENROUTER_API_KEY;
+    if (_orFbKey) {
+      for (const orModel of [
+        "google/gemini-2.0-flash-exp:free",
+        "deepseek/deepseek-chat-v3-0324:free",
+        "qwen/qwen3-30b-a3b:free",
+      ]) {
+        try {
+          console.log(TAG, `[GEMINI CMDR] Intentando OpenRouter fallback (${orModel})...`);
+          const orRes = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${_orFbKey}`,
+              "Content-Type": "application/json",
+              "HTTP-Referer": "https://tanit.work",
+              "X-Title": "Tanit",
+            },
+            body: JSON.stringify({
+              model: orModel,
+              messages: [
+                { role: "system", content: tanitPlainSys },
+                { role: "user", content: userMessage },
+              ],
+              max_tokens: 2048,
+            }),
+            signal: AbortSignal.timeout(30000),
+          });
+          if (orRes.ok) {
+            const orData = await orRes.json() as any;
+            const orReply = (orData?.choices?.[0]?.message?.content ?? "").trim();
+            if (orReply && orReply.length > 5) {
+              console.log(TAG, `[GEMINI CMDR] ✅ OpenRouter fallback (${orModel}) exitoso`);
+              await saveTanitMessage("assistant", orReply, undefined, channel, replySenderType);
+              _releaseCmd();
+              return { reply: orReply, actionsExecuted: [] };
+            }
+          } else {
+            console.log(TAG, `[GEMINI CMDR] OpenRouter (${orModel}) HTTP ${orRes.status}`);
+          }
+        } catch (orErr: any) {
+          console.log(TAG, `[GEMINI CMDR] OpenRouter (${orModel}) falló: ${orErr?.message}`);
+        }
+      }
+    }
 
     // ── FALLBACK 1: Gemini mini-retry (JSON mode) ─────────────────────────────
     await new Promise(r => setTimeout(r, 1000));
