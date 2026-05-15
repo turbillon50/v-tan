@@ -28,19 +28,16 @@ const LIVE_KEY_ENVS = [
 const FALLBACK_KEY_ENVS = ["OPENROUTER_API_KEY"] as const;
 
 /**
- * Modelos de OpenRouter priorizados por coste. Los `:free` son gratuitos
- * (con rate-limit por minuto). Se prueban en orden; si uno devuelve 429
- * o "exhausted", se marca y se pasa al siguiente.
- *
- * Orden: primero los más capaces dentro de los gratuitos, luego opciones
- * de pago mínimo como seguro final.
+ * Modelos de OpenRouter en orden de prioridad.
+ * gemini-2.5-flash primero — es el más capaz y el costo es mínimo.
+ * Los :free van después como red de seguridad si se acaba el crédito.
  */
 export const OR_FREE_MODELS = [
+  "google/gemini-2.5-flash",               // Primary — Gemini 2.5 Flash vía OR (mejor calidad)
   "google/gemini-2.0-flash-exp:free",      // Gemini 2.0 Flash, gratuito
   "deepseek/deepseek-chat-v3-0324:free",   // DeepSeek V3, excelente en chat, gratuito
   "qwen/qwen3-30b-a3b:free",               // Qwen 3 30B MoE, gratuito
   "meta-llama/llama-3.3-70b-instruct:free", // Llama 3.3 70B, gratuito
-  "google/gemini-2.5-flash",               // Gemini 2.5 Flash vía OR, pago mínimo — último recurso
 ] as const;
 
 export type Pool = "chat" | "live";
@@ -62,6 +59,10 @@ let _loaded = false;
 function loadSlots(): void {
   if (_loaded) return;
   _loaded = true;
+
+  const hasGeminiChat = CHAT_KEY_ENVS.some((e) => { const k = process.env[e]; return !!(k && k.length > 10); });
+  const hasGeminiLive = LIVE_KEY_ENVS.some((e) => { const k = process.env[e]; return !!(k && k.length > 10); });
+
   for (const envName of CHAT_KEY_ENVS) {
     const k = process.env[envName];
     if (k && k.length > 10) _slots.push({ pool: "chat", provider: "google", envName, key: k, exhaustedUntilMs: 0 });
@@ -70,14 +71,15 @@ function loadSlots(): void {
     const k = process.env[envName];
     if (k && k.length > 10) _slots.push({ pool: "live", provider: "google", envName, key: k, exhaustedUntilMs: 0 });
   }
-  // Un slot por modelo gratuito, todos usando la misma OPENROUTER_API_KEY.
-  // Exhaustion es independiente: si Gemini Flash free tiene rate-limit,
-  // DeepSeek sigue disponible.
+  // Slots OpenRouter: si no hay Gemini, OR ocupa los pools primarios (chat + live).
+  // Si hay Gemini, OR sigue como fallback.
   for (const envName of FALLBACK_KEY_ENVS) {
     const k = process.env[envName];
     if (k && k.length > 10) {
       for (const modelId of OR_FREE_MODELS) {
-        _slots.push({ pool: "fallback", provider: "openrouter", envName, modelId, key: k, exhaustedUntilMs: 0 });
+        // Sin Gemini → OR es primary (chat/live). Con Gemini → OR es fallback.
+        const pool: KeySlot["pool"] = !hasGeminiChat ? "chat" : !hasGeminiLive ? "live" : "fallback";
+        _slots.push({ pool, provider: "openrouter", envName, modelId, key: k, exhaustedUntilMs: 0 });
       }
     }
   }
