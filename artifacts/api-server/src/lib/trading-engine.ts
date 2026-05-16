@@ -7267,12 +7267,65 @@ Citar una excusa técnica falsa = FALLA CRÍTICA equivalente a mentirle al usuar
   try {
     let text = "";
 
-    // Si Gemini está en cooldown O no está configurado, saltamos directo a OpenRouter
-    if (skipGemini) {
-      throw new Error("Gemini en cooldown — usando OpenRouter primary");
-    }
-    if (!key) {
-      throw new Error("Sin GEMINI_API_KEY — OpenRouter es el primary");
+    // Si Gemini está en cooldown O no hay key → OR corre DENTRO del try para que,
+    // si tiene éxito, el mismo executor de acciones (close/open/etc.) procese el JSON.
+    // Sin esto, OR devolvía reply pero nunca ejecutaba las actions en Bybit.
+    if (skipGemini || !key) {
+      const _orInlineKey = process.env.OPENROUTER_API_KEY;
+      if (_orInlineKey) {
+        const orHistInline: { role: "user" | "assistant"; content: string }[] = [];
+        for (const msg of chatHistory.slice(-6)) {
+          orHistInline.push({ role: msg.role === "user" ? "user" : "assistant", content: msg.content });
+        }
+        const orModelsInline = [
+          "google/gemini-2.5-flash",
+          "google/gemini-2.0-flash-exp:free",
+          "deepseek/deepseek-chat-v3-0324:free",
+          "qwen/qwen3-30b-a3b:free",
+        ];
+        for (const orModel of orModelsInline) {
+          try {
+            console.log(TAG, `[OR-INLINE] Intentando ${orModel}...`);
+            const orMsgsInline = [
+              { role: "system" as const, content: prompt },
+              ...orHistInline,
+              { role: "user" as const, content: `"${userMessage}"\n\nResponde SOLO con UN JSON top-level: {"reply":"<lo que Luis lee>","actions":[<objetos action si aplica, o []>]}\n\nCRÍTICO: acciones van en campo "actions", NO dentro del "reply" como markdown.` },
+            ];
+            const orResInline = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+              method: "POST",
+              headers: {
+                Authorization: `Bearer ${_orInlineKey}`,
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://tanit.work",
+                "X-Title": "Tanit",
+              },
+              body: JSON.stringify({
+                model: orModel,
+                messages: orMsgsInline,
+                max_tokens: 8192,
+                response_format: { type: "json_object" },
+              }),
+              signal: AbortSignal.timeout(35000),
+            });
+            if (orResInline.ok) {
+              const orDataInline = await orResInline.json() as any;
+              const orRawInline = (orDataInline?.choices?.[0]?.message?.content ?? "").trim();
+              if (orRawInline && orRawInline.length > 5) {
+                console.log(TAG, `[OR-INLINE] ✅ ${orModel} exitoso — executor de acciones activo`);
+                text = orRawInline;
+                break;
+              }
+            } else {
+              const errTextInline = await orResInline.text().catch(() => "");
+              console.log(TAG, `[OR-INLINE] ${orModel} HTTP ${orResInline.status}: ${errTextInline.slice(0, 200)}`);
+            }
+          } catch (orErrInline: any) {
+            console.log(TAG, `[OR-INLINE] ${orModel} falló: ${orErrInline?.message}`);
+          }
+        }
+      }
+      if (!text) throw new Error("Sin LLM disponible — Gemini sin key/cooldown y OR también falló");
+      // Si text fue seteado por OR, cae al parser+executor de acciones abajo ↓
     }
 
     const proxyBase = process.env.AI_INTEGRATIONS_GEMINI_BASE_URL;
@@ -8523,18 +8576,16 @@ ${criticalIdentityBlock}`;
           cmd.reply = cleaned.slice(0, 8000);
         }
         if (!cmd.reply) cmd.reply = text.slice(0, 2000);
+        // NOTA: este path OR es fallback de Gemini-que-falló-a-mitad-de-request.
+        // Las actions no se ejecutan aquí porque el executor completo está en el try block.
+        // El caso sin key (OR como primary) está correctamente en el try block con executor completo.
+        if (cmd.actions?.length > 0) {
+          const actionTypes = cmd.actions.map((a: any) => a?.type).filter(Boolean).join(", ");
+          cmd.reply += `\n\n[Detecté acciones (${actionTypes}) pero Gemini falló antes de ejecutarlas — reintenta tu solicitud]`;
+        }
         await saveTanitMessage("assistant", cmd.reply, undefined, channel, replySenderType);
         _releaseCmd();
-        const actionsRan: string[] = [];
-        // Ejecutar actions igual que el path Gemini principal (si las hay)
-        for (const action of cmd.actions) {
-          if (!action?.type) continue;
-          try {
-            // Las actions se procesan más abajo en el código original — aquí solo registramos
-            actionsRan.push(action.type);
-          } catch {}
-        }
-        return { reply: cmd.reply, actionsExecuted: actionsRan };
+        return { reply: cmd.reply, actionsExecuted: [] };
       }
     }
 
