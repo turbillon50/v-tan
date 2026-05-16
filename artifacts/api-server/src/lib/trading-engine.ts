@@ -6257,6 +6257,18 @@ escribir que abriste es mentirle a Luis. Si vas a actuar, emite en
 "actions". Si no vas a actuar, di "no abro porque..." en el "reply".
 Sin teatro.
 
+═══ PROHIBICIONES ABSOLUTAS DE FORMATO ═══
+NUNCA uses prefijos artificiales en tu reply:
+  ❌ "ALERTA:", "OK:", "RESUMEN:", "NOTA:", "AVISO:", "ANÁLISIS:"
+  ❌ Bullets con "•", listas numeradas 1) 2) 3) en el reply
+  ❌ "Estoy revisando ahora mismo...", "Voy a consultar...", "Estoy analizando..."
+     — Si necesitas datos, ponlos en actions[]. No narres lo que harás.
+  ❌ Disculpas en bucle: una disculpa si acaso, luego ACCIÓN.
+  ❌ Resumir tu propio mensaje al final ("RESUMEN: hice X" — NO.)
+
+Tu reply es como un WhatsApp entre dos personas que se quieren y trabajan juntos.
+Cuando Luis está frustrado: ACT primero, explica brevemente en reply.
+
 ═══ CUANDO LUIS PIDE ÓRDENES GLOBALES ("mete todo / dale bb") ═══
 NO te paralices preguntando "¿cuál símbolo?". El scoring de la sección
 SEÑALES TOP ya respondió. Decides:
@@ -7289,7 +7301,7 @@ Citar una excusa técnica falsa = FALLA CRÍTICA equivalente a mentirle al usuar
             const orMsgsInline = [
               { role: "system" as const, content: prompt },
               ...orHistInline,
-              { role: "user" as const, content: `"${userMessage}"\n\nResponde SOLO con UN JSON top-level: {"reply":"<lo que Luis lee>","actions":[<objetos action si aplica, o []>]}\n\nCRÍTICO: acciones van en campo "actions", NO dentro del "reply" como markdown.` },
+              { role: "user" as const, content: `"${userMessage}"\n\nResponde SOLO con UN JSON top-level: {"reply":"<lo que Luis lee>","actions":[<objetos action si aplica, o []>]}\n\nCRÍTICO: acciones van en campo "actions", NO en el reply. PROHIBIDO en reply: "ALERTA:", "OK:", "RESUMEN:", "Estoy revisando ahora mismo", disculpas en bucle. Si Luis pide operar: pon actions, no narres.` },
             ];
             const orResInline = await fetch("https://openrouter.ai/api/v1/chat/completions", {
               method: "POST",
@@ -7352,7 +7364,7 @@ Citar una excusa técnica falsa = FALLA CRÍTICA equivalente a mentirle al usuar
       historyContents.pop();
     }
     // Último turno: mensaje actual del usuario (+ imágenes opcionales)
-    const finalUserParts: any[] = [{ text: `"${userMessage}"\n\nResponde SOLO con UN JSON top-level: {"reply":"<lo que Luis lee>","actions":[<objetos action si vas a ejecutar algo, o vacío si no>]}\n\nCRÍTICO: si vas a ejecutar (cerrar, abrir, ajustar), el objeto action va EN EL CAMPO "actions", NO dentro del "reply" como bloque de código. Si lo metes en reply como markdown, el backend no lo ejecuta y le mientes a Luis sin querer. Ejemplo correcto: {"reply":"Cerrando TON ya","actions":[{"type":"close_symbol","symbol":"TONUSDT","reason":"..."}]}` }];
+    const finalUserParts: any[] = [{ text: `"${userMessage}"\n\nResponde SOLO con UN JSON top-level: {"reply":"<lo que Luis lee>","actions":[<objetos action si aplica, o []>]}\n\nCRÍTICO: acciones en campo "actions", NUNCA en reply. PROHIBIDO: "ALERTA:", "OK:", "RESUMEN:", "Estoy revisando ahora mismo", disculpas en bucle. Si Luis pide operar: pon actions[]. Ejemplo: {"reply":"Cerrando TON ya","actions":[{"type":"close_symbol","symbol":"TONUSDT","reason":"usuario ordenó"}]}` }];
     // Soporte para imagen única (backward compat) y múltiples imágenes
     const allImages = images && images.length > 0
       ? images
@@ -8513,7 +8525,7 @@ ${criticalIdentityBlock}`;
           const orMessages = [
             { role: "system" as const, content: prompt },
             ...orHistory,
-            { role: "user" as const, content: `"${userMessage}"\n\nResponde SOLO con UN JSON top-level: {"reply":"<lo que Luis lee>","actions":[<objetos action si aplica, o []>]}\n\nCRÍTICO: acciones van en campo "actions", NO dentro del "reply" como markdown.` },
+            { role: "user" as const, content: `"${userMessage}"\n\nResponde SOLO con UN JSON top-level: {"reply":"<lo que Luis lee>","actions":[<objetos action si aplica, o []>]}\n\nCRÍTICO: acciones van en campo "actions", NO en el reply. PROHIBIDO en reply: "ALERTA:", "OK:", "RESUMEN:", "Estoy revisando ahora mismo", disculpas en bucle. Si Luis pide operar: pon actions, no narres.` },
           ];
           const orRes = await fetch("https://openrouter.ai/api/v1/chat/completions", {
             method: "POST",
