@@ -16,13 +16,19 @@ const GEMINI_KEY = process.env["GEMINI_API_KEY"] ?? "";
 const EMBED_MODEL = "gemini-embedding-001";
 const EMBED_DIMS = 768;
 
+// Structural type for the Fetch API Response — the global Response is
+// shadowed by Express's Response in this workspace, so we declare what we
+// actually need and cast.
+interface FetchResponse {
+  ok: boolean;
+  status: number;
+  json(): Promise<unknown>;
+}
+
 export async function generateEmbedding(text: string): Promise<number[] | null> {
   if (!GEMINI_KEY) return null;
   if (!text || text.trim().length === 0) return null;
   try {
-    // Cast to globalThis.Response (Fetch API) — somewhere in this workspace
-    // the global Response type is shadowed by Express's Response, which
-    // doesn't have .ok / .json(). This forces TS to use the right one.
     const r = (await fetch(
       `https://generativelanguage.googleapis.com/v1beta/models/${EMBED_MODEL}:embedContent?key=${GEMINI_KEY}`,
       {
@@ -34,7 +40,7 @@ export async function generateEmbedding(text: string): Promise<number[] | null> 
         }),
         signal: AbortSignal.timeout(8000),
       },
-    )) as globalThis.Response;
+    )) as unknown as FetchResponse;
     if (!r.ok) return null;
     const j = (await r.json()) as { embedding?: { values?: number[] } };
     const vec = j?.embedding?.values;
