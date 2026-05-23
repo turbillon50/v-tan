@@ -1,24 +1,27 @@
 import { Router, type IRouter, type Request } from "express";
-import { neon, type NeonQueryFunction } from "@neondatabase/serverless";
+import { Pool, type QueryResult } from "pg";
 import { logger } from "../lib/logger";
 
 const router: IRouter = Router();
 
-let sqlClient: NeonQueryFunction<false, false> | null = null;
+let pool: Pool | null = null;
 let schemaReady = false;
 
-function getSql(): NeonQueryFunction<false, false> {
-  if (sqlClient) return sqlClient;
+function getPool(): Pool {
+  if (pool) return pool;
   const url = process.env.DATABASE_URL;
   if (!url) throw new Error("DATABASE_URL is not set");
-  sqlClient = neon(url);
-  return sqlClient;
+  pool = new Pool({
+    connectionString: url,
+    ssl: url.includes("sslmode=require") ? { rejectUnauthorized: false } : undefined,
+  });
+  return pool;
 }
 
 async function ensureFamilySchema(): Promise<void> {
   if (schemaReady) return;
-  const sql = getSql();
-  await sql`
+  const db = getPool();
+  await db.query(`
     CREATE TABLE IF NOT EXISTS family_messages (
       id                BIGSERIAL PRIMARY KEY,
       message_id        TEXT UNIQUE NOT NULL,
@@ -33,9 +36,13 @@ async function ensureFamilySchema(): Promise<void> {
       received_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       acked_at          TIMESTAMPTZ
     )
-  `;
-  await sql`CREATE INDEX IF NOT EXISTS idx_family_messages_channel_received ON family_messages (channel, received_at DESC)`;
-  await sql`CREATE INDEX IF NOT EXISTS idx_family_messages_sender_received ON family_messages (sender, received_at DESC)`;
+  `);
+  await db.query(
+    `CREATE INDEX IF NOT EXISTS idx_family_messages_channel_received ON family_messages (channel, received_at DESC)`,
+  );
+  await db.query(
+    `CREATE INDEX IF NOT EXISTS idx_family_messages_sender_received ON family_messages (sender, received_at DESC)`,
+  );
   schemaReady = true;
 }
 
@@ -113,21 +120,31 @@ router.post("/family-incoming", async (req, res) => {
 
   try {
     await ensureFamilySchema();
-    const sql = getSql();
-    const rows = (await sql`
-      INSERT INTO family_messages
-        (message_id, channel, sender, sender_kind, content, payload, reply_to,
-         mentions, family_created_at, acked_at)
-      VALUES
-        (${messageId}, ${channel}, ${sender}, ${senderKind},
-         ${content}, ${JSON.stringify(payload)},
-         ${replyTo}, ${JSON.stringify(mentions)},
-         ${createdAt}, NOW())
-      ON CONFLICT (message_id) DO UPDATE SET acked_at = NOW()
-      RETURNING id
-    `) as Array<{ id: number }>;
+    const db = getPool();
+    const result: QueryResult<{ id: number }> = await db.query(
+      `
+        INSERT INTO family_messages
+          (message_id, channel, sender, sender_kind, content, payload, reply_to,
+           mentions, family_created_at, acked_at)
+        VALUES
+          ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+        ON CONFLICT (message_id) DO UPDATE SET acked_at = NOW()
+        RETURNING id
+      `,
+      [
+        messageId,
+        channel,
+        sender,
+        senderKind,
+        content,
+        JSON.stringify(payload),
+        replyTo,
+        JSON.stringify(mentions),
+        createdAt,
+      ],
+    );
 
-    const externalRef = `family_messages:${rows[0]!.id}`;
+    const externalRef = `family_messages:${result.rows[0]!.id}`;
     if (ackUrl) void ackToFamily(ackUrl, messageId, externalRef);
     return res.json({ ok: true, externalRef });
   } catch (e) {
