@@ -20,7 +20,10 @@ export async function generateEmbedding(text: string): Promise<number[] | null> 
   if (!GEMINI_KEY) return null;
   if (!text || text.trim().length === 0) return null;
   try {
-    const r = await fetch(
+    // Cast to globalThis.Response (Fetch API) — somewhere in this workspace
+    // the global Response type is shadowed by Express's Response, which
+    // doesn't have .ok / .json(). This forces TS to use the right one.
+    const r = (await fetch(
       `https://generativelanguage.googleapis.com/v1beta/models/${EMBED_MODEL}:embedContent?key=${GEMINI_KEY}`,
       {
         method: "POST",
@@ -31,9 +34,9 @@ export async function generateEmbedding(text: string): Promise<number[] | null> 
         }),
         signal: AbortSignal.timeout(8000),
       },
-    );
+    )) as globalThis.Response;
     if (!r.ok) return null;
-    const j = await r.json();
+    const j = (await r.json()) as { embedding?: { values?: number[] } };
     const vec = j?.embedding?.values;
     if (!Array.isArray(vec) || vec.length !== EMBED_DIMS) return null;
     return vec;
