@@ -18,6 +18,7 @@ import threadsRouter from "./threads";
 import audioRouter from "./audio";
 import systemRouter from "./system";
 import adminRouter from "./admin";
+import familyRouter from "./family";
 const router: IRouter = Router();
 
 router.use(healthRouter);
@@ -38,6 +39,7 @@ router.use(threadsRouter);
 router.use(audioRouter);
 router.use(systemRouter);
 router.use(adminRouter);
+router.use(familyRouter);
 router.use("/bybit", bybitRealRouter);
 
 export default router;
