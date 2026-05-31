@@ -80,6 +80,36 @@ export const consultarModeloLibre = createTool({
       };
     }
 
+    // Bloqueo de modelos caros en modo solo plática.
+    // Cuando chat_only_mode=true no estamos operando — Opus (y modelos Pro)
+    // consumen tokens caros sin beneficio real. Usá Sonnet o Gemini-flash.
+    const EXPENSIVE_MODEL_PATTERNS = [
+      /claude-opus/i,
+      /claude-3-opus/i,
+      /gpt-5/i,
+      /gemini-2\.5-pro/i,
+    ];
+    const isExpensive = EXPENSIVE_MODEL_PATTERNS.some((re) => re.test(ctx.model));
+    if (isExpensive) {
+      try {
+        const r = await pool.query<{ value: string }>(
+          `SELECT value FROM tanit_runtime_config WHERE key = 'chat_only_mode' LIMIT 1`,
+        );
+        if (r.rows[0]?.value === "true") {
+          return {
+            ok: false,
+            model: ctx.model,
+            latencyMs: Date.now() - t0,
+            error:
+              `Modelo '${ctx.model}' bloqueado en modo solo plática — caro y no estamos operando. ` +
+              "Usá 'anthropic/claude-sonnet-4.6' o 'google/gemini-2.5-flash' en su lugar.",
+          };
+        }
+      } catch {
+        // Si falla la consulta, no bloqueamos — fail-open.
+      }
+    }
+
     const messages: { role: string; content: string }[] = [];
     if (ctx.systemPrompt) messages.push({ role: "system", content: ctx.systemPrompt });
     messages.push({ role: "user", content: ctx.prompt });

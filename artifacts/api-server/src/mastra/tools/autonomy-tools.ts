@@ -57,7 +57,7 @@ export const consultarAutonomia = createTool({
 export const ajustarAutonomia = createTool({
   id: "ajustar_autonomia",
   description:
-    "Modifica un campo de tu configuración de autonomía. Requiere autorización explícita de Luis en chat. Campos editables: enabled, mode, max_autonomous_size_usd, max_autonomous_leverage, max_daily_trades, cooldown_minutes_between_trades, require_thesis_citation. Valores válidos para mode: 'observe_only', 'propose_for_approval', 'execute_with_governance'.",
+    "Modifica un campo de tu configuración de autonomía. Requiere autorización explícita de Luis en chat. Campos editables: enabled, mode, max_autonomous_size_usd, max_autonomous_leverage, max_daily_trades, cooldown_minutes_between_trades, require_thesis_citation. Valores válidos para mode: 'observe_only', 'propose_for_approval', 'execute_with_governance'. NOTA: para activar 'modo solo plática' (parar loops y bloquear Opus) usa el endpoint POST /admin/chat-only-mode — es un toggle de un solo golpe.",
   inputSchema: z.object({
     field: z
       .string()

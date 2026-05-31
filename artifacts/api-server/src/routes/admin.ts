@@ -1280,4 +1280,87 @@ router.post("/admin/live-restart", async (req, res): Promise<void> => {
   res.json({ ok: true, restarting: true });
 });
 
+// ─── Modo Solo Plática ────────────────────────────────────────────────────────
+// POST /admin/chat-only-mode  { active: true|false }
+//
+// Activa o desactiva el "modo solo plática":
+//   - Mutea el live loop (persistente en BD)
+//   - Para el autonomous loop (loop_active=false)
+//   - Bloquea modelos caros (Opus, Pro) en consultarModeloLibre
+//
+// Revertir: { active: false } — vuelve a unmutear el live loop y libera el
+// bloqueo de modelos. El autonomous loop NO se reactiva automáticamente;
+// hay que encenderlo explícitamente via /admin/autonomy/loop.
+
+router.post("/admin/chat-only-mode", async (req, res): Promise<void> => {
+  const body = (req.body ?? {}) as { secret?: unknown; active?: unknown };
+  const guard = requireAdmin(body.secret, req.headers.origin);
+  if (guard) { res.status(403).json({ ok: false, error: guard }); return; }
+
+  const activate = body.active !== false; // default true
+  try {
+    // 1. Marcar chat_only_mode en tanit_runtime_config
+    await pool.query(
+      `INSERT INTO tanit_runtime_config (key, value, reason, updated_at)
+       VALUES ('chat_only_mode', $1, $2, now())
+       ON CONFLICT (key) DO UPDATE SET value = $1, reason = EXCLUDED.reason, updated_at = now()`,
+      [activate ? "true" : "false", activate ? "Modo solo plática activado" : "Modo solo plática desactivado"],
+    );
+
+    // 2. Live loop — mute persistente
+    await pool.query(
+      `INSERT INTO tanit_runtime_config (key, value, reason, updated_at)
+       VALUES ('live_loop_muted_persistent', $1, $2, now())
+       ON CONFLICT (key) DO UPDATE SET value = $1, reason = EXCLUDED.reason, updated_at = now()`,
+      [activate ? "true" : "false", activate ? "Mute por modo solo plática" : "Unmute al salir de modo solo plática"],
+    );
+    if (activate) {
+      muteTanitLive();
+    } else {
+      unmuteTanitLive();
+    }
+
+    // 3. Autonomous loop — apagar cuando se activa (no reactivar al desactivar)
+    if (activate) {
+      await updateAutonomyConfig({ field: "loop_active", value: false, actor: "admin", reason: "Modo solo plática" });
+    }
+
+    const autonomy = await getAutonomyConfig({ force: true });
+    logger.info({ activate }, "[admin] chat-only-mode toggled");
+    res.json({
+      ok: true,
+      chat_only_mode: activate,
+      live_muted: activate,
+      loop_active: autonomy.loop_active,
+      note: activate
+        ? "Modo solo plática ON: live loop muteado, autonomous loop parado, Opus bloqueado."
+        : "Modo solo plática OFF: live loop libre, Opus disponible. El autonomous loop NO se reactiva automáticamente.",
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
+// GET /admin/chat-only-mode → estado actual
+router.get("/admin/chat-only-mode", async (req, res): Promise<void> => {
+  const guard = requireAdmin(req.query.secret, req.headers.origin);
+  if (guard) { res.status(403).json({ ok: false, error: guard }); return; }
+  try {
+    const r = await pool.query<{ key: string; value: string }>(
+      `SELECT key, value FROM tanit_runtime_config WHERE key IN ('chat_only_mode', 'live_loop_muted_persistent')`,
+    );
+    const cfg: Record<string, string> = {};
+    for (const row of r.rows) cfg[row.key] = row.value;
+    const autonomy = await getAutonomyConfig({ force: true });
+    res.json({
+      ok: true,
+      chat_only_mode: cfg["chat_only_mode"] === "true",
+      live_muted_persistent: cfg["live_loop_muted_persistent"] === "true",
+      loop_active: autonomy.loop_active,
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
 export default router;
