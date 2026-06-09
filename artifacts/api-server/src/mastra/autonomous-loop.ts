@@ -71,12 +71,26 @@ async function runOneTick(): Promise<void> {
   _ticks++;
   const t0 = Date.now();
   try {
-    // Toggle dinámico desde BD: si loop_active=false, skip y ya. No requiere
-    // restart de Railway para encender/apagar.
+    // Toggle dinámico desde BD: si loop_active=false o chat_only_mode=true, skip.
+    // No requiere restart de Railway para encender/apagar.
     const autonomy = await getAutonomyConfig({ force: true });
     if (!autonomy.loop_active) {
       _running = false;
       return;
+    }
+    // Modo solo plática — bloquea el loop aunque loop_active esté en true.
+    try {
+      const { pool: dbPool } = await import("@workspace/db");
+      const r = await dbPool.query<{ value: string }>(
+        `SELECT value FROM tanit_runtime_config WHERE key = 'chat_only_mode' LIMIT 1`,
+      );
+      if (r.rows[0]?.value === "true") {
+        logger.info({ tick: _ticks }, "[autonomous-loop] chat_only_mode activo, skip");
+        _running = false;
+        return;
+      }
+    } catch {
+      // fail-open: si no podemos leer la config, continuamos
     }
     // Kill-switch global tiene precedencia
     const rules = await getRules({ force: true });

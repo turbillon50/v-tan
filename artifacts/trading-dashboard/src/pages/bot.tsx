@@ -1850,6 +1850,39 @@ export default function Bot() {
     );
   };
 
+  // ── Modo Solo Plática ────────────────────────────────────────────────────
+  const [chatOnlyMode, setChatOnlyMode] = useState<boolean | null>(null);
+  const [chatOnlyLoading, setChatOnlyLoading] = useState(false);
+
+  useEffect(() => {
+    const load = async () => {
+      try {
+        const r = await fetch(`${BASE_URL}admin/chat-only-mode`);
+        if (r.ok) {
+          const d = await r.json();
+          setChatOnlyMode(d.chat_only_mode ?? false);
+        }
+      } catch {}
+    };
+    load();
+  }, []);
+
+  const toggleChatOnly = async () => {
+    if (chatOnlyLoading) return;
+    setChatOnlyLoading(true);
+    try {
+      const next = !chatOnlyMode;
+      const r = await fetch(`${BASE_URL}admin/chat-only-mode`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ active: next }),
+      });
+      if (r.ok) setChatOnlyMode(next);
+    } catch {} finally {
+      setChatOnlyLoading(false);
+    }
+  };
+
   return (
     <Layout>
       <div className="space-y-5 max-w-5xl" style={{ paddingBottom: 110 }}>
@@ -1873,7 +1906,27 @@ export default function Bot() {
                 {currentSession}
               </div>
             )}
-            <div className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-semibold border ${
+            <button
+            onClick={toggleChatOnly}
+            disabled={chatOnlyLoading || chatOnlyMode === null}
+            title={chatOnlyMode ? "Salir de modo solo plática" : "Activar modo solo plática — pausa loops y bloquea Opus"}
+            style={{
+              display: "flex", alignItems: "center", gap: 6,
+              padding: "6px 12px", borderRadius: 999,
+              fontSize: 11, fontWeight: 700, fontFamily: "var(--app-font-mono)",
+              letterSpacing: "0.06em", cursor: chatOnlyLoading ? "wait" : "pointer",
+              transition: "all 0.15s",
+              border: `1px solid ${chatOnlyMode ? "rgba(167,139,250,0.45)" : "rgba(138,152,179,0.25)"}`,
+              background: chatOnlyMode ? "rgba(167,139,250,0.12)" : "rgba(138,152,179,0.06)",
+              color: chatOnlyMode ? "#A78BFA" : "#6a7890",
+              opacity: chatOnlyMode === null ? 0.4 : 1,
+            }}
+          >
+            <span>{chatOnlyMode ? "💬" : "🔇"}</span>
+            {chatOnlyLoading ? "..." : chatOnlyMode ? "SOLO PLÁTICA" : "SOLO PLÁTICA"}
+          </button>
+
+          <div className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-semibold border ${
               isRunning
                 ? "border-primary/30 bg-primary/10 text-primary"
                 : "border-border bg-muted/20 text-muted-foreground"
@@ -1883,6 +1936,40 @@ export default function Bot() {
             </div>
           </div>
         </div>
+
+        {/* ── Banner modo solo plática ── */}
+        {chatOnlyMode && (
+          <div style={{
+            display: "flex", alignItems: "center", justifyContent: "space-between",
+            padding: "10px 16px", borderRadius: 12,
+            background: "rgba(167,139,250,0.08)",
+            border: "1px solid rgba(167,139,250,0.25)",
+          }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <span style={{ fontSize: 16 }}>💬</span>
+              <div>
+                <div style={{ fontSize: 11, fontWeight: 700, color: "#A78BFA", fontFamily: "var(--app-font-mono)", letterSpacing: "0.08em" }}>
+                  MODO SOLO PLÁTICA ACTIVO
+                </div>
+                <div style={{ fontSize: 10, color: "#6a7890", marginTop: 2 }}>
+                  Live loop muteado · Autonomous loop pausado · Opus bloqueado
+                </div>
+              </div>
+            </div>
+            <button
+              onClick={toggleChatOnly}
+              disabled={chatOnlyLoading}
+              style={{
+                fontSize: 10, fontWeight: 700, fontFamily: "var(--app-font-mono)",
+                padding: "4px 10px", borderRadius: 6, cursor: "pointer",
+                background: "rgba(167,139,250,0.15)", color: "#A78BFA",
+                border: "1px solid rgba(167,139,250,0.30)",
+              }}
+            >
+              {chatOnlyLoading ? "..." : "DESACTIVAR"}
+            </button>
+          </div>
+        )}
 
         {/* ── TAB SWITCHER — Operativa | Aprendizaje ── */}
         <div className="flex items-center gap-2 border-b border-border/40">

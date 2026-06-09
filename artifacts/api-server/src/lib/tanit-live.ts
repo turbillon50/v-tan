@@ -131,14 +131,17 @@ async function runOneBeat(): Promise<void> {
   // Mute persistente desde BD — sobrevive a redeploys. Si Luis dejó el loop
   // muteado en una sesión anterior, queremos que siga muteado al boot del
   // nuevo proceso, no que se reactive solo.
+  // También chequea chat_only_mode (modo solo plática).
   try {
     const { pool } = await import("@workspace/db");
-    const r = await pool.query<{ value: string }>(
-      `SELECT value FROM tanit_runtime_config WHERE key = 'live_loop_muted_persistent' LIMIT 1`,
+    const r = await pool.query<{ key: string; value: string }>(
+      `SELECT key, value FROM tanit_runtime_config WHERE key IN ('live_loop_muted_persistent', 'chat_only_mode')`,
     );
-    if (r.rows[0]?.value === "true") {
-      _muted = true;
-      return;
+    for (const row of r.rows) {
+      if (row.value === "true" && (row.key === "live_loop_muted_persistent" || row.key === "chat_only_mode")) {
+        _muted = true;
+        return;
+      }
     }
   } catch {
     // si falla la consulta no bloqueamos el beat — solo no hereda mute persistente
